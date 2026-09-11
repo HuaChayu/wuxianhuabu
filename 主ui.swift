@@ -33,6 +33,22 @@ struct InfiniteCanvasApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if ProcessInfo.processInfo.environment["NA_SELFCHECK"] == "1" {
+            let code = NASelfCheck.run()
+            exit(code)
+        }
+        if ProcessInfo.processInfo.environment["NA_BENCH"] == "1" {
+            let code = NABench.run()
+            exit(code)
+        }
+        if let h3t = ProcessInfo.processInfo.environment["NA_H3TEST"], let h3v = Int(h3t), h3v >= 1 && h3v <= 20 {
+            let code = H3PipelineRun.run()
+            exit(code)
+        }
+        if ProcessInfo.processInfo.environment["NA_VAETEST"] == "1" {
+            let code = H3VAETestRun.run()
+            exit(code)
+        }
         ensureCanvasDirectories()
         loadAssetLibrary()
         DispatchQueue.main.async {

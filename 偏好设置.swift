@@ -40,6 +40,15 @@ final class AppSettings: ObservableObject {
     @Published var canvasRootPath: String {
         didSet { defaults.set(canvasRootPath, forKey: "canvasRootPath") }
     }
+    // LTX-2.5 第二阶段总开关：true=启用第二阶段（旧 refine 精修）；false=仅跑第一阶段
+    @Published var videoUseStage2: Bool {
+        didSet { defaults.set(videoUseStage2, forKey: "videoUseStage2") }
+    }
+    // LTX-2.5 扩散视频解码器开关：true=VAE 解码改用扩散视频解码器（vaeDiffusionDecoder 权重）；
+    // false=使用原卷积 VAE 解码器（vaeDecoder）。默认 false（扩散解码器内存/耗时显著更高）
+    @Published var videoUseDiffusionDecoder: Bool {
+        didSet { defaults.set(videoUseDiffusionDecoder, forKey: "videoUseDiffusionDecoder") }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -48,6 +57,8 @@ final class AppSettings: ObservableObject {
         wheelAccelerationWheel = d.object(forKey: "wheelAccelerationWheel") as? Double ?? 30.0
         let savedPath = d.string(forKey: "canvasRootPath") ?? ""
         canvasRootPath = savedPath.isEmpty ? Self.defaultRootPath : savedPath
+        videoUseStage2 = d.object(forKey: "videoUseStage2") as? Bool ?? true
+        videoUseDiffusionDecoder = d.object(forKey: "videoUseDiffusionDecoder") as? Bool ?? false
     }
 
     // 默认文档地址（~/Documents/无限画布）
@@ -128,7 +139,7 @@ struct PreferencesView: View {
     @State private var showResetMenu = false
     @ObservedObject private var settings = AppSettings.shared
 
-    private let sections = ["通用设置", "API", "授权设置", "快捷键", "关于"]
+    private let sections = ["通用设置", "模型管理", "API", "授权设置", "快捷键", "关于"]
 
     var body: some View {
         HStack(spacing: 0) {
@@ -213,7 +224,9 @@ struct PreferencesView: View {
             Divider()
             if selectedSection == 0 {
                 generalSettings
-            } else if selectedSection == 3 {
+            } else if selectedSection == 1 {
+                modelManagementSettings
+            } else if selectedSection == 4 {
                 shortcutSettings
             } else {
                 Text("这里是「\(sections[selectedSection])」的内容区域，占位文本，后续补充。")
@@ -302,6 +315,47 @@ struct PreferencesView: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
                     }
+                }
+                .padding(.leading, 12)
+            }
+
+            Spacer()
+        }
+    }
+
+    // 模型管理页：LTX-2.5 视频模型阶段设置
+    private var modelManagementSettings: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            // 阶段2 设置
+            VStack(alignment: .leading, spacing: 12) {
+                Text("阶段2 设置（调试作用，生成必开）")
+                    .font(.system(size: 13, weight: .medium))
+
+                VStack(alignment: .leading, spacing: 12) {
+                    // 阶段2 总开关：关闭后仅跑第一阶段（目标尺寸单遍直出，不除2/不升频/不二采）
+                    Toggle(isOn: $settings.videoUseStage2) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("阶段2 开关")
+                                .font(.system(size: 13))
+                            Text("开启：目标÷2 跑第一阶段，再接通用升频×2+二采精修（H3/LTX 共用）；关闭：目标尺寸单遍直出")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
+                    // 扩散视频解码器开关：true=VAE 解码改用扩散视频解码器（vaeDiffusionDecoder 权重）；
+                    // false=使用原卷积 VAE 解码器（vaeDecoder）。默认 false（扩散解码器内存/耗时显著更高）
+                    Toggle(isOn: $settings.videoUseDiffusionDecoder) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("扩散视频解码器")
+                                .font(.system(size: 13))
+                            Text("开启：视频解码改用扩散解码器（vaeDiffusionDecoder），内存/耗时更高")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
                 }
                 .padding(.leading, 12)
             }

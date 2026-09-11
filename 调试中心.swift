@@ -211,7 +211,7 @@ final class MonitorCenter: ObservableObject {
             ("dit", DiTModelCache.shared.hasDiT),
             ("gemma", TextEncoderCache.shared.hasGemma),
             ("connector", TextEncoderCache.shared.hasConnector),
-            ("compiled", ltxCompiledForward.isCompiled),
+            ("compiled", CompiledForwardCache.shared.isCompiled),
         ]
         residencyInFlight = true
         residencyQueue.async { [weak self] in
@@ -432,7 +432,7 @@ struct ModelMonitorButton: View {
                     .shadow(color: accent.opacity(0.3 + 0.7 * v), radius: 4 + 4 * v)
             }
             .buttonStyle(.plain)
-            .help("模型监控：\(level.label)（内存 \(Int(center.memoryUsage * 100))% / 交换 \(byteString(center.swapUsed))）")
+            .help("模型监控：压力分 \(String(format: "%.1f", MemoryPolicy.pressureScore)) 策略：\(MemoryPolicy.currentStrategy.rawValue)（内存 \(Int(center.memoryUsage * 100))% / 交换 \(byteString(center.swapUsed))）")
         }
     }
 }
@@ -465,14 +465,6 @@ struct ModelMonitorOverlay: View {
         MemoryLevel(usage: center.memoryUsage, swapUsed: center.swapUsed, swapTotal: center.swapTotal)
     }
 
-    /// 动态状态：压力评分 + 当前内存策略（压力分 ≥ 进入高压阈值 → 内存优先，否则速度优先；
-    /// 刻度与峰值保底 ensureLoose / VAE 动态分块一致，随 MonitorCenter 1s 轮询实时刷新）
-    var memoryStatusText: String {
-        let ps = SystemMemory.pressureScore
-        let strategy = ps >= SystemMemory.looseEnterHysteresis ? "内存优先" : "速度优先"
-        return String(format: "压力评分：%.1f 策略：%@", ps, strategy)
-    }
-
     var body: some View {
         let accent = AppSettings.shared.defaultNodeColor // 跟随公共节点主题色（偏好设置/画布右上角共用），同色系表达
         VStack(alignment: .leading, spacing: 6) {
@@ -500,8 +492,8 @@ struct ModelMonitorOverlay: View {
             }
             .frame(height: 6)
             HStack(spacing: 8) {
-                Text(memoryStatusText)
-                    .font(.caption2.monospacedDigit())
+                Text("压力分：\(String(format: "%.1f", MemoryPolicy.pressureScore)) 策略：\(MemoryPolicy.currentStrategy.rawValue)")
+                    .font(.caption2)
                     .foregroundColor(accent)
                 Spacer()
                 Text("交换 \(byteString(center.swapUsed))")

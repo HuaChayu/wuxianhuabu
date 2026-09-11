@@ -11,15 +11,6 @@
 		5A31860B30331AFC004031FC /* 快捷键.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A31860630331AFC004031FC /* 快捷键.swift */; };
 		5A392BBC3031C1410045162C /* 读取&保存.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A392BBA3031C1370045162C /* 读取&保存.swift */; };
 		5A392BCF303238890045162C /* 偏好设置.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A392BBD303238890045162C /* 偏好设置.swift */; };
-		5A79E3AA3039A43C00ED9732 /* 本地化包的方式.txt in Resources */ = {isa = PBXBuildFile; fileRef = 5A79E3A93039A43C00ED9732 /* 本地化包的方式.txt */; };
-		5AA4CF8830484ED30044BADF /* 服务器.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AA4CF8730484ECB0044BADF /* 服务器.swift */; };
-		5AB062303036DC9F0091017D /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = 5A365035B10F1C2E6293B67A /* MLX */; };
-		5AB062313036DC9F0091017D /* MLXFast in Frameworks */ = {isa = PBXBuildFile; productRef = 5A93FEB55D14B0038E83B786 /* MLXFast */; };
-		5AB062323036DC9F0091017D /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = 5ABE1B15E53042AE7B604EF0 /* MLXNN */; };
-		5AB062333036DC9F0091017D /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 5A764E5FC218E370A2483A11 /* Tokenizers */; };
-		5AB063D4303900AC0091017D /* MLXRandom in Frameworks */ = {isa = PBXBuildFile; productRef = 5A71E2C1B10F1C2E6293B67C /* MLXRandom */; };
-		5AB063D5303900AC0091017D /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 5A72E2C1B10F1C2E6293B67D /* MLXLMCommon */; };
-		5AB063D6303900AC0091017D /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = 5A73E2C1B10F1C2E6293B67D /* MLXVLM */; };
 		5ACA61D4302EE9E400C0EF7D /* 说明.txt in Resources */ = {isa = PBXBuildFile; fileRef = 5ACA61D3302EE9E400C0EF7D /* 说明.txt */; };
 		5ACA61DC302EEA3E00C0EF7D /* 更新日志.txt in Resources */ = {isa = PBXBuildFile; fileRef = 5ACA61DB302EEA3E00C0EF7D /* 更新日志.txt */; };
 		5ACA61E8302EEFE700C0EF7D /* 主ui.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5ACA61E7302EEFD800C0EF7D /* 主ui.swift */; };
@@ -34,8 +25,6 @@
 		5A31860630331AFC004031FC /* 快捷键.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "快捷键.swift"; sourceTree = "<group>"; };
 		5A392BBA3031C1370045162C /* 读取&保存.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "读取&保存.swift"; sourceTree = "<group>"; };
 		5A392BBD303238890045162C /* 偏好设置.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "偏好设置.swift"; sourceTree = "<group>"; };
-		5A79E3A93039A43C00ED9732 /* 本地化包的方式.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "本地化包的方式.txt"; sourceTree = "<group>"; };
-		5AA4CF8730484ECB0044BADF /* 服务器.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "服务器.swift"; sourceTree = "<group>"; };
 		5ACA61D3302EE9E400C0EF7D /* 说明.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "说明.txt"; sourceTree = "<group>"; };
 		5ACA61DB302EEA3E00C0EF7D /* 更新日志.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "更新日志.txt"; sourceTree = "<group>"; };
 		5ACA61E7302EEFD800C0EF7D /* 主ui.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "主ui.swift"; sourceTree = "<group>"; };
@@ -62,13 +51,6 @@
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
-				5AB063D6303900AC0091017D /* MLXVLM in Frameworks */,
-				5AB063D5303900AC0091017D /* MLXLMCommon in Frameworks */,
-				5AB063D4303900AC0091017D /* MLXRandom in Frameworks */,
-				5AB062333036DC9F0091017D /* Tokenizers in Frameworks */,
-				5AB062323036DC9F0091017D /* MLXNN in Frameworks */,
-				5AB062313036DC9F0091017D /* MLXFast in Frameworks */,
-				5AB062303036DC9F0091017D /* MLX in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -77,7 +59,6 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				5AA4CF8730484ECB0044BADF /* 服务器.swift */,
 				5A21C637303444A60015B325 /* 图标预览.swift */,
 				5A392BBA3031C1370045162C /* 读取&保存.swift */,
 				5ACA61E7302EEFD800C0EF7D /* 主ui.swift */,
@@ -89,7 +70,6 @@
 				5ACA61F7302F0D6000C0EF7D /* Packages */,
 				5ACA61F8302F0DF200C0EF7D /* icon */,
 				5ACA61D3302EE9E400C0EF7D /* 说明.txt */,
-				5A79E3A93039A43C00ED9732 /* 本地化包的方式.txt */,
 				5ACA61DB302EEA3E00C0EF7D /* 更新日志.txt */,
 				5A392BBD303238890045162C /* 偏好设置.swift */,
 				5A31860630331AFC004031FC /* 快捷键.swift */,
@@ -154,15 +134,6 @@
 				5ACA61D5302EE9EB00C0EF7D /* model */,
 			);
 			name = "无限画布";
-			packageProductDependencies = (
-				5A365035B10F1C2E6293B67A /* MLX */,
-				5A93FEB55D14B0038E83B786 /* MLXFast */,
-				5ABE1B15E53042AE7B604EF0 /* MLXNN */,
-				5A71E2C1B10F1C2E6293B67C /* MLXRandom */,
-				5A72E2C1B10F1C2E6293B67D /* MLXLMCommon */,
-				5A73E2C1B10F1C2E6293B67D /* MLXVLM */,
-				5A764E5FC218E370A2483A11 /* Tokenizers */,
-			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* 无限画布.app */;
 			productType = "com.apple.product-type.application";
@@ -193,21 +164,6 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				5A31862930338106004031FC /* XCLocalSwiftPackageReference "Packages/z-image-swift" */,
-				5AA76CFC2C95C572682D1C91 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift" */,
-				5A60E7A39B4D9B9CC0C59B47 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-transformers" */,
-				5AC376D1A94C2307296D344A /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-huggingface" */,
-				5AF9D6A348214AF8EAD67DE8 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-jinja" */,
-				5A501D3458A893390B81D63F /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-collections" */,
-				5A515C0F6E738D35EBDBA1BE /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-crypto" */,
-				5A4F10FD6669751F801B04B5 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/yyjson" */,
-				5A0B1C519697DA30629C2714 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/EventSource" */,
-				5A33ADD232444F49E3A20948 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-engine-swift" */,
-				5AB565911736E1479481EA03 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-profiling" */,
-				5A48AF89F5BCF34348B3F21F /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift-lm" */,
-				5A5820FFCC9CB74340BCA4F8 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-argument-parser" */,
-				5A714310F63DCD4C0A81E2CD /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-asn1" */,
-				5AE1906F0E245E4613B20F6D /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-numerics" */,
-				5A940002CE392E40B892FD14 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-syntax" */,
 			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
@@ -223,7 +179,6 @@
 		000000000000000140000000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
-				5A79E3AA3039A43C00ED9732 /* 本地化包的方式.txt in Resources */,
 				5ACA61DC302EEA3E00C0EF7D /* 更新日志.txt in Resources */,
 				5ACA61D4302EE9E400C0EF7D /* 说明.txt in Resources */,
 			);
@@ -235,7 +190,6 @@
 			isa = PBXSourcesBuildPhase;
 			files = (
 				5ACA61E8302EEFE700C0EF7D /* 主ui.swift in Sources */,
-				5AA4CF8830484ED30044BADF /* 服务器.swift in Sources */,
 				5A392BCF303238890045162C /* 偏好设置.swift in Sources */,
 				5ACA61E9302EEFE700C0EF7D /* 调试中心.swift in Sources */,
 				5A31860B30331AFC004031FC /* 快捷键.swift in Sources */,
@@ -410,7 +364,7 @@
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
@@ -448,7 +402,7 @@
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
@@ -478,109 +432,11 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		5A0B1C519697DA30629C2714 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/EventSource" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/EventSource";
-		};
 		5A31862930338106004031FC /* XCLocalSwiftPackageReference "Packages/z-image-swift" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = "Packages/z-image-swift";
 		};
-		5A33ADD232444F49E3A20948 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-engine-swift" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-engine-swift";
-		};
-		5A48AF89F5BCF34348B3F21F /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift-lm" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift-lm";
-		};
-		5A4F10FD6669751F801B04B5 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/yyjson" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/yyjson";
-		};
-		5A501D3458A893390B81D63F /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-collections" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-collections";
-		};
-		5A515C0F6E738D35EBDBA1BE /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-crypto" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-crypto";
-		};
-		5A5820FFCC9CB74340BCA4F8 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-argument-parser" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-argument-parser";
-		};
-		5A60E7A39B4D9B9CC0C59B47 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-transformers" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-transformers";
-		};
-		5A714310F63DCD4C0A81E2CD /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-asn1" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-asn1";
-		};
-		5A940002CE392E40B892FD14 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-syntax" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-syntax";
-		};
-		5AA76CFC2C95C572682D1C91 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift";
-		};
-		5AB565911736E1479481EA03 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-profiling" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-profiling";
-		};
-		5AC376D1A94C2307296D344A /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-huggingface" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-huggingface";
-		};
-		5AE1906F0E245E4613B20F6D /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-numerics" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-numerics";
-		};
-		5AF9D6A348214AF8EAD67DE8 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-jinja" */ = {
-			isa = XCLocalSwiftPackageReference;
-			relativePath = "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-jinja";
-		};
 /* End XCLocalSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		5A365035B10F1C2E6293B67A /* MLX */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5AA76CFC2C95C572682D1C91 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift" */;
-			productName = MLX;
-		};
-		5A71E2C1B10F1C2E6293B67C /* MLXRandom */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5AA76CFC2C95C572682D1C91 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift" */;
-			productName = MLXRandom;
-		};
-		5A72E2C1B10F1C2E6293B67D /* MLXLMCommon */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5A48AF89F5BCF34348B3F21F /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift-lm" */;
-			productName = MLXLMCommon;
-		};
-		5A73E2C1B10F1C2E6293B67D /* MLXVLM */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5A48AF89F5BCF34348B3F21F /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift-lm" */;
-			productName = MLXVLM;
-		};
-		5A764E5FC218E370A2483A11 /* Tokenizers */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5A60E7A39B4D9B9CC0C59B47 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/swift-transformers" */;
-			productName = Tokenizers;
-		};
-		5A93FEB55D14B0038E83B786 /* MLXFast */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5AA76CFC2C95C572682D1C91 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift" */;
-			productName = MLXFast;
-		};
-		5ABE1B15E53042AE7B604EF0 /* MLXNN */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 5AA76CFC2C95C572682D1C91 /* XCLocalSwiftPackageReference "../../Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/mlx-swift" */;
-			productName = MLXNN;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }

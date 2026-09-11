@@ -424,7 +424,7 @@ struct WaveformView: View {
     private let windowSeconds: Double = 2.0
 
     var body: some View {
-        Canvas { context, size in
+        SwiftUI.Canvas { context, size in
             guard progress.duration > 0, !progress.waveform.isEmpty, size.width > 1 else { return }
             let samples = progress.waveform
             let total = samples.count

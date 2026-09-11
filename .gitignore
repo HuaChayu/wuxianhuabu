@@ -1,35 +1,8 @@
-# macOS
-.DS_Store
-
-# Xcode 用户状态 / 派生数据
-xcuserdata/
+# SwiftPM / Xcode 构建产物
+**/.build/
+**/.swiftpm/
 DerivedData/
-*.xcuserstate
-
-# SwiftPM 构建产物（含 mlx-swift 等第三方 checkouts，可重新拉取）
-.build/
-.swiftpm/
-.checkouts/
-
-# 运行期生成：临时备份、日志、输出
-temp/
-*.log
-pipeline.log
-
-# 模型权重/大文件（避免仓库膨胀；如需上传请单独走 LFS）
-*.safetensors
-*.bin
-*.gguf
-*.mlx
-*.npy
-*.npz
-*.caffemodel
-*.onnx
-*.pth
-*.pt
-
-# 通用
-*.swp
-*~
+xcuserdata/
+# 备份与系统文件
 *.bak
-*.bak_*
+.DS_Store
