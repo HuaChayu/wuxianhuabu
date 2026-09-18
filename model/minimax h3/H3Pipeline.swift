@@ -32,6 +32,18 @@ public final class H3Stage2MemoryBridge {
     public var height: Int = 0
     public var frameCount: Int = 0
     public var fps: Int = 24
+
+    // ── H3-to-LTX-Latent-Adapter 直通（可选） ──
+    /// adapter 直出的 LTX 归一化 latent：NDHWC [1, F, H/32, W/32, 128]。
+    /// 非 nil 时，队列走「latent 直入二采」路径，跳过 LTX vaeEncodeVideo。
+    /// 若生成时 adapterSkipH3Decode=true，则 pixels 为 nil（H3 完全不解码），
+    /// stage1 预览视频不存在，音轨以 audioTrackPath（独立 wav）承载。
+    public var ltxHalfLatent: MLXArray?
+    /// adapter 模式下 H3 侧等效像素几何（= H3 latent 空间 × 16），供 LTX 侧定尺寸/预算
+    public var adapterPixelWidth: Int = 0
+    public var adapterPixelHeight: Int = 0
+    /// adapter 跳解码模式下的音轨载体（独立 wav）；非 nil 表示无 stage1 mp4，二采音轨取此文件
+    public var audioTrackPath: String?
 }
 import MLX
 import MLXNN
@@ -39,6 +51,7 @@ import MLXRandom
 import MLXLMCommon
 import Tokenizers
 import Hub
+import ImageIO
 
 /// sigma 调度风格（对照实验开关）
 /// - `.official`：官方 shift 公式 `sigmaSchedule`（默认，turbo 4-8 步标准调度）
@@ -106,13 +119,38 @@ public enum H3FL2VAPipeline {
         // warmup/tail 强制重算，中间步按 k 间隔刷新，其余步复用上一步 attention 输出。
         // k<=1 等价禁用；环境变量 NA_H3_PAB=0 可强制关闭做对照，NA_H3_PAB_K 可覆盖间隔扫描。
         attentionBroadcastK: UInt32 = 2,
+        // ★ SelfLift 第三分支（H3 一采渐进式采样，见 SelfLiftH3-(h3专属).swift）：
+        //   true = stage1 走「低分（×0.5）ts 次 NFE → 零 NFE 过渡块（nearest 直接 latent 提升 +
+        //          VAE 像素锚点一致修正）→ 升回全分辨率 → 高分 N-ts 次 NFE」，总 NFE = N 不变；
+        //   false = 原单条 stage1 循环单遍直出（默认，行为与本次接入前逐字一致，供自检/对照脚本用）。
+        //   生产入口（模型生成队列-通用.swift）按偏好设置「H3 一采设置 → SelfLift 渐进采样」显式传值。
+        //   ts 不写死：transitionStep = 0 → 官方 75% 规则按 N（= sigmas.count - 1，取自步数滑杆）推导。
+        selfLiftEnabled: Bool = false,
+        // ★ SelfLift lowOnly 模式（IC 链路用）：true = H3 一采只跑低分（半清）段，直接返回
+        //   低清 latent（跳过过渡块 + H3 高分循环）；高分（升频×2 + 精修）交由 LTX 二采完成，
+        //   「H3 低分 + LTX 高分」两模型组成 lift。必须与队列二采 fullResInput=false 配套。
+        selfLiftLowOnly: Bool = false,
         log: (String) -> Void = { s in print("[H3-FL2VA] \(s)"); fflush(stdout) },
         stage2: H3Stage2Config? = nil,
         proResOutput: Bool = false,
-        stage2MemBridge: H3Stage2MemoryBridge? = nil
+        stage2MemBridge: H3Stage2MemoryBridge? = nil,
+        /// ref2va 多参考图通路：非空即启用（此时首/尾帧被忽略）。
+        /// 每张图按官方 reference canvas（短边 2048、32 对齐）编码为独立参考块，
+        /// 文本侧生成 `<Picture i>: ` + vision block 序列，prompt 放在最后。
+        referenceImagePaths: [String] = [],
+        /// 参考图缩放模式：.match = 缩到与生成画面同面积（默认，序列最短）；
+        /// .mid = 短边上限 1024；.max = 短边上限 2048（官方 ref2va，序列最长）
+        referenceSizing: RefImageSizing = .match,
+        /// ★ H3→LTX latent 直通适配器（H3-to-LTX-Latent-Adapter，见 H3-to-LTX-Latent-Adapter-(h3专属).swift）：
+        /// 非 nil 时，在 H3 VAE 解码之前拦截 clean latent，直接映射为 LTX 归一化 latent 挂到 bridge，
+        /// 使队列可走「latent 直入二采」路径，省去 LTX VAE encode（乃至 H3 VAE decode）两步像素往返。
+        h3ToLTXAdapter: H3ToLTXLatentAdapter? = nil,
+        /// adapter 生效时是否连 H3 VAE 解码一并跳过（默认 true：不写 stage1 mp4，音轨单独落 wav
+        /// 由二采最终混流；false：仍解码出 stage1 预览视频，仅省 LTX encode）。
+        adapterSkipH3Decode: Bool = true
     ) async throws -> String {
         let t0 = Date()
-        let modelDir = "/Users/huachayui/Downloads/minimax h3/MiniMax-H3-FL2VA-MLX-Serve-4bit"
+        let modelDir = "/Users/huachayui/Downloads/h3-fused/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
         let wURL = { (name: String) in URL(fileURLWithPath: "\(modelDir)/\(name)") }
 
         // ── 内存打点（RSS phys_footprint + MLX activeMemory）──
@@ -148,6 +186,89 @@ public enum H3FL2VAPipeline {
         let cfg: H3Config = (try? H3Config.load(from: wURL("config.json"))) ?? H3Config()
         log("config: \(cfg.hiddenSize)h/\(cfg.numLayers)L video_shift=\(cfg.sigmaShiftVideo) audio_shift=\(cfg.sigmaShiftAudio)")
 
+        // ── 1. 条件编码：fl2va 首尾帧 OR ref2va 多参考图 ──
+        let useRef2VA = !referenceImagePaths.isEmpty
+        var condRows: MLXArray!
+        var latC = 0, latT = 0, latH = 0, latW = 0, gridH = 0, gridW = 0
+        // ref2va 布局块与文本侧视觉块（顺序严格对应）
+        var refBlocks: [RefBlock] = []
+        var refVisionBlocks: [H3VisionBlock] = []
+        var refVisionLabels: [String] = []
+
+        if useRef2VA {
+            guard referenceImagePaths.count <= Int(H3Const.maxRefImages) else {
+                throw NSError(domain: "H3REF2VA", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "参考图数量 \(referenceImagePaths.count) 超过上限 \(H3Const.maxRefImages)"])
+            }
+            log("ref2va：\(referenceImagePaths.count) 张参考图")
+
+            try autoreleasepool {
+                var vaeWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
+                vaeWeights?.cacheEnabled = false
+                var vae: H3VAE? = try H3VAE.load(vaeWeights!)
+                // 目标 latent 几何：用生成分辨率的探测图走同一条 VAE 通路（不做 /16 假设）
+                let probe = vae!.encodeImage(MLXArray.zeros([1, 3, 1, height, width]))
+                latT = probe.shape[2]
+                latH = probe.shape[3]
+                latW = probe.shape[4]
+                latC = probe.shape[1]
+                gridH = latH / 2
+                gridW = latW / 2
+                log("ref2va 目标 latent [1,\(latC),\(latT),\(latH),\(latW)]")
+                var rowChunks: [MLXArray] = []
+                for (i, p) in referenceImagePaths.enumerated() {
+                    guard let dims = h3ImagePixelSize(p) else {
+                        throw NSError(domain: "H3REF2VA", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "参考图尺寸读取失败：\(p)"])
+                    }
+                    // 官方 reference canvas：短边 2048 上限、32 对齐；再经 fitCanvas 复核对齐
+                    let rc = refImageCanvas(UInt32(dims.w), UInt32(dims.h),
+                                            genW: UInt32(width), genH: UInt32(height),
+                                            mode: referenceSizing)
+                    let vc = fitCanvas(h: rc.h, w: rc.w)
+                    guard let px = loadImageBCFHW(path: p, width: Int(vc.w), height: Int(vc.h)) else {
+                        throw NSError(domain: "H3REF2VA", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "参考图加载失败：\(p)"])
+                    }
+                    let lat = vae!.encodeImage(px)      // [1,24,1,lh,lw]
+                    let lh = lat.shape[3], lw = lat.shape[4], lc = lat.shape[1]
+                    let nhwc = lat.transposed(0, 2, 3, 4, 1).reshaped([1, lh, lw, lc])
+                    rowChunks.append(H3TensorOps.patchifyVideo(nhwc, gridH: lh / 2, gridW: lw / 2))
+                    refBlocks.append(RefBlock(kind: .image, latentH: UInt32(lh), latentW: UInt32(lw),
+                                              latentT: 1, audioT: 0))
+                    // 文本侧视觉块：静帧沿 temporal patch 重复填满 2 帧
+                    let plane = px.reshaped([3, Int(vc.h), Int(vc.w)])
+                    let frames = concatenated([plane, plane], axis: 0)   // [2,3,H,W]
+                    refVisionBlocks.append(H3VisionBlock(frames: frames, grid: gridFor(h: vc.h, w: vc.w)))
+                    refVisionLabels.append(labelFor(kind: .image, ordinal: UInt32(i + 1)))
+                    if (ProcessInfo.processInfo.environment["NA_H3_FL2VA_AS_REFS"].flatMap { Int($0) } ?? 0) > 0
+                        && referenceImagePaths.count == 2 {
+                        // ★ 2026-09-18 首尾帧 as refs：恰好 2 张参考图时把视觉块标签换成
+                        //   首/尾帧语义（而非通用 "Picture 1/2"），让模型明确哪张是开头、
+                        //   哪张是结尾——软参考无 keyframes 时间锚，靠文本标签补时序角色。
+                        refVisionLabels[refVisionLabels.count - 1] = (i == 0 ? "<First frame>: " : "<Last frame>: ")
+                    }
+                    log("参考图 \(i + 1)：\(dims.w)×\(dims.h) → 画布 \(vc.w)×\(vc.h)，latent [\(lc),1,\(lh),\(lw)]，rows \((lh / 2) * (lw / 2))")
+                }
+                condRows = rowChunks.count == 1 ? rowChunks[0] : concatenated(rowChunks, axis: 0)
+                MLX.eval(condRows)
+                log("参考图编码完成：cond rows \(condRows.shape)")
+
+                // 噪声增强：r = 0.999·r + 0.001·noise（与 fl2va keyframe 同一规则）
+                let augNoise = MLXRandom.normal(condRows.shape, key: MLXRandom.key(seed))
+                let augA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), condRows)
+                let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), condRows)
+                condRows = condRows * augA + augNoise * augB
+                MLX.eval(condRows)
+
+                // 释放 VAE 编码器（解码阶段再加载）
+                vae = nil
+                vaeWeights = nil
+                MLX.Memory.clearCache()
+                h3MemLog("VAE 编码器已释放（autoreleasepool 内）")
+            }
+        } else {
         // ── 1. 加载 2 张 keyframe 图片 → VAE 编码 → cond rows ──
         guard let firstPx = loadImageBCFHW(path: firstImagePath, width: width, height: height),
               let lastPx = loadImageBCFHW(path: lastImagePath, width: width, height: height) else {
@@ -156,8 +277,6 @@ public enum H3FL2VAPipeline {
         }
         log("图片加载完成：首帧 \(firstPx.shape)，尾帧 \(lastPx.shape)")
 
-        var condRows: MLXArray!
-        var latC = 0, latT = 0, latH = 0, latW = 0, gridH = 0, gridW = 0
         autoreleasepool {
             var vaeWeights: H3Weights? = try! H3Weights(url: wURL("video_vae.safetensors"))
             vaeWeights?.cacheEnabled = false
@@ -192,6 +311,7 @@ public enum H3FL2VAPipeline {
             MLX.Memory.clearCache()
             h3MemLog("VAE 编码器已释放（autoreleasepool 内）")
         }
+        }
         h3MemLog("VAE 编码器已释放（pool drain 后）")
         log("VAE 编码器已释放")
 
@@ -203,16 +323,67 @@ public enum H3FL2VAPipeline {
             throw NSError(domain: "H3FL2VA", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "tokenizer 加载失败"])
         }
-        let ids = tokenizer.encode(text: prompt, addSpecialTokens: false).map { Int32($0) }
-        log("prompt 编码：\(ids.count) tokens")
+        let promptIds = tokenizer.encode(text: prompt, addSpecialTokens: false).map { Int32($0) }
+        var presentItems: [H3PresentItem] = []
+        var textTagsForLayout: [UInt8] = []
+        // 无字幕抑制条件：简短标准写法，避免长句误伤画面内容（如广告牌/文字元素）。
+        // 作为条件 token 注入文本序列末尾（与首尾帧标签同机制），默认开启，设 NA_H3_NO_SUBTITLES=0 关闭。
+        let noSubtitleOn = (ProcessInfo.processInfo.environment["NA_H3_NO_SUBTITLES"].flatMap { $0 == "1" } ?? true)
+        if useRef2VA {
+            // 对齐官方 build_ref2va_presentation：逐张 `<Picture i>: ` + vision block，prompt 收尾
+            for (i, vb) in refVisionBlocks.enumerated() {
+                let labelIds = tokenizer.encode(text: refVisionLabels[i], addSpecialTokens: false).map { Int32($0) }
+                presentItems.append(.text(labelIds))
+                presentItems.append(.vision(vb))
+            }
+            presentItems.append(.text(promptIds))
+            if noSubtitleOn {
+                let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
+                presentItems.append(.text(suppressIds))
+                log("ref2va 文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
+            } else {
+                log("ref2va 文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
+            }
+        } else {
+            if noSubtitleOn {
+                let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
+                presentItems = [.text(promptIds), .text(suppressIds)]
+                log("prompt 编码：\(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens")
+            } else {
+                presentItems = [.text(promptIds)]
+            }
+        }
+        log("prompt 编码：\(promptIds.count) tokens")
 
         var textHidden: MLXArray!
+        var textHiddenNeg: MLXArray? = nil
+        // CFG 开关预判（与第三分支 slCfg.cfgScale 同一公式：仅 NA_H3_SELFLIFT_CFG 显式 >0 时编码
+        // negative 条件行；缺省 0=关闭，避免 turbo LoRA 下白跑双路）。此处需在文本编码前决定。
+        let slCfgScaleNeeded = (ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_CFG"].flatMap(Double.init) ?? 0.0) > 0
         autoreleasepool {
             var teWeights: H3Weights? = try! H3Weights(url: wURL("text_encoder.safetensors"))
             teWeights?.cacheEnabled = false
             var textEncoder: H3TextEncoder? = try! H3TextEncoder.load(teWeights!)
-            let encoded = try! textEncoder!.encodeItems([.text(ids)])
+            if useRef2VA { try! textEncoder!.loadVision(teWeights!) }
+            let encoded = try! textEncoder!.encodeItems(presentItems)
+            if useRef2VA { textTagsForLayout = encoded.tags }
             textHidden = encoded.hidden
+            // ★ CFG negative 条件行：官方 SelfLiftH3Sampler 默认 negative = 空 prompt。
+            //   行数通常远小于 positive，后续在 DiT refine 后 pad 到与 positive 相同 textLen，
+            //   使 negative forward 可复用同一 layout/rope/plan（时间坐标严格一致）。
+            if slCfgScaleNeeded {
+                var negIds = tokenizer.encode(text: "", addSpecialTokens: true).map { Int32($0) }
+                if negIds.isEmpty {
+                    negIds = tokenizer.encode(text: " ", addSpecialTokens: true).map { Int32($0) }
+                }
+                if negIds.isEmpty {
+                    negIds = [Int32(0)]   // 兜底：词表 id 0 必存在；负文本内容不影响 CFG 方向
+                }
+                let encNeg = try! textEncoder!.encodeItems([.text(negIds)])
+                textHiddenNeg = encNeg.hidden
+                MLX.eval(textHiddenNeg!)
+                log("SelfLift CFG negative：空文本 → \(negIds.count) tokens，hidden \(encNeg.hidden.shape)")
+            }
             MLX.eval(textHidden)
             h3MemLog("文本编码完成")
             log("文本编码完成：hidden \(textHidden.shape)，tags \(encoded.tags.count)")
@@ -258,8 +429,13 @@ public enum H3FL2VAPipeline {
         let layout = PackedLayout(textLen: UInt32(textHidden.shape[0]),
                                   latentT: latentT, latentH: UInt32(latH), latentW: UInt32(latW),
                                   audioT: audioT,
-                                  keyframes: [.first, .last],
-                                  frameCount: frameCount)
+                                  keyframes: useRef2VA ? [] : [.first, .last],
+                                  frameCount: frameCount,
+                                  refs: refBlocks)
+        if useRef2VA {
+            layout.textTags = textTagsForLayout
+            log("ref2va 布局：text \(textHidden.shape[0]) + \(refBlocks.count) 参考块 + video/audio 目标")
+        }
 
         // sigma 调度：official = 官方 shift 公式；betaRefined = Beta 分布 + 余弦尾段精修
         // （betaRefinedSchedule 内部保证非零档数 = steps，末位补 0，可直接对位使用）
@@ -280,9 +456,25 @@ public enum H3FL2VAPipeline {
                                        shiftV: cfg.sigmaShiftVideo, shiftA: cfg.sigmaShiftAudio,
                                        aug: CondNoiseAug())
         var refined = MLXArray(0)
+        var refinedNeg: MLXArray? = nil
         autoreleasepool {
             dit!.precomputeAdaln(ts: tsList)
             refined = dit!.refineText(textHidden)
+            // ★ CFG negative 经同一 refineText 变换后 pad 到 positive 相同行数（= textLen），
+            //   复用同一 layout/rope/plan：PackedLayout 的 text 段固定占 textLen 行，negative
+            //   行数不足会平移后续 video/audio 行的时间坐标，两路 forward 不在同一坐标系。
+            if var neg = textHiddenNeg {
+                MLX.eval(neg)
+                if neg.shape[0] < refined.shape[0] {
+                    let pad = MLXArray.zeros([refined.shape[0] - neg.shape[0], neg.shape[1]], dtype: neg.dtype)
+                    neg = concatenated([neg, pad], axis: 0)
+                } else if neg.shape[0] > refined.shape[0] {
+                    neg = neg[0..<refined.shape[0], 0..<neg.shape[1]]
+                }
+                refinedNeg = dit!.refineText(neg)
+                MLX.eval(refinedNeg!)
+                log("SelfLift CFG negative refined：\(refined.shape) → pad → \(refinedNeg!.shape)")
+            }
             MLX.eval(refined)
             h3MemLog("DiT 就绪（pool 内）")
         }
@@ -330,6 +522,135 @@ public enum H3FL2VAPipeline {
             return attentionBroadcastK
         }()
         let pab1: H3AttnBroadcast? = pabK > 1 ? H3AttnBroadcast(count: dit!.blocks.count) : nil
+        // ── 3.1 SelfLift 第三分支（H3 一采渐进式采样，实现在 SelfLiftH3-(h3专属).swift）─────
+        // 低分（×0.5）跑 ts 次 NFE → 零 NFE 过渡块（官方 H3 路径 nearest 直接 latent 提升 +
+        // VAE 像素锚点一致修正，ρ=0.6）→ 升回全分辨率 → 高分跑 N-ts 次 NFE；
+        // 不变量：低分 NFE + 高分 NFE = N（总 NFE 与单遍路径一致，加速来自低分单步算力下降）。
+        // ts 不写死：transitionStep = 0 → 官方 75% 规则按 N 推导（N 来自面板第一阶段总步数滑杆）。
+        // 过渡块的像素锚点需要在采样中途做一次 VAE decode→encode，故此处临时加载 video_vae，
+        // 过渡块跑完立即置 nil + clearCache（与 1./2. 段 keyframe 编码同一「用后即释」范式）。
+        if selfLiftEnabled, stage1SegmentCount >= 2 {
+            // 显式覆盖仅 transitionStep = 0（自动）；lowResScale/rho/wMin/wMax 取 SelfLiftConfig 默认＝官方 H3 建议起点；
+            // NA_H3_SELFLIFT_RHO / NA_H3_SELFLIFT_WMIN / NA_H3_SELFLIFT_WMAX 可覆盖。
+            // 默认 rho=0.0（官方默认）：learned upscaler 纯 z_lat 提升，不混合像素锚点。
+            // 决定性实验（NA_H3TEST=26，1344×768×39 帧同 seed 同场景）：learned+rho=0 前后段逐帧全干净，
+            // 而 rho=0.25/0.6/0.9 均有 z_pix VAE 往返伪影注入（运动剧烈后段背景角色双轮廓/鬼影）；
+            // 官方 SelfLiftH3Sampler 默认即 rho=0，像素锚点为可选增强（默认关闭）。
+            // NA_H3_SELFLIFT_RHO / NA_H3_SELFLIFT_WMIN / NA_H3_SELFLIFT_WMAX 可覆盖。
+            let envRho = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_RHO"].flatMap(Double.init)
+            let envWMin = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_WMIN"].flatMap(Float.init)
+            let envWMax = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_WMAX"].flatMap(Float.init)
+            let slCfgBase = SelfLiftConfig(enabled: true,
+                                           transitionStep: 0,
+                                           rho: envRho ?? 0.0,
+                                           wMin: envWMin ?? 1.0,
+                                           wMax: envWMax ?? 1.0)
+            // 解耦模式（本工程调试扩展，A/B 用；默认关闭，不触碰默认值）：
+            //   NA_H3_SELFLIFT_DECOUPLE=1              开启：低清/高清两条独立曲线，σ_k 与 σ_next 解耦
+            //   NA_H3_SELFLIFT_DECOUPLE_LOW_STEPS=3    固定低清步数 L（>0 时不再由 σ_k 反推，低清终点直接取
+            //                                          L 步曲线实际终点 σ_{L-1} 作为「过渡用的值」，无需过渡补 Euler）
+            //   NA_H3_SELFLIFT_DECOUPLE_LOW_K=0.9     低清终点 σ_k（仅 LOW_STEPS 缺省时用于反推 L；2026-09-17 由 0.7 上调至浅区消除深跑固化双影，0.9 → L=2、σ_k≈0.9231）
+            //   NA_H3_SELFLIFT_DECOUPLE_HIGH_START=…   高清起点 σ_next（缺省 = 低清终点，浅起点直接重加噪）
+            //   NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS=3   高清独立步数（2026-09-17 v2 由 6 改回 3，等距曲线下 3 步即达安全残留）
+            var slCfg = slCfgBase
+            let decoupleEnv = ProcessInfo.processInfo.environment
+            if decoupleEnv["NA_H3_SELFLIFT_DECOUPLE"] == "1" {
+                slCfg.decoupleSigmaK = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_LOW_K"].flatMap(Double.init) ?? 0.7
+                slCfg.decoupleLowSteps = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_LOW_STEPS"].flatMap(Int.init) ?? 0
+                slCfg.decoupleSigmaNext = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_HIGH_START"].flatMap(Double.init)
+                slCfg.decoupleHighSteps = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS"].flatMap(Int.init) ?? 6
+                log("SelfLift 解耦开关：σ_k=\(slCfg.decoupleSigmaK!)"
+                    + (slCfg.decoupleSigmaNext.map { ", σ_next=\($0)" } ?? "（σ_next=低清终点）")
+                    + (slCfg.decoupleLowSteps > 0 ? "，固定低清步数=\(slCfg.decoupleLowSteps)（终点即过渡值）" : "")
+                    + "，高清步数=\(slCfg.decoupleHighSteps)")
+            }
+            // ★ CFG 引导（2026-09-18 重影根因修复，对齐官方 SelfLiftH3Sampler cfg=5.0）：
+            //   NA_H3_SELFLIFT_CFG 显式覆盖；缺省 0（关闭）——2026-09-18 实测 cfg=5.0 对 600 turbo
+            //   LoRA（蒸馏模型，训练目标 cfg=1）过强：高对比度马赛克/过曝/网格噪点，画面崩坏；
+            //   官方 cfg=5.0 面向原版 H3（非 turbo）。保留机制供显式实验（小值 1.5~3.0 可试）。
+            let envCfgScale = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_CFG"].flatMap(Double.init) ?? 0.0
+            slCfg.cfgScale = envCfgScale
+            if envCfgScale > 0 {
+                log("SelfLift CFG：cfg=\(envCfgScale)（每步 positive+negative 双 forward；注意 turbo LoRA 蒸馏模型 cfg 过大会过冲）")
+            } else {
+                log("SelfLift CFG：关闭（cfg=0，仅 positive 单路；NA_H3_SELFLIFT_CFG=1.5~3.0 可显式实验）")
+            }
+            let slTs = slCfg.resolvedTransitionStep(totalSteps: stage1SegmentCount)
+            if slCfg.decoupleSigmaK != nil {
+                log("SelfLift 第三分支：开启（解耦模式，低清/高清独立曲线见 Runner 调度日志；面板参考 N=\(stage1SegmentCount)，原调度 ts=\(slTs) 已绕开）")
+            } else {
+                log("SelfLift 第三分支：开启（N=\(stage1SegmentCount) → ts=\(slTs)：低分 NFE=\(slTs) + 高分 NFE=\(stage1SegmentCount - slTs)，总 NFE=\(stage1SegmentCount)；低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
+            }
+            // 像素锚点 VAE（decoder + encoder，bf16 实测 ≈5.3GB）只服务过渡块的
+            // decode→encode 往返；rho=0（needsPixelAnchor=false）时 liftPixelAnchor 为
+            // nil、不会调用 hooks 的 decode/encode，故按需加载，rho=0 直接省掉这 5.3GB。
+            // lowOnly 模式（IC 链路）连过渡块都不跑，同样跳过 VAE 加载。
+            var slVaeWeights: H3Weights?
+            var slVae: H3VAE?
+            if slCfg.needsPixelAnchor && !selfLiftLowOnly {
+                slVaeWeights = try H3Weights(url: wURL("video_vae.safetensors"))
+                slVaeWeights?.cacheEnabled = false
+                slVae = try H3VAE.load(slVaeWeights!)
+                h3MemLog("SelfLift 像素锚点 VAE 已加载（≈5.3GB，仅过渡块使用）")
+            } else {
+                h3MemLog("SelfLift ρ=0：跳过像素锚点 VAE 加载（省 ≈5.3GB）")
+            }
+            let slHooks = SelfLiftH3Hooks(
+                decodeToPixels: { px in
+                    guard let vae = slVae else {
+                        fatalError("SelfLift: needsPixelAnchor=false（rho=0）时像素锚点解码不应被调用")
+                    }
+                    return vae.decoder.decode(px)
+                },
+                encodeToLatent: { z in
+                    guard let vae = slVae else {
+                        fatalError("SelfLift: needsPixelAnchor=false（rho=0）时像素锚点编码不应被调用")
+                    }
+                    return vae.encoder.encodeVideo(z)
+                },
+                // ★ 像素锚点 VAE（decoder + encoder，bf16 实测 ≈5.3GB）只服务过渡块；
+                //   Runner 在过渡块出口屏障（已 Stream.gpu.synchronize()）后回调此处提前置 nil，
+                //   把这 5.3GB 从高分段（全分辨率 ~39k token × 高分 NFE）基线里摘掉。
+                //   只放手：**不 clearCache、不动 cacheLimit**（撤销依据见 SelfLiftH3 入口屏障注释 ①②）；
+                //   放掉的权重 buffer 落进空闲池，被高分段每步中间量命中复用。
+                releasePixelVAE: { slVae = nil; slVaeWeights = nil })
+            let slOut = try runH3Stage1WithSelfLift(
+                dit: dit!,
+                textStates: refined,
+                condRowsFull: condRows,
+                refBlocks: refBlocks,
+                textTags: textTagsForLayout,
+                latT: Int(latentT),
+                latH: latH,
+                latW: latW,
+                latC: latC,
+                audioT: audioT,
+                textLen: UInt32(textHidden.shape[0]),
+                frameCount: frameCount,
+                sigmas: sigmas,
+                shiftV: sv,
+                shiftA: sa,
+                seed: seed,
+                sparsePolicy: sparsePolicy,
+                attentionBroadcastK: pabK,
+                cfg: slCfg,
+                hooks: slHooks,
+                log: log,
+                lowOnly: selfLiftLowOnly,
+                textStatesNeg: refinedNeg)
+            videoX = slOut.videoX
+            audioX = slOut.audioX
+            MLX.eval(videoX, audioX)
+            slVae = nil
+            slVaeWeights = nil
+            MLX.Memory.clearCache()
+            h3MemLog("SelfLift 像素锚点 VAE 已释放（回到全分辨率 \(latW)×\(latH) latent）")
+        } else {
+            if !selfLiftEnabled {
+                log("SelfLift 第三分支：关闭，走原单条 stage1 循环（单遍直出）")
+            } else {
+                log("SelfLift 第三分支：N=\(stage1SegmentCount) < 2，无法切分低分/高分两段，走原单条 stage1 循环")
+            }
         for i in 0..<stage1SegmentCount {
             let stepT = Date()
             // 分阶段门控（默认已取消）：sparseGatePercent 为 nil 时走 else 分支 —— 全程
@@ -370,6 +691,7 @@ public enum H3FL2VAPipeline {
             MLX.eval(videoX, audioX)
             log("step \(i + 1)/\(stage1SegmentCount) sigma \(String(format: "%.4f", sigma)) dsigma \(String(format: "%.4f", dsigma)) [\(gateMode)\(pabMark)]（\(Int(-Date().timeIntervalSince(stepT)))s）")
         }
+        }   // ← 原单条 stage1 循环结束（SelfLift 第三分支的开/else 收口）
         let pvMean: Float = videoX.mean().item()
         let pvVar: Float = ((videoX * videoX).mean() - videoX.mean() * videoX.mean()).item()
         log("STAT post videoX mean=\(pvMean) std=\(pvVar.squareRoot())")
@@ -395,7 +717,14 @@ public enum H3FL2VAPipeline {
         // 几何空间×scale → 按 refineSigmas 起点加噪 → 低步 Euler 精修，
         // 全程不落地像素，最终 zForDecode 直接喂 VAE decode（行数按放大网格重建）。
         var zForDecode: MLXArray
-        if let s2cfg = stage2, s2cfg.scale > 1 {
+        if selfLiftLowOnly, selfLiftEnabled, stage1SegmentCount >= 2 {
+            // SelfLift lowOnly：runner 已直接返回低清 NCDHW latent [1,C,T,latHl,latWl]（半清网格），
+            // 不再是全清 rows——stage2 放大与 rows→zlat reshape 全部跳过；
+            // 高分（升频×2 + 精修）在 LTX 二采侧完成（fullResInput=false）。
+            zForDecode = videoX
+            MLX.eval(zForDecode)
+            log("SelfLift lowOnly：直接采用低清 zForDecode \(zForDecode.shape)（半清，高分交由 LTX 二采升频×2 + IC 精修）")
+        } else if let s2cfg = stage2, s2cfg.scale > 1 {
             let sc = s2cfg.scale
             guard sc == 2 else {
                 throw NSError(domain: "H3FL2VA", code: 12,
@@ -517,13 +846,55 @@ public enum H3FL2VAPipeline {
         ditWeights = nil
         MLX.Memory.clearCache()
 
-        // ── 5. VAE 解码 + 写无声 mp4（同一池内完成：像素大数组写完立即释放，再进音频段） ──
-        var decWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
-        var decoder: H3VAE? = try H3VAE.load(decWeights!)
+        // ── 4.9 H3→LTX latent 直通适配器（可选）：在 VAE 解码之前拦截 clean latent ──
+        // 官方 H3-to-LTX-Latent-Adapter：H3 归一化 latent →［时间线性重采样 + 最近邻打包(3 槽)
+        // → 2× pixel-unshuffle → Conv3D 残差主干］→ LTX 归一化 latent，可直接进 LTX Stage2 refine。
+        // 一步替代「H3 VAE decode → 像素 → LTX VAE encode」两步像素往返。
+        // 适配器不改变采样结果，失败时自动回退原像素桥路径（不影响出片）。
+        var adapterActive = false
+        var adapterSkipDecode = false
+        var silentPath = proResOutput ? (outPath + ".silent.mov") : (outPath + ".silent.mp4")
         var fCount = 0
         var h = 0
         var w = 0
-        let silentPath = proResOutput ? (outPath + ".silent.mov") : (outPath + ".silent.mp4")
+        if let adapter = h3ToLTXAdapter, let bridge = stage2MemBridge {
+            do {
+                let tA = Date()
+                let latShape = zForDecode.shape
+                let ltxLatent = try adapter.convert(h3LatentNCDHW: zForDecode, pixelFrames: Int(frameCount))
+                bridge.ltxHalfLatent = ltxLatent
+                bridge.adapterPixelWidth = latShape[4] * H3ToLTXAdapterConst.h3SpatialCompression
+                bridge.adapterPixelHeight = latShape[3] * H3ToLTXAdapterConst.h3SpatialCompression
+                adapterActive = true
+                adapterSkipDecode = adapterSkipH3Decode
+                let aSec = String(format: "%.1f", Date().timeIntervalSince(tA))
+                log("★ H3→LTX 适配器直通完成（\(aSec)s）：H3 latent \(latShape) → LTX latent \(ltxLatent.shape)"
+                    + "（等效像素 \(bridge.adapterPixelWidth)×\(bridge.adapterPixelHeight) @ \(frameCount) 帧）"
+                    + "，已省去 LTX VAE 编码\(adapterSkipH3Decode ? "与 H3 VAE 解码" : "")")
+            } catch {
+                adapterActive = false
+                adapterSkipDecode = false
+                stage2MemBridge?.ltxHalfLatent = nil
+                log("⚠️ H3→LTX 适配器不可用（\(error.localizedDescription)），回退像素桥路径（H3 decode → LTX encode）")
+            }
+        }
+
+        // ── 5. VAE 解码 + 写无声 mp4（同一池内完成：像素大数组写完立即释放，再进音频段） ──
+        // adapter 直通且要求跳解码时不进此段：无 stage1 mp4，音轨改由 5.1 单独落 wav 承载。
+        if adapterActive && adapterSkipDecode {
+            h = stage2MemBridge?.adapterPixelHeight ?? 0
+            w = stage2MemBridge?.adapterPixelWidth ?? 0
+            fCount = Int(frameCount)
+            // 像素为空，但尺寸/帧率元数据仍需回填：二采据此推输出帧率与日志几何。
+            stage2MemBridge?.width = w
+            stage2MemBridge?.height = h
+            stage2MemBridge?.frameCount = fCount
+            stage2MemBridge?.fps = Int(H3Const.fps)
+            log("⏭️ adapter 直通模式：跳过 H3 VAE 解码，不写 stage1 mp4"
+                + "（像素几何 \(w)×\(h) @ \(fCount) 帧，仅供 LTX 侧尺寸推导）")
+        } else {
+        var decWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
+        var decoder: H3VAE? = try H3VAE.load(decWeights!)
         try autoreleasepool {
             let pixels = decoder!.decode(zForDecode)
             MLX.eval(pixels)
@@ -553,6 +924,7 @@ public enum H3FL2VAPipeline {
         decWeights = nil
         MLX.Memory.clearCache()
         log("无声 mp4 已写出：\(silentPath)（\(fCount) 帧 \(w)×\(h)），VAE 解码器与像素数组已释放")
+        }
 
         // ── 5.1 音频 vocoder 解码 + 混入音轨 ──
         // 对齐 minimax_h3_audio.zig：audioRows [2T,32] → audioRowsToLatent
@@ -578,22 +950,39 @@ public enum H3FL2VAPipeline {
             writeWav(pcm, sampleRate: H3AudioConst.sampleRate,
                      channels: H3AudioConst.stereoChannels, to: wavPath)
             log("wav 已写出：\(wavPath)")
-            try muxAudio(videoPath: silentPath, wavPath: wavPath, to: outPath, proRes: proResOutput)
-            log("音轨已混入：\(outPath)")
-            try? FileManager.default.removeItem(atPath: wavPath)
-            try? FileManager.default.removeItem(atPath: silentPath)
+            if adapterActive && adapterSkipDecode {
+                // adapter 直通：无 stage1 视频可混流，保留 wav 作为音轨载体，
+                // 由 LTX 二采在最终出片时混流（见 bridge.audioTrackPath）。
+                stage2MemBridge?.audioTrackPath = wavPath
+                log("音轨载体已保留（adapter 直通，无 stage1 mp4）：\(wavPath)")
+            } else {
+                try muxAudio(videoPath: silentPath, wavPath: wavPath, to: outPath, proRes: proResOutput)
+                log("音轨已混入：\(outPath)")
+                try? FileManager.default.removeItem(atPath: wavPath)
+                try? FileManager.default.removeItem(atPath: silentPath)
+            }
         } catch {
             // 音频失败不丢视频：无声 mp4 兜底保留为 outPath
             log("⚠️ 音频解码/混流失败（\(error.localizedDescription)），保留无声 mp4")
-            if FileManager.default.fileExists(atPath: outPath) {
-                try? FileManager.default.removeItem(atPath: outPath)
+            if adapterActive && adapterSkipDecode {
+                log("   （adapter 直通模式无 stage1 视频，需由 LTX 侧无声产物兜底）")
+            } else {
+                if FileManager.default.fileExists(atPath: outPath) {
+                    try? FileManager.default.removeItem(atPath: outPath)
+                }
+                try? FileManager.default.moveItem(atPath: silentPath, toPath: outPath)
             }
-            try? FileManager.default.moveItem(atPath: silentPath, toPath: outPath)
         }
         // 总耗时：分钟进制度（≥60s 显示 Xm Ys，否则仅 Xs）
         let totalSec = Int(Date().timeIntervalSince(t0))
         let totalStr = totalSec >= 60 ? "\(totalSec / 60)m \(totalSec % 60)s" : "\(totalSec)s"
-        log("视频写出完成：\(outPath)（\(fCount) 帧 \(w)×\(h)，总耗时 \(totalStr)）")
+        if adapterActive && adapterSkipDecode {
+            let latShape = stage2MemBridge?.ltxHalfLatent?.shape ?? []
+            log("H3 阶段完成（adapter 直通，未解码像素）：LTX latent \(latShape)，"
+                + "像素几何 \(w)×\(h) @ \(fCount) 帧，音轨载体 \(stage2MemBridge?.audioTrackPath ?? "无")，总耗时 \(totalStr)")
+        } else {
+            log("视频写出完成：\(outPath)（\(fCount) 帧 \(w)×\(h)，总耗时 \(totalStr)）")
+        }
         return outPath
     }
 }
@@ -630,4 +1019,16 @@ private func h3SpatialUpsample2x5D(_ z: MLXArray) -> MLXArray {
     let xT = xW.transposed(0, 1, 2, 4, 3)                        // [1,C,T,2w,h]
     let xH = lin2xLast(xT)                                       // [1,C,T,2w,2h]
     return xH.transposed(0, 1, 2, 4, 3)                          // [1,C,T,2h,2w]
+}
+
+// MARK: - ref2va 参考图工具
+
+/// 读取图片像素尺寸（不解码整图，供 reference canvas 计算）。
+func h3ImagePixelSize(_ path: String) -> (w: Int, h: Int)? {
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+          let w = props[kCGImagePropertyPixelWidth] as? Int,
+          let h = props[kCGImagePropertyPixelHeight] as? Int,
+          w > 0, h > 0 else { return nil }
+    return (w, h)
 }

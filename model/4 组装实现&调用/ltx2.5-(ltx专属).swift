@@ -1240,39 +1240,135 @@ func runLTXStage2RefineOnLatent(
     guideWeight: Float = 0,   // 全片 latent guide 强度（0=关闭）。>0 时以整片 normLat 为 guide，自动禁用 imagePaths 首尾硬钉
     headTailGuideBlend: Float = 0.5,  // guide>0 且传 imagePaths 时：首/尾帧的 guide 目标在「源 normLat 帧」与「外部首尾帧 latent」间的渗透系数（0=只锁源=现状；1=首尾帧 guide 完全指向外部图）。软引导语义：guide 是每步回拉而非 mask 硬钉，首尾帧不会被迫等于参考图
     tailGuideMask: Float = 0,  // 尾帧 mask（对齐官方 keyframe-guide 软语义）：0=硬钉外部图（旧语义）；>0=软引导，越大模型自由度越高、贴近参考程度越低。仅 imagePaths≥2 分支生效，首帧保持硬钉
-    icLoRAEnable: Bool? = nil, // IC-LoRA Pixel Spatial Upscaler x2 官方模式：nil=默认关闭（非 IC 路径，收敛旧版 32640 量级，不再按 icLoRAPath 是否存在于 auto 启用）；true=强制启用。LTX_IC_LORA=1/0 环境变量可再覆盖
-    icLoRAPath: String = ICLoRADefaultPath  // 官方 IC-LoRA 权重路径（默认见 ICLoRA-(ltx专属).swift；LTX_IC_LORA_PATH 可覆盖）
+    icLoRAEnable: Bool? = nil, // IC-LoRA Pixel Spatial Upscaler x2 官方模式（改造 C 后为默认路径）：H3 像素桥队列调用点显式传 true；nil=按 LTX_IC_LORA 判定（未设环境变量时由 icLoRAEnable 决定，不按 icLoRAPath 是否存在 auto 启用）；LTX_IC_LORA=1/0 环境变量优先级最高
+    icLoRAPath: String = ICLoRADefaultPath,  // 官方 IC-LoRA 权重路径（默认见 ICLoRA-(ltx专属).swift；LTX_IC_LORA_PATH 可覆盖）
+    // ★ 新增「第二阶段·CQ 清晰度增强」通道（官方 CQ Video Enhancer LoRA；与 IC 像素桥二采并存、互斥，CQ 优先）：
+    //   · 仅做清晰度增强（生成式增强，不改脸/不重绘构图）：复用同一 in-context 骨架 —— 主序列从
+    //     升频 latent 加噪起采，参考序列 = H3 一采半清视频整段 latent 作 KV，空文本条件；
+    //   · σ 锁官方 9 段（σ0=1.0 / 8 步）+ 官方 euler_ancestral；LoRA 强度 1.0；
+    //   · LTX_CQ_ENHANCER=1/0 环境变量可强制开关（未设时看本参数）。
+    cqEnhancerEnable: Bool = false,
+    cqEnhancerPath: String = cqEnhancerDefaultPath,   // LTX_CQ_ENHANCER_PATH 可覆盖
+    cqLoRAStrength: Float = cqEnhancerStrength,       // 官方工作流 strength_model=1.0
+    // ★ 全清直通模式（H3 一采直出目标尺寸，2026-09-17）：H3 SelfLift 内部已做 ×0.5 低清→全清，
+    //   LTX 二采直接收到**全清网格 latent**（空间压缩 32 的 norm 域 latent，对应全清像素）。
+    //   true 时：跳过 SelfLift 解耦低清段（H3 已做低清段）、跳过空间升频×2（normLat=halfLatent）、
+    //   IC/CQ 参考几何退化为 factor=1 同格同位（参考 = 输入全清网格自身）。
+    fullResInput: Bool = false
 ) -> MLXArray? {
     let tS2 = Date()
+    // ★ IC/CQ 通道使能判定提前（SelfLift 解耦低清段需在升频之前知晓 IC 通道是否启用；
+    //   原判定位于 in-context 分支前段，此处上移后该处直接复用同一份判定，避免漂移）。
+    //   LTX_IC_LORA="1"=强制开 "0"=强制关 其它=看 icLoRAEnable（H3 像素桥队列默认 true）
+    let icModeFlag = ProcessInfo.processInfo.environment["LTX_IC_LORA"]
+    let icRequested = (icModeFlag == "1") || (icModeFlag != "0" && icLoRAEnable == true)
+    let cqModeFlag = ProcessInfo.processInfo.environment["LTX_CQ_ENHANCER"]
+    let cqRequested = (cqModeFlag == "1") || (cqModeFlag != "0" && cqEnhancerEnable)
+    // in-context 官方骨架总开关：IC / CQ 任一启用即走官方骨架（guide / 锚定 / 首尾帧一律停用）
+    let inCtxRequested = cqRequested || icRequested
+
+    // ★★ SelfLift 解耦（LTX IC 二采版，2026-09-17）：半清低清段 2 步（普通 5D Euler refine，
+    //   无 IC 参考、无 LoRA 旁路）→ 升频 ×2 → 重加噪 σ_next → 高清段 IC 官方骨架 2 步收细节。
+    //   总 NFE = 低2+高2 = 4（官方 IC 单段 3 步；低清 2 步跑 1/4 网格，算力 ≈ 2.5 全清步）。
+    //   语义与 H3 一采 SelfLift 解耦同源：低清段先锁定时间-光照一致的结构，升频后高清段只补细节，
+    //   缓解高分辨率短步数下的帧间闪烁。仅 IC 通道生效（CQ 官方 9 段锁档不参与）；
+    //   环境变量 NA_PIX_SELFLIFT_DECOUPLE=0 关闭 → 回到原单段 3 步 IC 官方路径。
+    var decoupledRefLatent: MLXArray? = nil
+    // fullResInput（全清直通）下解耦低清段整体跳过：H3 一采 SelfLift 内部已做「低清→升频→高清」，
+    // LTX 二采收到的已是全清网格，无需再跑一次半清低清段。
+    if !fullResInput && icRequested && !cqRequested && ProcessInfo.processInfo.environment["NA_PIX_SELFLIFT_DECOUPLE"] != "0" {
+        let decLow = ltx25Stage2SigmasDecoupleLow
+        let decHigh = ltx25Stage2SigmasDecoupleHigh
+        let halfG = GenConfig(numFrames: pixelFrames, height: fullPixelHeight / 2, width: fullPixelWidth / 2,
+                              frameRate: frameRate, numSteps: 8, seed: seed)
+        let (_, halfPos) = makeVideoLatentAndPos(g: halfG)
+        pipelineLog("🧩 [像素桥] SelfLift 解耦开启（IC 通道）：低清段半清 \(halfLatent.shape) \(decLow.count - 1) 步（σ0=\(decLow[0])→σ_k=\(decLow[decLow.count - 1])）→ 升频×2 → 重加噪 σ_next=\(decHigh[0]) → 高清段 IC 官方骨架 \(decHigh.count - 1) 步，总 NFE = \(decLow.count - 1 + decHigh.count - 1)")
+        MLXRandom.seed(seed &+ 0xDEC0_0000)  // 魔数 DEC0-0000（decouple），与其它通道种子错开
+        let halfNoise = MLXRandom.normal(halfLatent.shape).asType(halfLatent.dtype)
+        let halfInit = (halfLatent * (1 - decLow[0]) + halfNoise * decLow[0]).asType(halfLatent.dtype)
+        let (halfV, _) = runOnBigStack {
+            sampleLatentsDistilled(
+                dit: dit,
+                noiseV: halfInit,
+                noiseA: noiseA, condV: condV, condA: condA,
+                negV: nil, negA: nil,
+                frozenAudio: nil,
+                initVideo: nil, cleanV: nil, condMask: nil,
+                keyframesMLX: nil,
+                guideClean: nil, guideWeight: 0,
+                videoPos: halfPos, audioPos: audioPos,
+                numSteps: decLow.count - 1,
+                sigmas: decLow,
+                ancestral: false,
+                seed: seed,
+                sparseVideo: nil,
+                isCancelled: isCancelled)
+        }
+        if isCancelled() {
+            pipelineLog("⏹ [像素桥] SelfLift 解耦低清段已取消")
+            return nil
+        }
+        eval(halfV)
+        decoupledRefLatent = halfV.asType(halfLatent.dtype)
+        pipelineLog("✅ [像素桥] SelfLift 解耦低清段完成：\(halfV.shape)（\(Int(Date().timeIntervalSince(tS2)))s）")
+    }
+    // ★ LoRA 旁路（IC 二采 / CQ 清晰度增强）挂载生命周期：必须在**函数级**注册关闭动作。
+    //   历史缺陷：原先把 `defer { dit.setICActive(false) }` 写在 `if icModeEnabled { ... }` 块内，
+    //   Swift 的 defer 在**该块结束**（即挂载完成后、if 块闭合处）即触发，而真正的采样发生在其后的
+    //   runOnBigStack/闭包内 —— 结果是采样全程 icActive/cqActive 恒为 false：LoRA 增量完全不注入，
+    //   但参考 KV token 仍然被拼进序列（分布外输入）→ 二采崩坏 / 换脸。此标志 + defer 修正为函数级，
+    //   覆盖采样全过程，函数返回前统一关闭，原生路径不受污染。
+    var loraBypassAttached = false
+    defer {
+        if loraBypassAttached {
+            dit.setICActive(false)
+            dit.setCQActive(false)
+        }
+        // 编译缓存标签复位：避免影响后续非旁路路径（stage1 / 原生 refine）的编译槽位
+        LoRABypassTag.current = "off"
+    }
     pipelineLog("=== [像素桥] Stage2 通用 refine：升频 ×2 + \(sigmas.count - 1) 步（σ0=\(sigmas[0])）锚定=\(anchorEveryNFrames)帧/softM=\(softAnchorMask)/guideW=\(guideWeight)/tailM=\(tailGuideMask)===")
     let s2c = Stage2Config.refine(g: GenConfig(numFrames: pixelFrames, height: fullPixelHeight,
                                                width: fullPixelWidth, frameRate: frameRate,
                                                numSteps: 8, seed: seed))
     let vaeDecPath = s2c.vaeDecoderPath
     let upPath = s2c.upscalerPath
-    guard let ms = loadVAEMeanStd(path: vaeDecPath) else {
-        pipelineLog("⚠️ [像素桥] refine 权重加载失败（mean/std 或升频器）")
-        return nil
-    }
-    // upW/denorm/upLatent 声明为 var：升频（eval(normLat)）完成后本函数后续不再引用，
+    // upW/denorm/upLatent 声明为 var（可选）：升频（eval(normLat)）完成后本函数后续不再引用，
     // 编译窗口前由「显式回收块」置空释放（见 ensureLoose·force 之后），让位给 DiT 编译峰值。
-    guard var upW = try? MLX.loadArrays(url: URL(fileURLWithPath: upPath)) else {
-        pipelineLog("⚠️ [像素桥] refine 权重加载失败（mean/std 或升频器）")
-        return nil
+    // fullResInput（全清直通）下这些升频相关量不产生，保持 nil。
+    var upW: [String: MLXArray]? = nil
+    var denorm: MLXArray? = nil
+    var upLatent: MLXArray? = nil
+    let normLat: MLXArray
+    if fullResInput {
+        // ★ 全清直通：H3 一采已直出**全清网格** latent（SelfLift 内部完成低清→全清），
+        //   LTX 二采不再需要空间升频×2 —— normLat 直接取输入 latent（空间压缩 32 对应全清像素）。
+        normLat = halfLatent
+        pipelineLog("✅ [像素桥] 全清直通（fullResInput）：跳过空间升频×2 与 mean/std/升频器加载，normLat = halfLatent \(normLat.shape)（H3 SelfLift 内部已升频）")
+    } else {
+        guard let ms = loadVAEMeanStd(path: vaeDecPath) else {
+            pipelineLog("⚠️ [像素桥] refine 权重加载失败（mean/std 或升频器）")
+            return nil
+        }
+        guard let loadedUp = try? MLX.loadArrays(url: URL(fileURLWithPath: upPath)) else {
+            pipelineLog("⚠️ [像素桥] refine 权重加载失败（mean/std 或升频器）")
+            return nil
+        }
+        upW = loadedUp
+        let mean = ms.mean.asType(halfLatent.dtype)
+        let std = ms.std.asType(halfLatent.dtype)
+        // ⏭️ 对照开关（仅排查用）：PIX_SKIP_UPSCALE=1 时连空间升频也跳过（半清 latent 直接解码），
+        //    用于区分 RGB 色边来自 VAE 往返（encode→decode）还是升频器/refine 链路。
+        if ProcessInfo.processInfo.environment["PIX_SKIP_UPSCALE"] == "1" {
+            pipelineLog("⏭️ [像素桥] PIX_SKIP_UPSCALE=1：跳过升频与 refine，半清 latent 直接解码（对照实验）")
+            return halfLatent
+        }
+        denorm = decoupledRefLatent.map { $0 * std + mean } ?? (halfLatent * std + mean)
+        upLatent = latentUpsamplerSpatial(weights: upW!, latentNDHWC: denorm!)
+        normLat = ((upLatent! - mean) / std).contiguous()
+        eval(normLat)
+        pipelineLog("✅ [像素桥] 空间升频完成（\(Int(Date().timeIntervalSince(tS2)))s）：\(denorm!.shape) → \(normLat.shape)\(decoupledRefLatent != nil ? "（SelfLift 解耦：升频源 = 低清段 refine 产物，非 H3 原片）" : "")")
     }
-    let mean = ms.mean.asType(halfLatent.dtype)
-    let std = ms.std.asType(halfLatent.dtype)
-    // ⏭️ 对照开关（仅排查用）：PIX_SKIP_UPSCALE=1 时连空间升频也跳过（半清 latent 直接解码），
-    //    用于区分 RGB 色边来自 VAE 往返（encode→decode）还是升频器/refine 链路。
-    if ProcessInfo.processInfo.environment["PIX_SKIP_UPSCALE"] == "1" {
-        pipelineLog("⏭️ [像素桥] PIX_SKIP_UPSCALE=1：跳过升频与 refine，半清 latent 直接解码（对照实验）")
-        return halfLatent
-    }
-    var denorm = halfLatent * std + mean
-    var upLatent = latentUpsamplerSpatial(weights: upW, latentNDHWC: denorm)
-    let normLat = ((upLatent - mean) / std).contiguous()
-    eval(normLat)
-    pipelineLog("✅ [像素桥] 空间升频完成（\(Int(Date().timeIntervalSince(tS2)))s）：\(halfLatent.shape) → \(normLat.shape)")
     // ⏭️ 对照开关（仅排查用）：PIX_SKIP_REFINE=1 时只做 encode+升频+decode，跳过 refine，
     //    用于数值拆解 RGB 色边到底来自 refine 还是 encode/升频/decode 公共链。
     if ProcessInfo.processInfo.environment["PIX_SKIP_REFINE"] == "1" {
@@ -1301,16 +1397,26 @@ func runLTXStage2RefineOnLatent(
     var icKeyframesZeros: MLXArray? = nil
     var refineClean: MLXArray? = nil
     var refineMask: [Float]? = nil
-    // guideClean 目标帧（guideWeight>0 时传给采样核心的干净 guide）：
+    // CQ 采样器：官方工作流为 euler_ancestral（默认 true）；LTX_CQ_ANCESTRAL=0 切确定性 Euler
+    // （icModeFlag / icRequested / cqModeFlag / cqRequested / inCtxRequested 已提前到函数开头声明，此处复用）
+    let cqAncestralRequested = ProcessInfo.processInfo.environment["LTX_CQ_ANCESTRAL"] != "0"
+    // guideClean 目标帧（guideWeight>0 时传给采样核心的干净 guide；仅非 IC 路径使用）：
     // 默认整片 = 源 normLat（现状：锁源精修，模型看不到外部参考）。
     // guide>0 且调用方仍传入 imagePaths 时 → 「强度锁 + 首尾帧软引导」并存：
     // 首/尾帧的 guide 目标改为 源帧与外部参考 latent 的渗透混合（headTailGuideBlend），
     // 中段保持锁源 normLat。guide 每步只是把 vx 拉回目标轨迹，不替换任何帧、
     // 无 mask 硬钉，因此参考图是「软引导」——模型有自由落笔空间，不会被迫让首帧等于参考图
     // （规避 v1.1 全分辨率硬钉导致的 RGB 色边/接缝）。
+    // 注（改造 C / CQ 扩展）：该块仅服务非 in-context 旧路径，故整块加 !inCtxRequested 互斥；
+    // 官方 IC / CQ stage2 均无 guideClean / guiding_latents 概念，两条通道下 guideCleanTarget 恒为 nil。
     var guideCleanTarget: MLXArray? = nil
-    let useImageAnchors = !imagePaths.isEmpty && guideWeight <= 0
-    if !imagePaths.isEmpty, guideWeight > 0 {
+    // 首/尾帧锚定（含首帧 mask=0 硬钉、中间帧稀疏软锚定）：官方 stage2 无此机制，
+    // 仅在「非 in-context + 显式传入参考图 + 未开 guide」时才允许；IC / CQ 模式下一律关闭。
+    let useImageAnchors = !inCtxRequested && !imagePaths.isEmpty && guideWeight <= 0
+    // image 来源 guide 软引导（非 in-context 旧路径能力，v2.0 软引导语义）：guideWeight>0 且传入
+    // imagePaths 时，把参考图 VAE 编码后按 headTailGuideBlend 渗透进 guideCleanTarget 首/尾帧，
+    // 中段仍锁源 normLat。IC / CQ 模式不参与（官方 in-context stage2 无 guideClean 机制）。
+    if !inCtxRequested, !imagePaths.isEmpty, guideWeight > 0 {
         pipelineLog("ℹ️ [像素桥] guideWeight>0 + imagePaths：首/尾帧并入 guide 软引导（渗透 headTailGuideBlend=\(headTailGuideBlend)，中段仍锁源 normLat；非 mask 硬钉）")
         autoreleasepool {
             guard let ew = try? MLX.loadArrays(url: URL(fileURLWithPath: s2c.vaeEncoderPath ?? Stage2Config.vaeEncoder)) else {
@@ -1411,152 +1517,279 @@ func runLTXStage2RefineOnLatent(
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // IC-LoRA 官方模式（Pixel Spatial Upscaler x2，H3 二采专用）
+    // in-context 官方模式（IC-LoRA 二采 与 CQ 清晰度增强 共用骨架，互斥执行、CQ 优先）
+    // 【原分支】IC-LoRA Pixel Spatial Upscaler x2（H3 二采专用）
     // 严格按官方模型卡协议（reference_video_cond.py + model_card 两阶段采样），
     // 不再引入自创的 grid-dilate 零填充：
-    //   ① 参考序列 = 半清视频整段 VAE latent（norm 域，H/2×W/2）直接 token 化
-    //      追加：官方 VideoConditionByReferenceLatent 把参考 latent patchify 成
-    //      F·h·w 稀疏真实 token 拼到主序列尾（无 0 填充占位），主干以 3D token 级
-    //      序列处理（[1, NvMain+NvRef, C]）；main 语义同 5D 网格仅是 reshape 形态差。
-    //   ② 主区加噪 x_t = normLat·(1-σ0) + noise·σ0（σ0=0.909375）；参考区噪声槽
-    //      填 0（官方 latent_noise 参考区不灌噪声，per-token σ=0 恒为 clean）。
+    // 【新分支】CQ Video Enhancer LoRA（第二阶段·CQ 清晰度增强，本文件新增）
+    //   与 IC 骨架完全相同（①~④、⑥ 全部复用），仅三处官方差异：
+    //     ⑤-1 LoRA 换成 ltx2.5-CQ-enhancer-lora-for-videos-rank128（strength=1.0 / 48 层 26 模块全键，
+    //          含音频流与 AV 交叉的低秩项；见 CQEnhancer-(ltx专属).swift）——仅清晰度增强，不换脸/不重绘构图；
+    //     ⑤-2 σ 档换成官方 CQ 工作流 ManualSigmas 9 段（σ0=1.0 / 8 步，cqEnhancerSigmas）；
+    //     ⑤-3 采样器换成官方 euler_ancestral（LTX_CQ_ANCESTRAL=0 可回退确定性 Euler）。
+    //   开关：设置项 videoUseCQEnhancer（AppSettings）或环境变量 LTX_CQ_ENHANCER=1/0；
+    //   权重路径：cqEnhancerDefaultPath（LTX_CQ_ENHANCER_PATH 覆盖）。
+    //   ① 参考序列 = 源视频整段 VAE latent（norm 域）直接 token 化追加：官方
+    //      VideoConditionByReferenceLatent 把参考 latent patchify 成 F·h·w 稀疏真实 token
+    //      拼到主序列尾（无 0 填充占位），主干以 3D token 级序列处理（[1, NvMain+NvRef, C]）；
+    //      main 语义同 5D 网格仅是 reshape 形态差。★参考网格由 LoRA 元数据
+    //      reference_downscale_factor 决定（不再硬编码）：factor=2（IC x2 放大器）→ 半清格
+    //      halfLatent；factor=1（CQ Enhancer 权重无 __metadata__ → 官方默认 1）→ 参考与目标同格
+    //      （参考 token = 目标网格 latent）。
+    //   ② 主区加噪 x_t = tgtLatent·(1-σ0) + noise·σ0（σ0 = 通道档：IC 0.909375 / CQ 1.0）；
+    //      参考区噪声槽填 0（官方 latent_noise 参考区不灌噪声，per-token σ=0 恒为 clean）。
     //   ③ 参考区 per-token timestep=0（condMask 尾部 0，denoise_mask=0：参考区
     //      只提供 KV、自身 x0 恒写回 clean 参考，不参与重建）；
-    //   ④ 参考区 RoPE 坐标 = 半清格像素中点 × downscale_factor(2) 映射回全清网格
-    //      （官方 positions h/w × scale_factors），t 轴与主帧同一视频时间；
-    //   ⑤ LoRA 全程开启（scale=1.0 预缩放、48 层全键注入），主序列从 σ0=0.909375
-    //      按官方 STAGE_2_DISTILLED_SIGMAS 4 步档蒸馏采样（保留升频锚点，非 1.0 全噪声）；
+    //   ④ 参考区 RoPE 坐标 = 参考格像素中点 × factor 映射回目标网格（官方 positions h/w ×
+    //      scale_factors），t 轴与主帧同一视频时间；★factor=1 时参考区坐标与主区逐 token 完全
+    //      同位（本轮修复点：CQ 不再错乘 2）。LTX_CQ_SAMEGRID=1 时 CQ 目标网格=源网格（官方同格 A/B）。
+    //   ⑤ LoRA 全程开启（CQ scale=1.0 官方强度 / IC 0.5 detailing，48 层全键注入）；
+    //      采样档按通道锁（IC：STAGE_2_DISTILLED 4 步 σ0=0.909375；CQ：ManualSigmas 9 段 σ0=1.0 + 8 步）；
     //      音频沿用像素桥占位/原声（不接 ref）；
     //   ⑥ 采样结束输出仅取主序列（前 NvMain token），参考区不落盘。
     // 外部 imagePaths / guide / anchor 与 IC 官方用法互斥：IC 启用时全部忽略
     // （官方 IC 参考即视频本身，无“外部参考图”概念；不引入 guide 混合）。
+    // in-context 官方骨架启用标志（IC 像素桥二采 / CQ 清晰度增强 共用；两者互斥，CQ 优先）
     var icModeEnabled = false
-    // IC 使能后锁定官方 STAGE_2_DISTILLED_SIGMAS（4 步，σ0=0.909375）+ ancestral SDE；
-    // 非 IC 保留调用方 σ 表。σ0=1.0 的 9 步 t2v 蒸馏档会丢掉升频锚点 → 网格/马赛克。
+    // 本次实际走哪条 in-context 通道（仅 icModeEnabled=true 时有意义）：
+    //   false → IC-LoRA 像素桥二采（原分支，行为与本改造前完全一致）
+    //   true  → CQ Video Enhancer 清晰度增强（新分支）
+    var cqChannelActive = false
+    var icBlocksLoaded: [ICLoRABlock] = []
+    var cqBlocksLoaded: [CQEnhancerBlock] = []
+    // in-context 使能后锁定各自官方 σ 档：
+    //   · IC 二采：官方 STAGE_2_DISTILLED_SIGMAS（4 步，σ0=0.909375）+ 官方确定性 Euler
+    //     （官方 DFR detailing 不传 stepper → EulerDiffusionStep，无 ancestral SDE）；
+    //   · CQ 增强：官方 CQ 工作流 ManualSigmas（9 段，σ0=1.0，8 步）+ 官方 euler_ancestral。
+    // 非 in-context 保留调用方 σ 表。σ0=1.0 的 9 步蒸馏档若无真实参考锚点会丢掉升频锚点
+    // → 网格/马赛克，故该档只在 CQ 通道使用（半清整段 latent 作 KV 参考即重建锚点）。
     var icEffSigmas: [Float] = sigmas
     let icModePath = ProcessInfo.processInfo.environment["LTX_IC_LORA_PATH"] ?? icLoRAPath
-    // IC-LoRA 默认关闭（收敛回旧版 32640 量级非 IC 路径）：仅当 LTX_IC_LORA=1 或显式传入
-    // icLoRAEnable=true 才启用。不再因磁盘存在 icLoRAPath 权重而 auto 启用——此前 auto 曾把
-    // Nv 从 32640 扩到 40800（KV 参考直放 8160 + frozen_a 音频条件），拉高编译窗口峰值顶穿 48G。
-    // LTX_IC_LORA=0 保持强制关语义；KV 参考 / 音频条件等 IC 专属机制随 icModeEnabled=false 一并停用。
-    let icModeFlag = ProcessInfo.processInfo.environment["LTX_IC_LORA"]  // "1"=强制开 "0"=强制关 其它=默认关
-    if icModeFlag == "0" {
-        pipelineLog("ℹ️ [像素桥] IC-LoRA 已被 LTX_IC_LORA=0 关闭，走原 refine 路径")
-    } else if icModeFlag == "1" || icLoRAEnable == true {
+    let cqModePath = ProcessInfo.processInfo.environment["LTX_CQ_ENHANCER_PATH"] ?? cqEnhancerPath
+    // IC 官方参考降采样因子：恒为 2（ICLoRA-(ltx专属).swift 记录其权重元数据
+    // reference_downscale_factor='2'）。按本次任务「IC 像素桥分支行为必须完全不变」的约束，
+    // 此处保留为常量（不随元数据动态漂移；若元数据与该常量不一致仅打印提示，不改变行为）。
+    let icRefFactor = 2
+    // in-context 通道的「目标网格」形状与每帧 token 数（供采样后裁参考区 / SOL 自动 sink 使用）：
+    //   默认 = ×2 升频后的全清格 normLat；CQ 同格模式（LTX_CQ_SAMEGRID=1）= 源半清格 halfLatent。
+    //   非 in-context 路径不读这两个变量（原语义不变）。
+    var icTargetT = normLat.shape[1]
+    var icTargetH = normLat.shape[2]
+    var icTargetW = normLat.shape[3]
+    var icTargetC = normLat.shape[4]
+    var refineTpfOverride: Int? = nil
+    // IC-LoRA 默认开启（改造 C）：H3 像素桥队列调用点显式传 icLoRAEnable=true，二采走官方
+    // in-context 参考路径。注意显存成本：IC 使 Nv 从 32640 扩到 40800（KV 参考直放 8160），
+    // 是编译窗口峰值的主要来源（此前曾顶穿 48G），已由默认关闭 frozen_a 音频条件 + SOL 稀疏
+    // 注意力 + 编译图瘦身缓解。LTX_IC_LORA=0 仍可强制关回非 IC 旧 refine 路径；
+    // 仍不按 icLoRAPath 权重是否存在 auto 启用（只认 LTX_IC_LORA / icLoRAEnable）。
+    // （icModeFlag / icRequested / cqModeFlag / cqRequested 已在本函数前段提前声明，此处直接复用，避免两处判定漂移）
+    if !inCtxRequested {
+        pipelineLog("ℹ️ [像素桥] in-context 官方通道未启用（IC 被关且 CQ 未开），走原 refine 路径")
+    } else if cqRequested, let cqBlocks = CQEnhancerCache.blocks(for: cqModePath, strength: cqLoRAStrength) {
+        // ★ 新增「第二阶段·CQ 清晰度增强」通道（CQ 优先于 IC，二者不并行）
+        cqBlocksLoaded = cqBlocks
+        icModeEnabled = true
+        cqChannelActive = true
+        // ★ CQ 官方协议锁档：官方 CQ 工作流 ManualSigmas 9 段（σ0=1.0 / 8 步）+ euler_ancestral
+        //   （官方 KSamplerSelect=euler_ancestral，CFG=1）。σ0=1.0 起采在此通道成立：主序列虽从
+        //   纯噪声起，但参考序列是源视频整段 latent（per-token σ=0 恒 clean，且与目标**同格同位**），
+        //   CQ LoRA 以生成式增强方式只补细节、不重绘；调用方 σ 表（PIX_SIGMAS/pixRefineSigmas）在此通道不再生效。
+        icEffSigmas = cqEnhancerSigmas
+        // 与 IC 通道同一套官方骨架（无外部参考图、无首帧锁帧、无尾帧 append）。
+        // ★参考网格/相位由 LoRA 元数据 reference_downscale_factor 决定（CQ 权重无 __metadata__ → 1，
+        //   即参考与目标同格同位；不再沿用 IC 的硬编码 2 / nvRef×2 旧注释）；LTX_CQ_SAMEGRID=1 切同格模式。
+        pipelineLog("🎯 [像素桥] CQ 清晰度增强通道：\(URL(fileURLWithPath: cqModePath).lastPathComponent)（strength=\(cqLoRAStrength)）+ \(icEffSigmas.count - 1) 步（σ0=\(icEffSigmas[0])）+ \(cqAncestralRequested ? "euler_ancestral（官方）" : "确定性 Euler（LTX_CQ_ANCESTRAL=0）")，参考 = 源视频整段 latent 作 in-context KV（参考几何按 LoRA 元数据 factor，缺失默认 1 = 同格同位；LTX_CQ_SAMEGRID=1 = 官方同格网格；无外部参考图/无首尾帧锚定）")
+    } else {
+        if cqRequested {
+            pipelineLog("⚠️ [像素桥] CQ Enhancer LoRA 权重不可用（\(cqModePath)），本轮回退原 IC 像素桥二采（不中断第二阶段）")
+        }
         guard let icBlocks = ICLoRACache.blocks(for: icModePath) else {
             pipelineLog("⚠️ [像素桥] IC-LoRA 权重加载失败（\(icModePath)），中止 refine")
             return nil
         }
+        icBlocksLoaded = icBlocks
         icModeEnabled = true
         // ★ IC 官方协议锁档：像素空间超分 x2 走 STAGE_2_DISTILLED_SIGMAS 4 步档
-        //   （ltx25Stage2Sigmas，σ0=0.909375 保留升频锚点）+ ancestral SDE（官方 euler_ancestral，
-        //   CFG=1）。9 步 t2v 蒸馏档 σ0=1.0 把主序列打成纯噪声、参考 KV 又无真实锚点可依
+        //   （ltx25Stage2Sigmas，σ0=0.909375 保留升频锚点）+ 官方确定性 Euler
+        //   （官方 DFR detailing 用确定性 Euler：不传 stepper → EulerDiffusionStep，无
+        //   euler_ancestral / eta，CFG=1）。9 步 t2v 蒸馏档 σ0=1.0 把主序列打成纯噪声、参考 KV 又无真实锚点可依
         //   → 整片彩色网格/马赛克；调用方 σ 表（PIX_SIGMAS/pixRefineSigmas）在 IC 模式不再生效。
-        icEffSigmas = ltx25Stage2Sigmas
-        // 外部尾帧 append 开关：默认关闭——外部尾图 ≠ H3 真实末帧时，append 的强可见性会拽末帧
-        // 造成末尾跳变；末帧交由 IC KV 参考（半清整段 latent 含真实末帧）+ 源结构收敛。
-        // LTX_IC_TAIL=1 可恢复旧 append 语义作对照。
-        let icTailOn = ProcessInfo.processInfo.environment["LTX_IC_TAIL"] == "1"
-        if guideWeight > 0 {
-            pipelineLog("ℹ️ [像素桥] IC 模式不采用 guide 锁源软引导（官方 stage2 无 guideClean），改用下方 keyframe 首帧锚 + KV")
-        }
-        if !imagePaths.isEmpty {
-            pipelineLog("🖼️ [像素桥] IC 模式启用外部首帧满锁 + KV 参考；外部尾帧 append \(icTailOn ? "开启（LTX_IC_TAIL=1）" : "默认关闭（外部尾图≠真实末帧会导致末尾跳变；LTX_IC_TAIL=1 可恢复）")")
-        }
-        // ① 外部首帧 keyframe 引导（官方 combined_image_conditionings / stage2 images 语义，
-        //    IC 模式不再忽略 imagePaths）：
-        //    首帧 = VideoConditionByLatentIndex（latent_cond.py）：替换主序列首帧 clean、mask=0 满锁，
-        //    每步 post_process 强制写回参考图。外部尾帧仅在 LTX_IC_TAIL=1 时按
-        //    VideoConditionByKeyframeIndex（keyframe_cond.py）append 恒 clean token（mask=0，只供注意力）。
-        let tCount = normLat.shape[1]
-        let fh = fullPixelHeight / 32, fw = fullPixelWidth / 32
-        let cCh = normLat.shape[4]
-        guard tCount == halfLatent.shape[1], halfLatent.shape[2] == fh / 2, halfLatent.shape[3] == fw / 2,
-              normLat.shape[2] == fh, normLat.shape[3] == fw else {
-            pipelineLog("❌ [像素桥] IC 网格不匹配：主 \(normLat.shape) vs 目标 \(tCount)×\(fh)×\(fw) / 半清 \(halfLatent.shape)")
-            return nil
-        }
-        let nvMain = tCount * fh * fw
-        let fhw = fh * fw
-        let nvRef = halfLatent.shape[1] * halfLatent.shape[2] * halfLatent.shape[3]
-        // IC KV 参考（半清整段 latent append，官方 stage1 IC 语义）默认保留；LTX_IC_KV=0 可关
-        let icKVOn = ProcessInfo.processInfo.environment["LTX_IC_KV"] != "0"
-        var headTokens: MLXArray? = nil
-        var tailTokens: MLXArray? = nil
-        if !imagePaths.isEmpty, tCount >= 2 {
-            autoreleasepool {
-                guard let ew = try? MLX.loadArrays(url: URL(fileURLWithPath: s2c.vaeEncoderPath ?? Stage2Config.vaeEncoder)) else {
-                    pipelineLog("⚠️ [像素桥] IC keyframe 引导：encoder 加载失败，跳过外部首尾帧（仅 KV）")
-                    return
-                }
-                if let img = loadImageBCFHW(path: imagePaths[0], width: fullPixelWidth, height: fullPixelHeight) {
-                    let head5D = vaeEncodeImage(weights: ew, pixelsBCFHW: img)
-                        .transposed(0, 2, 3, 4, 1).asType(refineInit.dtype)   // [1,1,fh,fw,C] norm 域
-                    eval(head5D)
-                    headTokens = head5D.reshaped([1, fhw, cCh])
-                }
-                if icTailOn, imagePaths.count >= 2,
-                   let imgTail = loadImageBCFHW(path: imagePaths[1], width: fullPixelWidth, height: fullPixelHeight) {
-                    let tail5D = vaeEncodeImage(weights: ew, pixelsBCFHW: imgTail)
-                        .transposed(0, 2, 3, 4, 1).asType(refineInit.dtype)
-                    eval(tail5D)
-                    tailTokens = tail5D.reshaped([1, fhw, cCh])
-                }
+        //   ★ SelfLift 解耦开启时（decoupledRefLatent != nil）：高清段改用解耦 σ 表
+        //     （σ_next=0.421875 重加噪起采 + 2 步收细节），总 NFE = 低2+高2 = 4；主区加噪
+        //     σ0 随 icEffSigmas[0] 自动取 0.421875（升频锚点由低清段产物承继，无需 0.909375 高噪起步）。
+        icEffSigmas = (decoupledRefLatent != nil) ? ltx25Stage2SigmasDecoupleHigh : ltx25Stage2SigmasConserve
+        // 改造 C：原「外部首帧满锁 + 外部尾帧 append」机制已整体移除（见下）。
+        // 官方 IC stage2 的参考语义只有一种：一采低清视频整段 latent 作 KV 参考；
+        // 既无「外部参考图」概念，也无首帧 mask=0 满锁 / 尾帧 append 通道。
+        pipelineLog("🎯 [像素桥] IC 官方模式：外部参考图与首/尾帧锚定已禁用（改造 C），参考 = 一采低清视频整段 latent\(fullResInput ? "（全清直通：H3 直出全清，参考 = 输入全清网格自身，factor=1 同格同位）" : "")")
+    }
+    if icModeEnabled {
+        // ─────────────────────────────────────────────────────────────────────────────
+        // ★★ 参考几何（本轮修复）：参考降采样因子**不再硬编码 2**，改为读 LoRA 权重元数据
+        //    metadata.reference_downscale_factor（缺失 → 官方默认 1）。
+        //    官方口径（官方 IC/CQ 工作流的 VideoConditionByReferenceLatent / LTXAddVideoICLoRAGuide）：
+        //    参考 latent 注入主序列时，其 RoPE 位置 = 参考 latent 所在网格的像素中点 × factor，
+        //    用于映射回主序列所在网格的相位；factor 由 LoRA 训练时写入权重 metadata。
+        //      · IC 像素桥（官方 IC-LoRA x2 放大器）：元数据 factor=2 → 参考 = 半清网格 halfLatent，
+        //        位置 = 半清格像素中点 ×2（映射回全清网格）—— 与本改造前逐值完全一致。
+        //      · CQ 清晰度增强：权重无 __metadata__ → factor=官方默认 1 → 参考必须与目标**同格同位**
+        //        （参考 token = 目标网格 latent，位置沿用主网格 fullPos、不再乘 2）。
+        //    【历史缺陷（本次修复根因）】CQ 通道沿用了 IC 的硬编码 factor=2：参考 latent 取半清网格、
+        //    位置却按 ×2 映射到全清网格 —— 与 CQ 目标网格（×2 升频后的 normLat）在「网格尺寸 + 相位」
+        //    上双重错位，参考 KV 与主序列不在同一相位；叠加 σ0=1.0 纯噪声起采且无 guide 锁源，
+        //    主序列失去唯一有效锚点 → 整段重绘、角色数量与形象全变（CQ 官方只有像素增强，不换脸/不重绘）。
+        let cqRefFactorMeta = cqChannelActive
+            ? loraReferenceDownscaleFactor(path: cqModePath, fallback: 1)
+            : 0
+        // ★ LTX_CQ_SAMEGRID=1：CQ 通道切「官方同格模式」—— 目标网格 = 源网格（不做 ×2 升频），
+        //    即官方 CQ 工作流的原生形态（输入视频与输出同分辨率、factor=1 同格同位）。
+        //    仅影响 CQ 通道；IC 与原 refine 路径不受影响。用于「升频后增强 vs 同格增强」A/B 对比。
+        //    ⚠️ 该模式下 ×2 升频计算仍会照常执行（normLat 已在上游算出），只是不作为目标网格使用；
+        //       仅 A/B 实验用途，工程上未裁剪上游计算（避免为实验开关改动共用升频段）。
+        let cqSameGrid = cqChannelActive
+            && ProcessInfo.processInfo.environment["LTX_CQ_SAMEGRID"] == "1"
+        // 目标网格 latent（主序列 x0 源；决定 NvMain 与采样后裁参考区的形状）：
+        //   IC / CQ（默认）= ×2 升频后的 normLat；CQ 同格模式 = 源半清 halfLatent；
+        //   fullResInput（全清直通）= 输入 latent 自身（normLat == halfLatent，即全清网格）
+        let tgtLatent = cqSameGrid ? halfLatent : normLat
+        let tCount = tgtLatent.shape[1]
+        let tgtH = tgtLatent.shape[2]
+        let tgtW = tgtLatent.shape[3]
+        let cCh = tgtLatent.shape[4]
+        // 目标网格像素尺寸（同格模式的 RoPE 相位基准 = 源像素尺寸 = 全清/2）
+        // fullResInput 下输入即全清网格：目标像素 = 全清像素（不 /2）
+        let tgtPixW = fullResInput ? fullPixelWidth : (cqSameGrid ? max(fullPixelWidth / 2, 32) : fullPixelWidth)
+        let tgtPixH = fullResInput ? fullPixelHeight : (cqSameGrid ? max(fullPixelHeight / 2, 32) : fullPixelHeight)
+        // 目标网格 RoPE 位置：默认沿用 fullPos（全清格，与非 in-context 路径同源）；同格模式按源网格
+        // 重新生成（makeVideoLatentAndPos 同一套 h/w/t 公式，仅网格与像素基准不同）。
+        // fullResInput 下输入即全清网格：直接沿用 fullPos（全清格相位）。
+        let tgtPos: [Float] = fullResInput
+            ? fullPos
+            : (cqSameGrid
+               ? makeVideoLatentAndPos(g: GenConfig(numFrames: pixelFrames, height: tgtPixH, width: tgtPixW,
+                                                    frameRate: frameRate, numSteps: 8, seed: seed)).pos
+               : fullPos)
+        // 生效的参考降采样因子 / 参考 latent：
+        //   factor=2 → 参考 = 源半清网格 halfLatent（位置需 ×2 映射回目标网格）；
+        //   factor=1（含同格模式）→ 参考 = 目标网格 latent（与主序列同格，位置不乘）。
+        //   fullResInput（全清直通）：无半清参考可用（H3 直出全清，低清段由 H3 SelfLift 内部消化），
+        //   IC 参考退化为 factor=1 同格同位（参考 = 输入全清网格自身，官方 CQ 同格语义）。
+        //   备注：更「忠实官方」的 factor=1 参考还可在 RGB 域做往返（半清→解码→×2 升采→conv VAE
+        //   重编码）；本实现直接用升频后的 latent（normLat）作参考，避免一次额外 VAE 往返，留待后续评估。
+        let refFactorEff = fullResInput ? 1 : (cqChannelActive ? (cqSameGrid ? 1 : cqRefFactorMeta) : icRefFactor)
+        let refIsSameGrid = (refFactorEff == 1)
+        let refLatent = refIsSameGrid ? tgtLatent : (decoupledRefLatent ?? halfLatent)
+        let refH = refLatent.shape[2]
+        let refW = refLatent.shape[3]
+        // 网格自洽校验：CQ 通道不再强制「半清网格」关系（默认改为同格），改为按 factor 校验目标/参考比例
+        if cqChannelActive {
+            let gridOK = (refH == tgtH && refW == tgtW)
+                || (refH * refFactorEff == tgtH && refW * refFactorEff == tgtW)
+            guard refLatent.shape[1] == tCount, gridOK, cCh > 0, tgtH > 0, tgtW > 0 else {
+                pipelineLog("❌ [像素桥] CQ 参考网格不自洽：目标 \(tgtLatent.shape) / 参考 \(refLatent.shape)（factor=\(refFactorEff)，同格模式=\(cqSameGrid)，目标像素 \(tgtPixW)×\(tgtPixH)）")
+                return nil
             }
-            MLX.Memory.clearCache()
+        } else {
+            let fh = fullPixelHeight / 32, fw = fullPixelWidth / 32
+            // fullResInput（全清直通）：halfLatent 已是全清网格（H3 直出目标尺寸），空间维 == fh×fw；
+            // 原半清路径：halfLatent 为半清网格（fh/2 × fw/2），normLat 为升频后全清网格。
+            guard tCount == halfLatent.shape[1],
+                  halfLatent.shape[2] == (fullResInput ? fh : fh / 2),
+                  halfLatent.shape[3] == (fullResInput ? fw : fw / 2),
+                  normLat.shape[2] == fh, normLat.shape[3] == fw, cCh == normLat.shape[4] else {
+                pipelineLog("❌ [像素桥] IC 网格不匹配：主 \(normLat.shape) vs 目标 \(tCount)×\(fh)×\(fw) / 输入 \(halfLatent.shape)（fullResInput=\(fullResInput)）")
+                return nil
+            }
+            // IC 元数据一致性提示（只读日志，不改变行为）：IC 官方 factor 恒为 2（icRefFactor 常量）
+            let icMetaFactor = loraReferenceDownscaleFactor(path: icModePath, fallback: icRefFactor)
+            if icMetaFactor != icRefFactor {
+                pipelineLog("⚠️ [像素桥] IC 权重元数据 reference_downscale_factor=\(icMetaFactor) 与固定常量 \(icRefFactor) 不一致（本次仍按常量执行，IC 行为保持不变）")
+            }
         }
-        // ② 主区 σ0 加噪（token 化）；首帧区（如有）替换为外部参考——官方 noiser 对 mask=0 区
-        //    lerp 后恒为 clean，首帧实际以参考图为采样起点；参考区/尾帧 append 区噪声槽填 0
-        //    （官方 latent_noise 参考区不灌噪声，per-token σ=0 恒为 clean）。
-        let fullNoised3 = (normLat.reshaped([1, nvMain, cCh]) * (1 - icEffSigmas[0])
-                           + fullNoise.reshaped([1, nvMain, cCh]) * icEffSigmas[0]).asType(refineInit.dtype)
-        var mainInit3 = fullNoised3
-        var mainClean3 = MLXArray.zeros([1, nvMain, cCh]).asType(refineInit.dtype)
-        var mainMask = [Float](repeating: 1, count: nvMain)
-        if let ht = headTokens {
-            let rest = fullNoised3[0 ..< 1, fhw ..< nvMain, 0 ..< cCh]
-            mainInit3 = concatenated([ht, rest], axis: 1).asType(refineInit.dtype)
-            mainClean3 = concatenated([ht, MLXArray.zeros([1, nvMain - fhw, cCh]).asType(refineInit.dtype)],
-                                      axis: 1).asType(refineInit.dtype)
-            mainMask = [Float](repeating: 0, count: fhw)
-                + [Float](repeating: 1, count: nvMain - fhw)
+        let nvMain = tCount * tgtH * tgtW
+        let nvRef = refLatent.shape[1] * refH * refW
+        // 同格模式：目标位置数组必须与目标 token 数严格一致（否则 RoPE 相位错位，宁可直接失败）
+        if cqSameGrid {
+            guard tgtPos.count == nvMain * 3 else {
+                pipelineLog("❌ [像素桥] 同格模式目标位置长度异常：pos=\(tgtPos.count) 期望 \(nvMain * 3)（目标 \(tCount)×\(tgtH)×\(tgtW) @ \(tgtPixW)×\(tgtPixH)）")
+                return nil
+            }
         }
+        // SOL 稀疏注意力的「每帧 token 数」按**目标网格**登记（IC/默认 = 全清格；CQ 同格模式 = 源网格）
+        refineTpfOverride = tgtH * tgtW
+        // ★ 参考几何单行日志（本轮新增）：实际 factor + 参考网格尺寸 + 参考位置相位
+        pipelineLog("🧭 [像素桥] \(cqChannelActive ? "CQ" : "IC") 参考几何：factor=\(refFactorEff)"
+            + "（\(cqChannelActive ? "LoRA 元数据 reference_downscale_factor，缺失→官方默认 1" : "IC 官方常量 2")）"
+            + "｜参考网格=\(refLatent.shape)｜目标网格=\(tgtLatent.shape)\(cqSameGrid ? "（LTX_CQ_SAMEGRID=1 官方同格模式：目标=源网格，未按 ×2 升频使用）" : "（×2 升频格）")"
+            + "｜参考位置相位=\(refIsSameGrid ? "与主网格逐 token 同位（参考区沿用主网格同一套像素中点公式 h*32+16，不乘 factor）" : "参考格像素中点 ×\(refFactorEff)（映射回目标网格）")"
+            + "｜Nv=\(nvMain)+\(nvRef)")
+        if refIsSameGrid && !cqSameGrid {
+            if fullResInput {
+                pipelineLog("⚠️ [像素桥] 全清直通同格参考（factor=1）：参考区与主序列等长 → Nv=\(nvMain + nvRef)（KV 显存≈2×主序列；H3 直出全清无半清参考可用，此为全清直通的固有代价，后续可评估 RGB 域往返低清参考来压缩 Nv）")
+            } else {
+                pipelineLog("⚠️ [像素桥] 同格参考（factor=1）：参考区与主序列等长 → Nv=\(nvMain + nvRef)（KV 显存≈2×主序列，明显高于旧版半清参考）；显存紧张时可设 LTX_CQ_SAMEGRID=1 切官方同格模式（目标=源网格，Nv 大幅下降）")
+            }
+        }
+        // 目标网格登记（供采样后裁参考区 / SOL 每帧 token 数使用；见函数前段声明）
+        icTargetT = tCount
+        icTargetH = tgtH
+        icTargetW = tgtW
+        icTargetC = cCh
+        // in-context KV 参考（源视频整段 latent append，官方 stage1 IC / 官方 CQ 参考语义）默认保留；LTX_IC_KV=0 可关
+        let ctxRefOn = ProcessInfo.processInfo.environment["LTX_IC_KV"] != "0"
+        // ② 主区 σ0 加噪（token 化）；参考区噪声槽填 0（官方 latent_noise 参考区不灌噪声，
+        //    per-token σ=0 恒为 clean）。
+        //    目标网格 latent：IC / CQ 默认 = ×2 升频后的 normLat；CQ 同格模式 = 源半清 halfLatent。
+        //    同格模式的噪声单独取（显式重播种 → 与是否调用 makeVideoLatentAndPos 无关、可复现）；
+        //    非同格路径沿用 fullNoise（normLat 同形状），与本改造前逐值一致。
+        let tgtNoise: MLXArray
+        if cqSameGrid {
+            MLXRandom.seed(seed &+ 0x5EED_5EED)
+            tgtNoise = MLXRandom.normal(tgtLatent.shape).asType(tgtLatent.dtype)
+        } else {
+            tgtNoise = fullNoise
+        }
+        let fullNoised3 = (tgtLatent.reshaped([1, nvMain, cCh]) * (1 - icEffSigmas[0])
+                           + tgtNoise.reshaped([1, nvMain, cCh]) * icEffSigmas[0]).asType(refineInit.dtype)
+        // 改造 C：主序列不做任何首帧替换 / mask=0 锚定，主区全 mask=1（细节由参考 KV 约束）
+        let mainInit3 = fullNoised3
+        let mainClean3 = MLXArray.zeros([1, nvMain, cCh]).asType(refineInit.dtype)
+        let mainMask = [Float](repeating: 1, count: nvMain)
         var extraNoise: [MLXArray] = []
         var extraClean: [MLXArray] = []
         var extraMask: [Float] = []
-        if icKVOn {
-            let refTokens = halfLatent.reshaped([1, nvRef, cCh]).asType(refineInit.dtype)
+        if ctxRefOn {
+            // 参考 token = refLatent（factor=2 → 源半清格；factor=1/CQ 默认 → 目标网格同格）。
+            // 参考区：噪声槽 0 + per-token σ=0 → 恒为 clean 真实参考（机制不变，仅网格来源随 factor 走）。
+            let refTokens = refLatent.reshaped([1, nvRef, cCh]).asType(refineInit.dtype)
             extraClean.append(refTokens)
             extraNoise.append(MLXArray.zeros([1, nvRef, cCh]).asType(refineInit.dtype))
             extraMask.append(contentsOf: [Float](repeating: 0, count: nvRef))
         } else {
-            pipelineLog("ℹ️ [像素桥] LTX_IC_KV=0：IC 参考区关闭（仅主序列 + 首尾帧锚）")
+            pipelineLog("ℹ️ [像素桥] LTX_IC_KV=0：in-context 参考区关闭（仅主序列，无参考 KV）")
         }
-        if let tt = tailTokens {
-            extraClean.append(tt)
-            extraNoise.append(MLXArray.zeros([1, fhw, cCh]).asType(refineInit.dtype))
-            extraMask.append(contentsOf: [Float](repeating: 0, count: fhw))
-        }
+        // 改造 C：尾帧 append 区已移除（官方 IC 无此通道）。
         refineInit = concatenated([mainInit3] + extraNoise, axis: 1).asType(refineInit.dtype)
-        // ③ clean/mask：主区 mask=1（自由生成，clean 值不参与；首帧锚定区除外 mask=0 满锁）；
-        //    参考区 / 尾帧 append 区 mask=0 恒写回真实参考（clean token）
+        // ③ clean/mask：主区 mask=1（不设锚，细节由参考 KV 约束）；参考区 mask=0 恒写回真实参考（clean token）
         refineClean = concatenated([mainClean3] + extraClean, axis: 1).asType(refineInit.dtype)
         refineMask = mainMask + extraMask
-        // ④ RoPE 坐标：主区 fullPos（全清格像素中点）；参考区 = 半清格像素中点 h/w ×2
-        //    （官方 VideoConditionByReferenceLatent positions × downscale_factor=2，映射回
-        //    全清网格），t 轴与主帧同一视频时间（同 makeVideoLatentAndPos 的 fmid 公式）。
+        // ④ RoPE 坐标：主区 = 目标网格相位（默认 fullPos；CQ 同格模式 = 源网格同公式 positions）；
+        //    参考区 = 参考 latent 所在网格的像素中点 h/w × 生效 factor（映射回目标网格相位），
+        //    t 轴与主帧同一视频时间（同 makeVideoLatentAndPos 的 fmid 公式）。
+        //    factor=1（CQ 默认/同格）⇒ 参考区坐标与主区逐 token 完全一致（不再 ×2）—— 本修复点。
         var extraPos: [Float] = []
         var extraPosCount = 0
-        if icKVOn {
+        if ctxRefOn {
             extraPos.reserveCapacity(nvRef * 3)
             for f in 0..<tCount {
                 let fs = max(Float(f) * 8.0 + 1.0 - 8.0, 0.0)
                 let fe = max(Float(f + 1) * 8.0 + 1.0 - 8.0, 0.0)
                 let fmid = (fs + fe) / 2.0 / frameRate
-                for h in 0..<halfLatent.shape[2] {
-                    let hmid = (Float(h) * 32.0 + 16.0) * 2.0
-                    for w in 0..<halfLatent.shape[3] {
-                        let wmid = (Float(w) * 32.0 + 16.0) * 2.0
+                for h in 0..<refH {
+                    let hmid = (Float(h) * 32.0 + 16.0) * Float(refFactorEff)
+                    for w in 0..<refW {
+                        let wmid = (Float(w) * 32.0 + 16.0) * Float(refFactorEff)
                         extraPos.append(fmid)
                         extraPos.append(hmid)
                         extraPos.append(wmid)
@@ -1565,36 +1798,28 @@ func runLTXStage2RefineOnLatent(
             }
             extraPosCount += nvRef
         }
-        // 尾帧 append token：全清格坐标（hmid/wmid 同主区，不 ×2）+ t=末 latent 帧 fmid
-        // （官方 VideoConditionByKeyframeIndex：positions t 轴 offset 到 frame_idx 附近）
-        if tailTokens != nil {
-            extraPos.reserveCapacity(extraPos.capacity + fhw * 3)
-            let f = tCount - 1
-            let fs = max(Float(f) * 8.0 + 1.0 - 8.0, 0.0)
-            let fe = max(Float(f + 1) * 8.0 + 1.0 - 8.0, 0.0)
-            let fmid = (fs + fe) / 2.0 / frameRate
-            for h in 0..<fh {
-                let hmid = Float(h) * 32.0 + 16.0
-                for w in 0..<fw {
-                    let wmid = Float(w) * 32.0 + 16.0
-                    extraPos.append(fmid)
-                    extraPos.append(hmid)
-                    extraPos.append(wmid)
-                }
-            }
-            extraPosCount += fhw
-        }
-        icVideoPos = fullPos + extraPos
-        // keyframes gate 全 0（禁用主干对参考区 / append keyframe 区的 keyframes_abs_pos_embedding 注入；
+        // 改造 C：尾帧 append token 的 RoPE 坐标段已随尾帧通道一并移除
+        icVideoPos = tgtPos + extraPos
+        // keyframes gate 全 0（禁用主干对参考区的 keyframes_abs_pos_embedding 注入；
         //    官方 VideoConditionByKeyframeIndex marked=False 同此语义）
         icKeyframesZeros = MLXArray.zeros([1, nvMain + extraPosCount, 1]).asType(.float32)
-        pipelineLog("🧩 [像素桥] IC-LoRA 官方模式：KV 参考 \(icKVOn ? "\(halfLatent.shape) 直放 \(nvRef) tokens ×2" : "关闭")"
-            + "，首帧锁帧 \(headTokens != nil ? "\(fhw) tokens" : "无")，尾帧 clean \(tailTokens != nil ? "\(fhw) tokens" : "无")"
+        pipelineLog("🧩 [像素桥] in-context 官方\(cqChannelActive ? "CQ 清晰度增强" : "IC-LoRA 二采")模式：KV 参考 \(ctxRefOn ? "\(refLatent.shape) 直放 \(nvRef) tokens（factor=\(refFactorEff)，\(refIsSameGrid ? "与主网格同格同位" : "参考格 ×\(refFactorEff) 映射")）" : "关闭")"
+            + "（无外部参考图 / 无首帧锁帧 / 无尾帧 append，改造 C）"
             + "，Nv=\(nvMain)+\(extraPosCount)=\(refineInit.shape)，σ0=\(icEffSigmas[0]) \(icEffSigmas.count - 1) 步")
-        // ⑤ 全程开 IC-LoRA 旁路（采样结束函数返回前自动关闭，原生路径不受污染）
-        dit.attachICLoRA(icBlocks)
-        dit.setICActive(true)
-        defer { dit.setICActive(false) }
+        // ⑤ LoRA 旁路挂载（按通道分派，互斥执行；关闭动作由**函数级 defer** 统一负责 ——
+        //    切勿在此 if 块内写 defer，否则会在 if 块闭合处提前关闭、采样时 LoRA 不生效）
+        //    LoRABypassTag：编译图会把「旁路权重 + icActive」固化进图，通道/权重/强度不同必须分槽编译
+        if cqChannelActive {
+            dit.attachCQEnhancer(cqBlocksLoaded)
+            dit.setCQActive(true)
+            LoRABypassTag.current = "cq-\(URL(fileURLWithPath: cqModePath).lastPathComponent)-s\(cqLoRAStrength)"
+            loraBypassAttached = true
+        } else {
+            dit.attachICLoRA(icBlocksLoaded)
+            dit.setICActive(true)
+            LoRABypassTag.current = "ic-\(URL(fileURLWithPath: icModePath).lastPathComponent)"
+            loraBypassAttached = true
+        }
     }
 
     // ★ 双驻留瘦身（v2）：refine 前仅淘汰与本次采样形状不同的编译图。若上轮同形状 refine 图仍
@@ -1625,9 +1850,10 @@ func runLTXStage2RefineOnLatent(
     //   不关 IC、不关 KV 参考、不改任何采样语义。
     runOnBigStack {
         autoreleasepool {
-            upW = [:]
-            denorm = MLXArray.zeros([0]).asType(denorm.dtype)
-            upLatent = MLXArray.zeros([0]).asType(upLatent.dtype)
+            // fullResInput 下这些量本就不存在（保持 nil），无需置空；仅释放升频相关资源。
+            upW = nil
+            denorm = nil
+            upLatent = nil
         }
         MLX.Memory.clearCache()
     }
@@ -1654,9 +1880,11 @@ func runLTXStage2RefineOnLatent(
     let s2Sparse: LTXSparseAttnConfig? = {
         let env = ProcessInfo.processInfo.environment
         guard env["PIX_SOL"] != "0" else { return nil }   // 默认开；仅显式 =0 关闭
-        // 每帧 token 数：5D 网格直接取 H/W；3D token 级（IC 合并序列）主序列按全清格 H=像素/32
-        let tpf = (refineInit.ndim >= 5 ? refineInit.shape[2] : max(1, fullPixelHeight / 32))
-            * (refineInit.ndim >= 5 ? refineInit.shape[3] : max(1, fullPixelWidth / 32))
+        // 每帧 token 数：5D 网格直接取 H/W；3D token 级（IC 合并序列）主序列按**本轮登记的目标网格**
+        // 计算（IC/CQ 默认 = 全清格 = 像素/32；CQ 同格模式 = 源半清格 = 像素/64）。
+        // 非 IC 路径 refineTpfOverride 为 nil → 行为与本改造前逐值一致。
+        let tpf = refineTpfOverride ?? ((refineInit.ndim >= 5 ? refineInit.shape[2] : max(1, fullPixelHeight / 32))
+            * (refineInit.ndim >= 5 ? refineInit.shape[3] : max(1, fullPixelWidth / 32)))
         let autoSink = (max(0, tpf) + 63) / 64        // 首帧占的 key 块数（SOL 块=64 行）
         let sink = Int(env["PIX_SOL_SINK"] ?? "") ?? autoSink
         return LTXSparseAttnConfig(
@@ -1683,8 +1911,10 @@ func runLTXStage2RefineOnLatent(
             videoPos: icVideoPos, audioPos: effAudioPos,
             numSteps: icEffSigmas.count - 1,
             sigmas: icEffSigmas,
-            // IC：官方 euler_ancestral SDE（STAGE_2 4 步档，eta=1.0）；非 IC 保持原确定性 Euler 精修
-            ancestral: icModeEnabled,
+            // 采样器：IC 通道 = 官方 DFR detailing 确定性 Euler（不传 stepper → EulerDiffusionStep，无 ancestral SDE）；
+            // CQ 通道 = 官方 CQ 工作流 euler_ancestral（KSamplerSelect=euler_ancestral，LTX_CQ_ANCESTRAL=0 可切回确定性 Euler）；
+            // 非 in-context 同为确定性 Euler 精修（原行为不变）
+            ancestral: cqChannelActive && cqAncestralRequested,
             seed: seed,
             sparseVideo: s2Sparse,
             isCancelled: isCancelled)
@@ -1696,13 +1926,16 @@ func runLTXStage2RefineOnLatent(
     pipelineLog("✅ [像素桥] Stage2 refine 完成（\(Int(Date().timeIntervalSince(tS2)))s）：\(vRef.shape)")
     if icModeEnabled {
         // ⑥ 仅保留主序列 token（前 NvMain）；参考区只服务注意力，不参与解码落盘。
-        // vRef 为 3D token 级 [1, NvMain+NvRef, 128]，恢复 5D 网格再交解码。
-        let tC = normLat.shape[1]
-        let fhC = normLat.shape[2], fwC = normLat.shape[3], cC = normLat.shape[4]
+        // vRef 为 3D token 级 [1, NvMain+NvRef, C]，恢复 5D 网格再交解码。
+        // 主序列网格取**本轮实际登记的目标网格**（IC / CQ 默认 = normLat 全清格 ×2 升频格；
+        // CQ 同格模式 = 源半清格）。此前硬写 normLat.shape 在「目标网格≠normLat」时会裁错，
+        // 故改用 icTargetT/H/W/C（与注入时同一来源，保证自洽）。
+        let tC = icTargetT
+        let fhC = icTargetH, fwC = icTargetW, cC = icTargetC
         let nvMainC = tC * fhC * fwC
         let vMain = vRef[0 ..< 1, 0 ..< nvMainC, 0 ..< cC]
             .reshaped([1, tC, fhC, fwC, cC])
-        pipelineLog("✂️ [像素桥] IC 参考区已裁剪，输出主序列：\(vMain.shape)")
+        pipelineLog("✂️ [像素桥] in-context 参考区已裁剪，输出主序列：\(vMain.shape)（目标网格登记 \(tC)×\(fhC)×\(fwC)，\(cqChannelActive ? "CQ" : "IC") 通道）")
         return vMain
     }
     return vRef
@@ -1815,7 +2048,7 @@ private func loadStaticEmptyTextCond() async -> (video: MLXArray, audio: MLXArra
 /// 像素桥 σ 档（4 步，仅【非 IC】精修路径默认使用）：σ0=0.909375 官方重画档。
 /// ⚠️ IC-LoRA 官方模式（权重存在自动启用）不再使用本表：已在
 /// runLTXStage2RefineOnLatent 内锁定官方 STAGE_2_DISTILLED_SIGMAS
-/// （ltx25Stage2Sigmas 4 步，σ0=0.909375 保留升频锚点 + ancestral SDE，CFG=1）——
+/// （ltx25Stage2Sigmas 4 步，σ0=0.909375 保留升频锚点 + 官方确定性 Euler，CFG=1）——
 /// 与下方 pixRefineSigmas 数值一致，但语义以官方 Stage2 为准；σ0=1.0 的 9 步
 /// t2v 蒸馏档在 IC 下不收敛（彩色网格/马赛克）。
 /// 原生 LTX 4.5 段仍走官方 ltx25Stage2Sigmas（见 840/898 行）；非 IC 路径需要其它档位时用 PIX_SIGMAS 覆盖。
@@ -1846,7 +2079,24 @@ func ltxEnhanceExternalVideoWithStage2(
     anchorEveryNFrames: Int? = nil,
     softAnchorMask: Float? = nil,
     tailGuideMask: Float? = nil,
-    icLoRAEnable: Bool? = nil  // IC-LoRA 官方模式（见 runLTXStage2RefineOnLatent）：nil=默认关闭（非 IC 路径）；true=强制启用。LTX_IC_LORA=1/0 环境变量可覆盖
+    icLoRAEnable: Bool? = nil, // IC-LoRA 官方模式（见 runLTXStage2RefineOnLatent）：改造 C 后为默认路径，H3 队列调用点显式传 true；nil=按 LTX_IC_LORA 判定；true=强制启用。LTX_IC_LORA=1/0 环境变量可覆盖
+    // ★ 新增「第二阶段·CQ 清晰度增强」通道（官方 CQ Video Enhancer LoRA；与 IC 像素桥二采并存、互斥，CQ 优先）：
+    //   true=改走 CQ 清晰度增强（只提清晰度，不换脸/不重绘构图）；false/nil=保持原 IC 二采路径。
+    //   LTX_CQ_ENHANCER=1/0 环境变量优先级最高；队列调用点传设置项 videoUseCQEnhancer。
+    cqEnhancerEnable: Bool? = nil,
+    cqLoRAStrength: Float? = nil,  // CQ LoRA 应用强度（官方工作流 1.0；LTX_CQ_STRENGTH 可覆盖）
+    // ★ H3→LTX latent 直通（H3-to-LTX-Latent-Adapter 产物）：非 nil 时跳过「读像素 + LTX VAE 编码」
+    //   两步，直接以该 LTX 归一化 latent（NDHWC [1,F,h,w,128]）作为升频/refine 输入。
+    //   几何与帧数全由其 shape 反推（半清像素 = latent 空间 ×16，输出帧数 = 8F-7），无需另传。
+    precomputedHalfLatent: MLXArray? = nil,
+    //   adapter 直通时的帧率（H3 侧 fps；仅用于音频位置/时长与配置推导，默认 24）
+    precomputedFrameRate: Double = 24,
+    // ★ 全清直通（fullResInput，2026-09-17）：H3 一采直出**目标尺寸**全清像素/latent（H3 SelfLift
+    //   内部已做 ×0.5 低清→全清），LTX 二采直接收到全清网格。true 时：
+    //   · 几何语义：输入宽高 = 最终目标像素（不再按「半清输入 → 升频×2 输出」理解）；
+    //   · 跳过 LTX 空间升频×2、跳过 SelfLift 解耦低清段（runLTXStage2RefineOnLatent 内处理）；
+    //   · IC/CQ 参考退化为 factor=1 同格同位。
+    fullResInput: Bool = false
 ) async -> String? {
     // 中间帧锚定参数（仅本入口生效，不影响原生 LTX 4.5 段）：
     // 【只精修画面模式】默认每个 latent 帧都软锚定一次源画面（anchorEvery=1），
@@ -1855,34 +2105,53 @@ func ltxEnhanceExternalVideoWithStage2(
     // 可用环境变量 PIX_ANCHOR_EVERY / PIX_SOFT_M 快速调参（anchorEvery=0 关闭锚定）。
     let anchorEvery: Int = anchorEveryNFrames ?? (Int(ProcessInfo.processInfo.environment["PIX_ANCHOR_EVERY"] ?? "") ?? 1)
     let softM: Float = softAnchorMask ?? (Float(ProcessInfo.processInfo.environment["PIX_SOFT_M"] ?? "") ?? 0.8)
-    // 尾帧软引导（对齐官方 keyframe-guide 语义）：默认 0=硬钉（旧行为），>0 时尾帧 mask 由硬钉改软引导。
-    // 可用环境变量 PIX_TAIL_M 覆盖（H3 像素桥默认 0.6，复现旧硬钉行为设 PIX_TAIL_M=0）。
+    // 改造 C 前置：IC 官方模式为默认路径（队列调用点 icLoRAEnable=true），此时下列自创机制
+    // 一律不参与——全片 latent guide 锁源（官方 Detailer guiding_latents 概念，stage2 无）、
+    // 首尾帧软引导（PIX_EDGE_M / PIX_TAIL_M）、中间帧稀疏软锚定（PIX_ANCHOR_EVERY），
+    // 在 IC 路径下全部显式归零。仅当 LTX_IC_LORA=0 强制关回非 IC 路径时按环境变量生效。
+    let icReq: Bool = {
+        let f = ProcessInfo.processInfo.environment["LTX_IC_LORA"]
+        return (f == "1") || (f != "0" && icLoRAEnable == true)
+    }()
+    // ★ CQ 清晰度增强请求判定（新分支）：LTX_CQ_ENHANCER=1/0 环境变量 > 调用点 cqEnhancerEnable >
+    //   偏好设置 videoUseCQEnhancer（调用点未显式传值时的兜底，保证自检/兼容入口与设置项一致）。
+    let cqReq: Bool = {
+        let f = ProcessInfo.processInfo.environment["LTX_CQ_ENHANCER"]
+        let wanted = cqEnhancerEnable ?? AppSettings.shared.videoUseCQEnhancer
+        return (f == "1") || (f != "0" && wanted)
+    }()
+    // in-context 官方骨架（IC 二采 / CQ 增强共用同一套「禁用自创锚定」语义）总开关：
+    // 任一通道启用即关闭 guide/软锚定/首尾帧软引导（两通道都是「参考 latent + 无外部锚定」官方协议）。
+    let inCtxReq = cqReq || icReq
+    // CQ LoRA 强度（官方 1.0）：入参 > LTX_CQ_STRENGTH > 默认
+    let cqStrengthEff: Float = cqLoRAStrength
+        ?? (Float(ProcessInfo.processInfo.environment["LTX_CQ_STRENGTH"] ?? "") ?? cqEnhancerStrength)
+    // 尾帧软引导（非 IC 路径专用；IC 下强制 0）。默认 0=硬钉（旧行为），>0 时尾帧 mask 由硬钉改软引导。
+    // 可用环境变量 PIX_TAIL_M 覆盖。
     let tailM: Float = tailGuideMask ?? (Float(ProcessInfo.processInfo.environment["PIX_TAIL_M"] ?? "") ?? 0)
-    if tailM > 0 {
-        pipelineLog("ℹ️ [像素桥] 尾帧软引导开启（tailM=\(tailM)，对齐官方 keyframe-guide 软语义；尾帧不再 100% 硬钉外部图）")
-    }
-    // 全片 latent guide（官方 Detailer guiding_latents 语义）：PIX_GUIDE_W>0 时开启，
+    // 全片 latent guide（非 IC 路径专用；IC 下强制 0）：PIX_GUIDE_W>0 时开启，
     // 每步把采样轨迹拉向 guideClean（默认=升频 clean latent normLat）的当前 σ 加噪版。
-    // 与 imagePaths 首尾帧的关系（v2.0 软引导并存，不再互斥）：
-    //   guideW>0 时关闭旧 mask 硬钉路径（anchorEvery/tailM 置 0），但 imagePaths 仍传入 refine：
-    //   首/尾帧的 guide 目标 = 源帧×(1-blend) + 外部参考 latent×blend（blend=PIX_EDGE_M），
-    //   中段仍锁源 normLat。guide 每步只是把 vx 拉回目标轨迹（非帧替换/非 mask），
-    //   所以参考图是「软引导」：轮廓/构图被拉向参考但不强制首帧等于参考（规避 v1.1 RGB 色边）。
-    //   PIX_EDGE_M=0 时退回纯锁源（参考图完全不参与）；=1.0 时首尾帧 guide 目标=参考图本身
-    //   （guideW<1 时仍非硬钉；guideW=1 时约等于首尾帧被参考接管）。
     // 默认 guideW 1.0（满锁保轮廓）；设 PIX_GUIDE_W=0 可退回旧稀疏帧硬钉/软引导路径。
     let guideW: Float = (Float(ProcessInfo.processInfo.environment["PIX_GUIDE_W"] ?? "") ?? 1.0)
-    // 首尾帧 guide 渗透系数（软引导强度）：0=不渗透（纯锁源）；1=guide 目标完全指向参考图。默认 0.5（半引导）。
+    // 首尾帧 guide 渗透系数（非 IC 路径专用；IC 下强制 0）：0=纯锁源；1=guide 目标完全指向参考图。
     let edgeM: Float = (Float(ProcessInfo.processInfo.environment["PIX_EDGE_M"] ?? "") ?? 0.5)
-    if guideW > 0 {
-        if !imagePaths.isEmpty {
-            pipelineLog("ℹ️ [像素桥] 全片 latent guide 开启（guideW=\(guideW) + 首尾帧软引导 edgeM=\(edgeM)；锚定/tailM 自动忽略，首尾帧按渗透系数并入 guide 目标）")
-        } else {
-            pipelineLog("ℹ️ [像素桥] 全片 latent guide 开启（guideW=\(guideW)，官方 Detailer 语义；锚=源视频自身 latent，无外部首尾帧）")
+    if inCtxReq {
+        pipelineLog("🎯 [像素桥] \(cqReq ? "CQ 清晰度增强" : "IC 官方模式")：guide / 软锚定 / 首尾帧软引导全部停用（guideW=\(guideW) edgeM=\(edgeM) tailM=\(tailM) anchorEvery=\(anchorEvery) 均忽略）")
+    } else {
+        // 非 IC 旧路径：以下三条日志语义与改造 C 之前完全一致
+        if tailM > 0 {
+            pipelineLog("ℹ️ [像素桥] 尾帧软引导开启（tailM=\(tailM)，对齐官方 keyframe-guide 软语义；尾帧不再 100% 硬钉外部图）")
         }
-    }
-    if anchorEvery == 0 {
-        pipelineLog("ℹ️ [像素桥] 中间帧锚定已关闭（anchorEvery=0）")
+        if guideW > 0 {
+            if !imagePaths.isEmpty {
+                pipelineLog("ℹ️ [像素桥] 全片 latent guide 开启（guideW=\(guideW) + 首尾帧软引导 edgeM=\(edgeM)；锚定/tailM 自动忽略，首尾帧按渗透系数并入 guide 目标）")
+            } else {
+                pipelineLog("ℹ️ [像素桥] 全片 latent guide 开启（guideW=\(guideW)，官方 Detailer 语义；锚=源视频自身 latent，无外部首尾帧）")
+            }
+        }
+        if anchorEvery == 0 {
+            pipelineLog("ℹ️ [像素桥] 中间帧锚定已关闭（anchorEvery=0）")
+        }
     }
     let tAll = Date()
     pipelineLog("\n========== [像素桥] 外部视频 → LTX 升频+二采 开始 ==========")
@@ -1890,47 +2159,92 @@ func ltxEnhanceExternalVideoWithStage2(
     // 完全静态空条件提供（loadStaticEmptyTextCond：常量读张量 / 缺失全零兜底，零模型权重），
     // 不再要求非空 prompt / Gemma 编码。
 
-    // 1) 读取外部视频 → 半清像素（32 对齐）
-    //    内存直通（方案 C）：memoryFrames 非 nil 时直接用 H3 stage1 解码像素（不经磁盘编码），
-    //    否则读盘（AVAssetReader 按源文件 BT.709 标记自动做 YCbCr→RGB）。
-    guard let video = memoryFrames ?? readVideoFramesToBCFHW(videoPath: videoPath),
-          video.frameCount >= 9 else {
-        pipelineLog("❌ [像素桥] 视频读取失败或帧数不足")
-        return nil
-    }
-    let halfW = video.width, halfH = video.height
-    var total = video.frameCount
-    let F = (total + 7) / 8
-    let outFrames = 8 * F - 7
-    var pixels = video.pixels
-    if total > outFrames {
-        pixels = pixels[0 ..< 1, 0 ..< 3, 0 ..< outFrames, 0 ..< halfH, 0 ..< halfW]
-        total = outFrames
-    }
-    guard F >= 2, halfW % 32 == 0, halfH % 32 == 0 else {
-        pipelineLog("❌ [像素桥] 尺寸/帧数异常：\(halfW)×\(halfH) \(total) 帧 → F=\(F)")
-        return nil
-    }
-    pipelineLog("ℹ️ [像素桥] 输入 \(total) 帧 \(halfW)×\(halfH) → latent F=\(F)，输出像素 \(halfW*2)×\(halfH*2)")
+    // 1) 输入准备（三条通路，最终都归到「半清 LTX latent + 像素几何」）
+    //    A. adapter latent 直通（precomputedHalfLatent 非 nil）：H3-to-LTX-Latent-Adapter 已把
+    //       H3 latent 映射为 LTX 归一化 latent，故不再读像素、不再做 LTX VAE 编码，
+    //       几何与帧数全部由 latent shape 反推（半清像素 = latent 空间 ×16，源像素压缩 32）。
+    //    B. 内存直通（方案 C）：memoryFrames 非 nil 时直接用 H3 stage1 解码像素（不经磁盘编码）。
+    //    C. 原路径：读盘（AVAssetReader 按源文件 BT.709 标记自动做 YCbCr→RGB）。
+    var halfW = 0
+    var halfH = 0
+    var total = 0
+    var outFrames = 0
+    var F = 0
+    var fpsEff: Double = 24
+    var halfLatentReady: MLXArray? = nil
 
-    // 2) LTX VAE 整段编码（外部像素 → LTX latent 域）
-    let gBase = GenConfig(numFrames: total, height: halfH, width: halfW,
-                          frameRate: Float(video.fps), numSteps: 8, seed: seed)
-    let stage1Config = Stage1Config.distilled(g: gBase)
-    let tEnc = Date()
-    // vae_encoder 用完即放：编码在池内同步完成，pool 结束后权重立即释放，
-    // 否则它与后续 DiT/Gemma/refine I2V 重复加载的 encoder 叠载，是像素桥 OOM 主因之一。
-    var halfLatent: MLXArray? = nil
-    autoreleasepool {
-        guard let ew = try? MLX.loadArrays(url: URL(fileURLWithPath: stage1Config.vaeEncoderPath)) else {
-            pipelineLog("❌ [像素桥] vae_encoder 加载失败")
-            return
+    if let pre = precomputedHalfLatent {
+        // ── A. adapter latent 直通：用 H3 latent 经适配器得到的 LTX 归一化 latent 直接起步 ──
+        guard pre.ndim == 5, pre.shape[0] == 1, pre.shape[4] == 128 else {
+            pipelineLog("❌ [像素桥] adapter latent 形状非法（期望 NDHWC [1,F,h,w,128]）：\(pre.shape)")
+            return nil
         }
-        halfLatent = vaeEncodeVideo(weights: ew, pixelsBCFHW: pixels)
+        // LTX latent 的空间压缩比是 32（H3 侧为 16，adapter 内部做了 2× pixel-unshuffle）：
+        // 半清像素 = LTX latent 空间维 × 32。此处必须按 32 换算，写成 ×16 会得到半清的一半。
+        // fullResInput（全清直通）：adapter 输入已是全清 latent（H3 SelfLift 内部升频），
+        // 该换算直接给出**最终目标像素**（不再 ×2）。
+        F = pre.shape[1]
+        halfW = pre.shape[3] * H3ToLTXAdapterConst.ltxSpatialCompression
+        halfH = pre.shape[2] * H3ToLTXAdapterConst.ltxSpatialCompression
+        outFrames = 8 * F - 7
+        total = outFrames
+        fpsEff = precomputedFrameRate
+        halfLatentReady = pre
+        guard F >= 2, halfW % 32 == 0, halfH % 32 == 0 else {
+            pipelineLog("❌ [像素桥] adapter latent 几何异常：半清 \(halfW)×\(halfH) F=\(F)")
+            return nil
+        }
+        pipelineLog("★ [像素桥] H3→LTX latent 直通（adapter\(fullResInput ? "·全清直通" : "")）：latent \(pre.shape) → \(fullResInput ? "全清" : "半清") \(halfW)×\(halfH)，F=\(F)，输出像素 \(fullResInput ? halfW : halfW*2)×\(fullResInput ? halfH : halfH*2)，\(outFrames) 帧 @\(fpsEff)fps；已省去像素读取与 LTX VAE 编码")
+    } else {
+        guard let video = memoryFrames ?? readVideoFramesToBCFHW(videoPath: videoPath),
+              video.frameCount >= 9 else {
+            pipelineLog("❌ [像素桥] 视频读取失败或帧数不足")
+            return nil
+        }
+        halfW = video.width
+        halfH = video.height
+        total = video.frameCount
+        F = (total + 7) / 8
+        outFrames = 8 * F - 7
+        fpsEff = video.fps
+        var pixels = video.pixels
+        if total > outFrames {
+            pixels = pixels[0 ..< 1, 0 ..< 3, 0 ..< outFrames, 0 ..< halfH, 0 ..< halfW]
+            total = outFrames
+        }
+        guard F >= 2, halfW % 32 == 0, halfH % 32 == 0 else {
+            pipelineLog("❌ [像素桥] 尺寸/帧数异常：\(halfW)×\(halfH) \(total) 帧 → F=\(F)")
+            return nil
+        }
+        // fullResInput（全清直通）：读入像素/内存像素已是**最终目标尺寸**（H3 一采直出全清），
+        // 输出像素 = 输入像素（不再 ×2）；半清路径输出像素 = ×2（升频语义）。
+        pipelineLog("ℹ️ [像素桥] 输入 \(total) 帧 \(halfW)×\(halfH) → latent F=\(F)，输出像素 \(fullResInput ? halfW : halfW*2)×\(fullResInput ? halfH : halfH*2)\(fullResInput ? "（全清直通，不升频）" : "")")
+
+        // 2) LTX VAE 整段编码（外部像素 → LTX latent 域）
+        let tEnc = Date()
+        let encConfig = Stage1Config.distilled(g: GenConfig(
+            numFrames: total, height: halfH, width: halfW,
+            frameRate: Float(fpsEff), numSteps: 8, seed: seed))
+        // vae_encoder 用完即放：编码在池内同步完成，pool 结束后权重立即释放，
+        // 否则它与后续 DiT/Gemma/refine I2V 重复加载的 encoder 叠载，是像素桥 OOM 主因之一。
+        autoreleasepool {
+            guard let ew = try? MLX.loadArrays(url: URL(fileURLWithPath: encConfig.vaeEncoderPath)) else {
+                pipelineLog("❌ [像素桥] vae_encoder 加载失败")
+                return
+            }
+            halfLatentReady = vaeEncodeVideo(weights: ew, pixelsBCFHW: pixels)
+        }
+        MLX.Memory.clearCache()
+        guard let ready = halfLatentReady else { return nil }
+        pipelineLog("✅ [像素桥] 整段编码完成（\(Int(Date().timeIntervalSince(tEnc)))s）：\(ready.shape)")
     }
-    MLX.Memory.clearCache()
-    guard let halfLatent = halfLatent else { return nil }
-    pipelineLog("✅ [像素桥] 整段编码完成（\(Int(Date().timeIntervalSince(tEnc)))s）：\(halfLatent.shape)")
+
+    guard let halfLatent = halfLatentReady else { return nil }
+
+    // 2.5) 阶段配置（两条通路共用：LTX latent 域一致，DiT 与后续 refine 路径同源）
+    let gBase = GenConfig(numFrames: total, height: halfH, width: halfW,
+                          frameRate: Float(fpsEff), numSteps: 8, seed: seed)
+    let stage1Config = Stage1Config.distilled(g: gBase)
 
     // 3) DiT 加载/复用（与原生管线同一缓存，不重复读盘）
     let ditPath = stage1Config.ditPath
@@ -1981,20 +2295,21 @@ func ltxEnhanceExternalVideoWithStage2(
     // 5) 音频 latent：随机占位（DiT 前向必需；非 IC 采样用它起步，产物音轨沿用半清源视频音轨）。
     //    另尝试把源视频音轨编码为真实音频条件（audioCond*，仅 IC 模式 frozen_a 锁口型用；
     //    非 IC 不消费，行为与改造前完全一致）。失败/无音轨则 audioCond* 为 nil。
-    let gFull = GenConfig(numFrames: outFrames, height: halfH * 2, width: halfW * 2,
-                          frameRate: Float(video.fps), numSteps: 8, seed: seed)
+    let gFull = GenConfig(numFrames: outFrames,
+                          height: fullResInput ? halfH : halfH * 2,
+                          width: fullResInput ? halfW : halfW * 2,
+                          frameRate: Float(fpsEff), numSteps: 8, seed: seed)
     let (noiseA, audioPos) = makeAudioLatentAndPos(g: gFull)
     var audioCondLatent: MLXArray? = nil
     var audioCondPos: [Float]? = nil
-    let naBudget = Int((Float(outFrames) / Float(video.fps) * 25.0).rounded())
+    let naBudget = Int((Float(outFrames) / Float(fpsEff) * 25.0).rounded())
     // 音轨源：内存直通时用 H3 预览文件（含 H3 生成音轨）抽音频条件/最终混流；原路径回退 videoPath。
     let audioSourcePath = sourceAudioVideoPath ?? videoPath
-    // frozen_a 音频条件（audio_vae 编码源音轨）仅供 IC 模式消费；默认非 IC 不编码、不加载
-    // audioVAE（收敛回旧版：仅随机噪声占位，产物音轨沿用源视频）。避免 audioVAE 权重驻留与
-    // 编码瞬时峰值叠加编译窗口。启用规则与 runLTXStage2RefineOnLatent 保持一致：
-    // LTX_IC_LORA=1 或 icLoRAEnable=true（LTX_IC_LORA=0 强制关）。
-    let icAudioFlag = ProcessInfo.processInfo.environment["LTX_IC_LORA"]
-    let icAudioRequested = (icAudioFlag == "1") || (icAudioFlag != "0" && icLoRAEnable == true)
+    // frozen_a 音频条件（audio_vae 编码源音轨）仅供 IC 模式消费。改造 C：改为「显式开关」，
+    // 默认不再随 IC 自动开启——frozen_a 与 KV 参考叠加是编译窗口峰值顶穿 48G 的主要来源
+    // （Nv 40800），默认只跑主序列 + KV 参考（产物音轨仍沿用源视频音轨，不受影响）。
+    // 需要口型跟源音轨时设 LTX_IC_AUDIO=1（需自行确认显存余量）。
+    let icAudioRequested = ProcessInfo.processInfo.environment["LTX_IC_AUDIO"] == "1"
     if icAudioRequested,
        let aw = try? MLX.loadArrays(url: URL(fileURLWithPath: CommonPaths.audioVae)),
        let pcm = loadAudioPCM16kStereo(path: audioSourcePath), !pcm.isEmpty {
@@ -2008,7 +2323,7 @@ func ltxEnhanceExternalVideoWithStage2(
 
     // 6) 通用 refine（升频 ×2 + Stage2 精修）
     //    外部半清视频进像素桥 Stage2 默认 pixRefineSigmas（与官方 STAGE_2_DISTILLED_SIGMAS
-    //    数值一致，σ0=0.909375 保留升频锚点）。IC 模式锁定官方档 + ancestral SDE；
+    //    数值一致，σ0=0.909375 保留升频锚点）。IC 模式锁定官方档 + 官方确定性 Euler；
     //    非 IC 需要其它档位时用 PIX_SIGMAS 覆盖（逗号分隔、降序、末位必须为 0）。
     //    原生 LTX 4.5 段仍走官方 ltx25Stage2Sigmas（见 840/898 行），本改动不影响原生路径。
     let refineSigmas: [Float]
@@ -2030,18 +2345,23 @@ func ltxEnhanceExternalVideoWithStage2(
         noiseA: noiseA, audioPos: audioPos,
         audioCondLatent: audioCondLatent, audioCondPos: audioCondPos,
         imagePaths: imagePaths,
-        fullPixelWidth: halfW * 2, fullPixelHeight: halfH * 2,
+        fullPixelWidth: fullResInput ? halfW : halfW * 2,
+        fullPixelHeight: fullResInput ? halfH : halfH * 2,
         pixelFrames: outFrames,
-        frameRate: Float(video.fps),
+        frameRate: Float(fpsEff),
         seed: seed,
         isCancelled: isCancelled,
         sigmas: refineSigmas,
-        anchorEveryNFrames: guideW > 0 ? 0 : anchorEvery,
+        anchorEveryNFrames: (inCtxReq || guideW > 0) ? 0 : anchorEvery,
         softAnchorMask: softM,
-        guideWeight: guideW,
-        headTailGuideBlend: edgeM,
-        tailGuideMask: guideW > 0 ? 0 : tailM,
-        icLoRAEnable: icLoRAEnable) else {
+        guideWeight: inCtxReq ? 0 : guideW,
+        headTailGuideBlend: inCtxReq ? 0 : edgeM,
+        tailGuideMask: (inCtxReq || guideW > 0) ? 0 : tailM,
+        icLoRAEnable: icLoRAEnable,
+        // ★ CQ 清晰度增强通道（与 IC 互斥、CQ 优先）；未开启时保持原 IC 二采行为不变
+        cqEnhancerEnable: cqReq,
+        cqLoRAStrength: cqStrengthEff,
+        fullResInput: fullResInput) else {
         pipelineLog("❌ [像素桥] refine 失败")
         return nil
     }
@@ -2051,7 +2371,7 @@ func ltxEnhanceExternalVideoWithStage2(
     MemoryPolicy.unloadIfNeededMidway(task: .video, current: .vae, next: nil)
 
     // 7) VAE 解码 → 无声 mp4，并把半清源视频的音轨原样沿用（不生成/不处理音频）
-    guard let silentPath = decodeLatentToSilentMP4(latentNDHWC: vRef, fps: video.fps, assetPrefix: "uhd") else {
+    guard let silentPath = decodeLatentToSilentMP4(latentNDHWC: vRef, fps: fpsEff, assetPrefix: "uhd") else {
         pipelineLog("❌ [像素桥] 解码落盘失败")
         return nil
     }
@@ -2084,11 +2404,16 @@ func ltxEnhanceExternalVideoWithStage2Pixels(
     anchorEveryNFrames: Int? = nil,
     softAnchorMask: Float? = nil,
     tailGuideMask: Float? = nil,
-    icLoRAEnable: Bool? = nil
+    icLoRAEnable: Bool? = nil,
+    // ★ CQ 清晰度增强通道开关（与 IC 二采互斥、CQ 优先，详见上游入口注释）
+    cqEnhancerEnable: Bool? = nil,
+    cqLoRAStrength: Float? = nil,
+    // ★ 全清直通（fullResInput）：H3 一采直出目标尺寸全清像素，跳过升频×2/解耦低清段（默认 false 保持原半清升频语义）
+    fullResInput: Bool = false
 ) async -> String? {
     let frames: (pixels: MLXArray, width: Int, height: Int, fps: Double, frameCount: Int) =
         (pixels, pixelWidth, pixelHeight, pixelFps, pixels.shape[2])
-    pipelineLog("🎯 [像素桥] 内存直通入口：H3 stage1 像素 \(frames.pixels.shape)（\(pixelWidth)×\(pixelHeight) @\(pixelFps)fps），音轨源 \(sourceAudioVideoPath)")
+    pipelineLog("🎯 [像素桥] 内存直通入口：H3 stage1 像素 \(frames.pixels.shape)（\(pixelWidth)×\(pixelHeight) @\(pixelFps)fps）\(fullResInput ? "·全清直通" : "")，音轨源 \(sourceAudioVideoPath)")
     return await ltxEnhanceExternalVideoWithStage2(
         videoPath: sourceAudioVideoPath,
         memoryFrames: frames,
@@ -2100,6 +2425,9 @@ func ltxEnhanceExternalVideoWithStage2Pixels(
         anchorEveryNFrames: anchorEveryNFrames,
         softAnchorMask: softAnchorMask,
         tailGuideMask: tailGuideMask,
-        icLoRAEnable: icLoRAEnable)
+        icLoRAEnable: icLoRAEnable,
+        cqEnhancerEnable: cqEnhancerEnable,
+        cqLoRAStrength: cqLoRAStrength,
+        fullResInput: fullResInput)
 }
 

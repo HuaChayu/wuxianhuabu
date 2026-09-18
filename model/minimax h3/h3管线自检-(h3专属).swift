@@ -220,6 +220,40 @@ enum H3PipelineRun {
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "12" {
             return runStage2E2E()
         }
+        // NA_H3TEST=21：SelfLift 第三分支 A/B（nearest vs learned upscaler）端到端对比
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "21" {
+            return runSelfLiftABTest()
+        }
+        // NA_H3TEST=23：h3_53 真实场景高分辨率 A/B（nearest vs learned，1344×768 / 62 帧）
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "23" {
+            return runH3SceneABTest()
+        }
+        // NA_H3TEST=24：h3_53 真实场景 rho 扫描（learned 提升 × rho 0.25/0.6/0.9，验证像素锚点修正能否消残余轻重影）
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "24" {
+            return runH3RhoSweepTest()
+        }
+        // NA_H3TEST=25：h3_53 真实场景 w 软混合扫描（learned + rho=0.9 × wMin/wMax 三档，
+        // 验证软混合能否在保留 z_pix 修正的同时用 z_lat 时间平滑性压掉背景小角色帧间抖动）
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "25" {
+            return runH3WMixSweepTest()
+        }
+        // NA_H3TEST=26：官方默认路径复刻（learned upscaler + rho=0，不混合 z_pix）。
+        // 官方 SelfLiftH3Sampler 默认即 rho=0（纯 z_lat 提升，像素锚点为可选增强）；
+        // 若本组后段干净 → 重影由 z_pix 混合引入，默认直接回 rho=0；若不干净 → 问题在 learned 升频器本身。
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "26" {
+            return runH3OfficialDefaultTest()
+        }
+        // NA_H3TEST=27：短场景帧数对照 —— 26 号输入（39 帧）× N=9（6+3，与用户 UI 同参数）。
+        // 若本组干净而 UI 长视频重影 → 帧数/时长因素；若本组也重影 → 与帧数无关，查调度/场景。
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "27" {
+            setenv("H3_AB_STEPS", "9", 1)
+            setenv("H3_AB_OUT", "h3_short_n9.mp4", 1)
+            return runH3OfficialDefaultTest()
+        }
+        // NA_H3TEST=20：ref2va 多参考图通路（多张角色参考图 + 场景描述，多参身份保持）
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "20" {
+            return runRef2VATest()
+        }
         // NA_H3TEST=9：ComfyUI sol-attn 移植（H3SolAttn）合成数值自检（不加载模型）
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "9" {
             return H3SolAttn.selfTest()
@@ -227,11 +261,16 @@ enum H3PipelineRun {
         let sem = DispatchSemaphore(value: 0)
         var code: Int32 = 1
 
-        // 首尾帧：基础站姿 → 舞蹈 pose
-        let firstImage = "/Users/huachayui/Downloads/基础.png"
-        let lastImage = "/Users/huachayui/Downloads/动作.png"
+        // 首尾帧：多角色同框场景（可用 H3_FIRST_IMG / H3_LAST_IMG 覆盖）
+        // three_shot_a/b.png = 左少女(2.png) + 中狐耳男(3.png) + 右银发男(4.png) 拼成的 864x480 横版合影，
+        // b 为 a 中心放大 1.08 的推近版，避免首尾同图导致画面完全静止。
+        // 合成脚本：temp/make_three_shot.py
+        let envCfg = ProcessInfo.processInfo.environment
+        let sceneDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3/assets"
+        let firstImage = envCfg["H3_FIRST_IMG"] ?? "\(sceneDir)/three_shot_a.png"
+        let lastImage = envCfg["H3_LAST_IMG"] ?? "\(sceneDir)/three_shot_b.png"
         let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
-        var outPath = "\(outDir)/h3_fl2va_dance_480p120f.mp4"
+        var outPath = "\(outDir)/h3_fl2va_trio_talk_480p124f.mp4"
 
         func log(_ s: String) { print("[H3PipelineRun] \(s)"); fflush(stdout) }
 
@@ -253,7 +292,14 @@ enum H3PipelineRun {
         Task {
             do {
                 let path = try await H3FL2VAPipeline.generateVideo(
-                    prompt: "A dancer stands in a relaxed neutral stance, then smoothly transitions into a graceful dance pose, lifting one leg and extending both arms elegantly, body slightly twisted with dynamic ballet posture, smooth continuous motion, full body in frame, clean studio background, gentle stage lighting.",
+                    // 多角色多参场景：三人同框、各有动作与台词，用于检验模型对多主体的身份保持与对白能力
+                    prompt: envCfg["H3_PROMPT"] ?? (
+                        "Three characters stand side by side in a clean white studio, full body in frame, soft studio lighting. "
+                        + "Left: a girl with short black hair in a light mint-green modern Chinese dress smiles and waves, saying \"Hey! The canvas is finally alive!\" "
+                        + "Middle: a young man with brown fox ears and a beige outfit turns his head toward her, eyes wide, and replies \"Wait, you rendered all of this on a laptop?\" "
+                        + "Right: a silver-haired man in a black crown and a long dark robe smiles calmly and says \"Impressive. But can it keep all three of us in frame?\" "
+                        + "Each character speaks clearly in turn, natural lip-sync, distinct voices, smooth continuous motion, stable identity, no morphing, no extra characters."
+                    ),
                     firstImagePath: firstImage,
                     lastImagePath: lastImage,
                     outPath: outPath,
@@ -395,6 +441,80 @@ enum H3PipelineRun {
         return code
     }
 
+    /// NA_H3TEST=20：ref2va 多参考图通路——多张角色参考图 + 场景描述互动，
+    /// 验证移植融合权重的多参能力（身份保持 / 同框互动）。
+    /// 默认参考图：~/Downloads/角色/ 1.jpg(红裙金冠女) 2.png(薄荷绿裙少女) 3.png(狐耳男) 4.png(银冠黑袍男)；
+    /// 可用 H3_REF_IMAGES（逗号分隔绝对路径）与 H3_PROMPT 覆盖。
+    static func runRef2VATest() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+        let envCfg = ProcessInfo.processInfo.environment
+        let refDir = "/Users/huachayui/Downloads/角色"
+        let refs: [String] = envCfg["H3_REF_IMAGES"]
+            .map { $0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) } }
+            ?? ["\(refDir)/1.jpg", "\(refDir)/2.png", "\(refDir)/3.png", "\(refDir)/4.png"]
+        let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
+        let outPath = envCfg["H3_OUT"] ?? "\(outDir)/h3_ref2va_quad_scene_480p124f.mp4"
+        // 参考图缩放模式：match = 缩到生成面积（快）；mid = 短边 1024；max = 官方短边 2048（慢）
+        let refMode = envCfg["H3_REF_MODE"] ?? "match"
+        let refSizing: RefImageSizing = refMode == "max" ? .max : (refMode == "mid" ? .mid : .match)
+
+        func log(_ s: String) { print("[H3Ref2VA] \(s)"); fflush(stdout) }
+
+        let requestFrames: UInt32 = 120
+        let aligned = H3Const.alignFrameCount(requestFrames)
+        let latentT = H3Const.videoLatentT(frameCount: aligned)
+        log("ref2va 多参测试：\(refs.count) 张参考图 / 864x480 / turbo 6 步 / latentT=\(latentT)")
+        for (i, p) in refs.enumerated() { log("  参考图 \(i + 1)：\(p)") }
+
+        // ★ 2026-09-18：ref2va 自检默认开 SelfLift 解耦（3+3），对齐用户 UI 组合；
+        //   NA_H3_FL2VA_AS_REFS=1 时"首尾帧作参考图"即走本通路（软参考 + 视觉块，无 keyframes 硬锚）。
+        setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+        setenv("NA_H3_SELFLIFT_DECOUPLE", "1", 1)
+        setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K", "0.7", 1)
+        setenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS", "3", 1)
+
+        Task {
+            do {
+                let path = try await H3FL2VAPipeline.generateVideo(
+                    prompt: envCfg["H3_PROMPT"] ?? (
+                        "The four characters shown in the reference pictures gather in a bright living room and interact with each other. "
+                        + "Picture 1, the woman in the red dress and golden crown, stands in the middle and speaks first: \"Welcome, everyone. Let's make a short film together.\" "
+                        + "Picture 2, the girl in the mint-green dress, waves happily and answers: \"I can do the lighting!\" "
+                        + "Picture 3, the young man with fox ears, laughs and says: \"Then I will handle the camera.\" "
+                        + "Picture 4, the man in the silver crown and dark robe, nods calmly and replies: \"And I will direct.\" "
+                        + "They look at each other in turn and talk, natural lip-sync, distinct voices, stable identities, consistent clothing, smooth continuous motion, no morphing, no extra characters."
+                    ),
+                    firstImagePath: refs[0],
+                    lastImagePath: refs[refs.count - 1],
+                    outPath: outPath,
+                    width: 864,
+                    height: 480,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .off,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[H3] \($0)") },
+                    referenceImagePaths: refs,
+                    referenceSizing: refSizing
+                )
+                log("✅ ref2va 生成完成：\(path)")
+                code = 0
+            } catch {
+                log("❌ ref2va 生成失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+
+        _ = sem.wait(timeout: .now() + 3600)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
+    }
+
     /// NA_H3TEST=10：UI 直出路径回归——目标分辨率 1344×768 直接作为 DiT 生成尺寸
     /// （无升频/无 Stage2、6 步 turbo），复现 Xcode Debug 下
     /// 全分辨率 encodeImage/encodeTiled 崩溃场景。
@@ -511,6 +631,270 @@ enum H3PipelineRun {
         return code
     }
 
+    /// NA_H3TEST=21：SelfLift 第三分支 A/B 端到端 —— 同一 seed/首尾帧/分辨率，
+    /// 分别用 nearest 直接 latent 提升（默认，对照 h3_53 配置）与官方 learned upscaler
+    /// （NA_H3_UPSCALER=learned，时间维感知）各生成一段短视频，抽中帧 PNG 供重影比对。
+    /// 参数：H3_AB_FRAMES（默认 33）、H3_AB_W/H3_AB_H（默认 448×256）。
+    static func runSelfLiftABTest() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+        let env = ProcessInfo.processInfo.environment
+        let sceneDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3/assets"
+        let firstImage = env["H3_FIRST_IMG"] ?? "/Users/huachayui/Documents/无限画布/资产库/t1.png"
+        let lastImage = env["H3_LAST_IMG"] ?? "/Users/huachayui/Documents/无限画布/资产库/t2.png"
+        let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
+        let framesRaw = UInt32(env["H3_AB_FRAMES"] ?? "33") ?? 33
+        let width = Int(env["H3_AB_W"] ?? "448") ?? 448
+        let height = Int(env["H3_AB_H"] ?? "256") ?? 256
+        // H3_AB_GROUPS="F,H" 时只跑指定组，跳过其余组（用于大分辨率快速对照）
+        let groups = (env["H3_AB_GROUPS"] ?? "A,B,C,D,E,F,G,H").split(separator: ",").map(String.init)
+        let aligned = H3Const.alignFrameCount(framesRaw)
+        let latentT = H3Const.videoLatentT(frameCount: aligned)
+        let prompt = env["H3_PROMPT"] ?? (
+            "A woman in an elegant celadon ancient-style long dress performs a flowing sword dance on a stage under a spotlight. "
+            + "She starts raising a glowing sword high, then smoothly turns and lunges into a low bow stance thrusting the sword sideways. "
+            + "Continuous fluid motion, stable identity, clear sharp face throughout, no ghosting, no double contours, no extra fingers, stable background."
+        )
+        let outNearest = "\(outDir)/h3_sl_ab_nearest.mp4"
+        let outLearned = "\(outDir)/h3_sl_ab_learned.mp4"
+        let outOfficial = "\(outDir)/h3_sl_ab_official.mp4"
+        let outRho06 = "\(outDir)/h3_sl_ab_rho06.mp4"
+        let outOfficial12 = "\(outDir)/h3_sl_ab_official12.mp4"
+        let outDecouple = "\(outDir)/h3_sl_ab_decouple.mp4"
+        let outDecoupleShallow = "\(outDir)/h3_sl_ab_decouple_shallow.mp4"
+        let outDecoupleLowK03 = "\(outDir)/h3_sl_ab_decouple_lowk03.mp4"
+        let outDecoupleHigh3 = "\(outDir)/h3_sl_ab_decouple_high3.mp4"
+        let probeNearest = "\(outDir)/h3_sl_ab_nearest_probe.png"
+        let probeLearned = "\(outDir)/h3_sl_ab_learned_probe.png"
+        let probeOfficial = "\(outDir)/h3_sl_ab_official_probe.png"
+        let probeRho06 = "\(outDir)/h3_sl_ab_rho06_probe.png"
+        let probeOfficial12 = "\(outDir)/h3_sl_ab_official12_probe.png"
+        let probeDecouple = "\(outDir)/h3_sl_ab_decouple_probe.png"
+        let probeDecoupleShallow = "\(outDir)/h3_sl_ab_decouple_shallow_probe.png"
+        let probeDecoupleLowK03 = "\(outDir)/h3_sl_ab_decouple_lowk03_probe.png"
+        let probeDecoupleHigh3 = "\(outDir)/h3_sl_ab_decouple_high3_probe.png"
+
+        func log(_ s: String) { print("[H3SLAB] \(s)"); fflush(stdout) }
+
+        log("SelfLift A/B/C/D/E/F：\(width)×\(height) / \(aligned) 帧 / seed=42；A-D 组 turbo 6 步（nearest → learned → official(rho0+learned) → rho06），E/F 组 12 步公平对照（official12 → 解耦 σ_k=0.7+高清6步）")
+        Task {
+            do {
+                if groups.contains("A") {
+                // A 组：nearest（显式回退，对照 h3_53 历史配置）
+                setenv("NA_H3_UPSCALER", "nearest", 1)
+                let p1 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outNearest,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[A-nearest] \($0)") }
+                )
+                log("✅ A 组 nearest 完成：\(p1)")
+                probeMp4MiddleFrame(mp4Path: p1, pngPath: probeNearest, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("B") {
+                // B 组：learned upscaler（时间维感知）
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                let p2 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outLearned,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[B-learned] \($0)") }
+                )
+                log("✅ B 组 learned 完成：\(p2)")
+                probeMp4MiddleFrame(mp4Path: p2, pngPath: probeLearned, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("C") {
+                // C 组：官方默认组合 —— rho=0（纯 latent 提升）+ learned upscaler
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                let p3 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outOfficial,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[C-official] \($0)") }
+                )
+                log("✅ C 组 official 完成：\(p3)")
+                probeMp4MiddleFrame(mp4Path: p3, pngPath: probeOfficial, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("D") {
+                // D 组：官方建议起点 rho=0.6 + nearest 提升（像素锚点修正比例最高）
+                setenv("NA_H3_UPSCALER", "nearest", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0.6", 1)
+                let p4 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outRho06,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[D-rho06] \($0)") }
+                )
+                log("✅ D 组 rho06 完成：\(p4)")
+                probeMp4MiddleFrame(mp4Path: p4, pngPath: probeRho06, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("E") {
+                // E 组：12 步官方调度对照（learned + rho=0，与 C 组同配置，仅步数 6→12；
+                // 低分 NFE=9 + 高分 NFE=3 = 12 总 NFE，即用户重影场景的默认配置）
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE", "0", 1)
+                let p5 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outOfficial12,
+                    width: width,
+                    height: height,
+                    steps: 12,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[E-official12] \($0)") }
+                )
+                log("✅ E 组 official12 完成：\(p5)")
+                probeMp4MiddleFrame(mp4Path: p5, pngPath: probeOfficial12, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("F") {
+                // F 组：12 步解耦模式（低清 6 步跑到 σ_k≈0.706 消歧义 + 提升后按 σ_next≈0.706
+                // 直接重加噪 + 高清 6 步收细节；总 NFE=12 与 E 组一致，仅 σ 调度解耦）
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE", "1", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K", "0.7", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS", "6", 1)
+                let p6 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outDecouple,
+                    width: width,
+                    height: height,
+                    steps: 12,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[F-decouple] \($0)") }
+                )
+                log("✅ F 组 decouple 完成：\(p6)")
+                probeMp4MiddleFrame(mp4Path: p6, pngPath: probeDecouple, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("G") {
+                // G 组：12 步解耦、低清更彻底消歧义档（σ_k=0.3 → 低清 L=29 步跑到 σ≈0.3，
+                // 运动位置歧义消得更干净；提升后按 σ_next=σ_k≈0.3 直接重加噪 + 高清 6 步收细节）
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE", "1", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K", "0.3", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS", "6", 1)
+                let p7 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outDecoupleLowK03,
+                    width: width,
+                    height: height,
+                    steps: 12,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[G-decouple-lowk03] \($0)") }
+                )
+                log("✅ G 组 decouple-lowk03 完成：\(p7)")
+                probeMp4MiddleFrame(mp4Path: p7, pngPath: probeDecoupleLowK03, log: log)
+                MLX.Memory.clearCache()
+                }
+
+                if groups.contains("H") {
+                // H 组：解耦 σ_k=0.7（低清 6 步消歧义）+ 高清只跑 3 步收细节。
+                // 与 F 组（高清 6 步）对照：验证低清跑深后高清是否只需 3 步即可收干净、总 NFE 更低。
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE", "1", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K", "0.7", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS", "3", 1)
+                let p8 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outDecoupleHigh3,
+                    width: width,
+                    height: height,
+                    steps: 12,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[H-decouple-high3] \($0)") }
+                )
+                log("✅ H 组 decouple-high3 完成：\(p8)")
+                probeMp4MiddleFrame(mp4Path: p8, pngPath: probeDecoupleHigh3, log: log)
+                }
+                code = 0
+            } catch {
+                log("❌ SelfLift A/B 失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+
+        _ = sem.wait(timeout: .now() + 3600)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
+    }
+
     /// NA_H3TEST=11：像素桥 refine 参数回归。
     /// 不改 H3：直接复用已有 stage1 半清视频（默认 h3_27_stage1.mp4，可用环境变量 PIX_IN 覆盖），
     /// 首尾参考图自抽自引用（抽 stage1 首/尾帧），跑 ltxEnhanceExternalVideoWithStage2 全链路，
@@ -543,12 +927,20 @@ enum H3PipelineRun {
         // （loadStaticEmptyTextCond：常量文件读张量 / 缺失全零兜底），全程零模型权重调用，
         // 不加载 Gemma/connector、不自动自举、无需手动设环境变量。
 
+        // ★ 二采通道 A/B 开关（自检专用，只影响本次 NA_H3TEST=11，不写回用户偏好设置）：
+        //   未设 / "1" → 走新的「第二阶段·CQ 清晰度增强」通道（与 App 默认一致）；
+        //   PIX_CQ=0   → 强制回原 LTX 像素桥 IC 二采，用于回归验证原分支未被破坏。
+        //   优先级：LTX_CQ_ENHANCER（通道强制开关）> PIX_CQ > 偏好设置 videoUseCQEnhancer。
+        let pixCQ = ProcessInfo.processInfo.environment["PIX_CQ"] != "0"
+        log("ℹ️ 二采通道：\(pixCQ ? "CQ 清晰度增强（PIX_CQ≠0，官方 CQ LoRA）" : "原 IC 像素桥（PIX_CQ=0）")")
+
         Task {
             do {
                 guard let path = await ltxEnhanceExternalVideoWithStage2(
                     videoPath: stage1,
                     imagePaths: [refFirst, refLast],
-                    seed: 42) else {
+                    seed: 42,
+                    cqEnhancerEnable: pixCQ) else {
                     log("❌ 像素桥失败")
                     return
                 }
@@ -619,5 +1011,328 @@ enum H3PipelineRun {
         // 兜底：首帧
         _ = runFF(["ffmpeg", "-y", "-i", mp4Path, "-vf", "select=eq(n\\,0)", "-frames:v", "1", pngPath])
         log("已抽首帧（探测失败兜底）→ \(pngPath)")
+    }
+
+    /// NA_H3TEST=26：官方默认路径复刻 —— learned + rho=0（不混合 z_pix，纯 z_lat 提升）。
+    /// 与 rho=0.6 组同 seed/同帧数/同场景，后段逐帧对比判定重影来源。
+    static func runH3OfficialDefaultTest() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+        let env = ProcessInfo.processInfo.environment
+        let inDir = "/Users/huachayui/Library/Application Support/com.tencent.mac.marvis/MarvisData/User/99999343CE761436DB7BAC928475A2A3/workspace/conv_1ef541d443984dc7885a9e7586114321/temp/h3_53_ab_input"
+        let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
+        let firstImage = env["H3_FIRST_IMG"] ?? "\(inDir)/first.png"
+        let lastImage = env["H3_LAST_IMG"] ?? "\(inDir)/last.png"
+        let width = Int(env["H3_AB_W"] ?? "1344") ?? 1344
+        let height = Int(env["H3_AB_H"] ?? "768") ?? 768
+        let framesRaw = UInt32(env["H3_AB_FRAMES"] ?? "33") ?? 33
+        let stepsOverride = UInt32(env["H3_AB_STEPS"] ?? "6") ?? 6
+        let outName = env["H3_AB_OUT"] ?? "h3_official_default.mp4"
+        let aligned = H3Const.alignFrameCount(framesRaw)
+        let latentT = H3Const.videoLatentT(frameCount: aligned)
+        let prompt = env["H3_PROMPT"] ?? (
+            "integrated_multimodal_description: [Shot 1] 赵阳在摇晃中缓缓睁开眼，入目便是一张清秀的脸庞。"
+            + "赵阳 (S1) 看着那双忧郁的眼睛道：<d>[Chinese] 你是？</d> 那张清秀脸庞的主人 (S2) 答："
+            + "<d>[Chinese] 果然还活着，哦，我叫江作人。咱们都被抓壮丁了，诶，等等，你自己看吧。</d>"
+            + "江作人 (S2) 给他讲述了自己睁开眼看到的一切。赵阳 (S1) 道：<d>[Chinese] 原来是这样吗。</d>"
+            + "赵阳顶着大光头，双手抱头，眼神空洞，久久不语。"
+        )
+
+        func log(_ s: String) { print("[OFFDEFAULT] \(s)"); fflush(stdout) }
+
+        log("官方默认路径：\(width)×\(height) / \(aligned) 帧 / turbo \(stepsOverride) 步 / seed=42，learned + rho=0（纯 z_lat，不混合 z_pix）")
+        Task {
+            do {
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                setenv("NA_H3_SELFLIFT_WMIN", "1.0", 1)
+                setenv("NA_H3_SELFLIFT_WMAX", "1.0", 1)
+                let out = "\(outDir)/\(outName)"
+                log("开始 → \(out)")
+                let p = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: out,
+                    width: width,
+                    height: height,
+                    steps: stepsOverride,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[official] \($0)") }
+                )
+                log("✅ 官方默认路径完成：\(p)")
+                code = 0
+            } catch {
+                log("❌ 官方默认路径失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+
+        _ = sem.wait(timeout: .now() + 5400)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
+    }
+
+    /// NA_H3TEST=25：h3_53 真实场景 w 软混合扫描 —— learned + rho=0.9 固定，w 三档：
+    /// W0 硬掩码（w=1/1，当前默认，=rho=0.9 基线）→ W1 半量（0.5/0.5）→ W2 渐变（0.3/0.8）。
+    /// 背景小角色残影来自 z_pix VAE 往返帧间抖动被 90% 全量注入；软混合让分歧小（模糊/背景）区
+    /// 保留 z_lat 时间平滑性。参数：H3_AB_FRAMES（默认 33）、H3_AB_W/H3_AB_H（默认 1344×768）。
+    static func runH3WMixSweepTest() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+        let env = ProcessInfo.processInfo.environment
+        let inDir = "/Users/huachayui/Library/Application Support/com.tencent.mac.marvis/MarvisData/User/99999343CE761436DB7BAC928475A2A3/workspace/conv_1ef541d443984dc7885a9e7586114321/temp/h3_53_ab_input"
+        let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
+        let firstImage = env["H3_FIRST_IMG"] ?? "\(inDir)/first.png"
+        let lastImage = env["H3_LAST_IMG"] ?? "\(inDir)/last.png"
+        let width = Int(env["H3_AB_W"] ?? "1344") ?? 1344
+        let height = Int(env["H3_AB_H"] ?? "768") ?? 768
+        let framesRaw = UInt32(env["H3_AB_FRAMES"] ?? "33") ?? 33
+        let aligned = H3Const.alignFrameCount(framesRaw)
+        let latentT = H3Const.videoLatentT(frameCount: aligned)
+        let prompt = env["H3_PROMPT"] ?? (
+            "integrated_multimodal_description: [Shot 1] 赵阳在摇晃中缓缓睁开眼，入目便是一张清秀的脸庞。"
+            + "赵阳 (S1) 看着那双忧郁的眼睛道：<d>[Chinese] 你是？</d> 那张清秀脸庞的主人 (S2) 答："
+            + "<d>[Chinese] 果然还活着，哦，我叫江作人。咱们都被抓壮丁了，诶，等等，你自己看吧。</d>"
+            + "江作人 (S2) 给他讲述了自己睁开眼看到的一切。赵阳 (S1) 道：<d>[Chinese] 原来是这样吗。</d>"
+            + "赵阳顶着大光头，双手抱头，眼神空洞，久久不语。"
+        )
+
+        func log(_ s: String) { print("[WMIXSWEEP] \(s)"); fflush(stdout) }
+
+        log("w 软混合扫描：\(width)×\(height) / \(aligned) 帧 / turbo 6 步 / seed=42，learned+rho0.9 × w 1/1 → 0.5/0.5 → 0.3/0.8")
+        Task {
+            do {
+                let runs: [(wMin: Float, wMax: Float, tag: String)] = [(1.0, 1.0, "w11"), (0.5, 0.5, "w05"), (0.3, 0.8, "w038")]
+                for run in runs {
+                    setenv("NA_H3_UPSCALER", "learned", 1)
+                    setenv("NA_H3_SELFLIFT_RHO", "0.9", 1)
+                    setenv("NA_H3_SELFLIFT_WMIN", "\(run.wMin)", 1)
+                    setenv("NA_H3_SELFLIFT_WMAX", "\(run.wMax)", 1)
+                    let out = "\(outDir)/h3_wmix_\(run.tag).mp4"
+                    let probe = "\(outDir)/h3_wmix_\(run.tag)_probe.png"
+                    log("组 w=\(run.wMin)/\(run.wMax) 开始 → \(out)")
+                    let p = try await H3FL2VAPipeline.generateVideo(
+                        prompt: prompt,
+                        firstImagePath: firstImage,
+                        lastImagePath: lastImage,
+                        outPath: out,
+                        width: width,
+                        height: height,
+                        steps: 6,
+                        latentT: latentT,
+                        seed: 42,
+                        sparsePolicy: .mix,
+                        scheduleStyle: .official,
+                        selfLiftEnabled: true,
+                        log: { log("[w=\(run.wMin)/\(run.wMax)] \($0)") }
+                    )
+                    log("✅ w=\(run.wMin)/\(run.wMax) 完成：\(p)")
+                    probeMp4MiddleFrame(mp4Path: p, pngPath: probe, log: log)
+                    MLX.Memory.clearCache()
+                }
+                code = 0
+            } catch {
+                log("❌ w 软混合扫描失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+
+        _ = sem.wait(timeout: .now() + 5400)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
+    }
+
+    /// NA_H3TEST=24：h3_53 真实场景 rho 扫描 —— learned 提升固定，rho 三档 0.25/0.6/0.9，
+    /// 验证像素锚点（z_pix VAE 往返真值）修正比例提高能否消除 learned 时间插值残留的轻微重影。
+    /// 参数：H3_AB_FRAMES（默认 33）、H3_AB_W/H3_AB_H（默认 1344×768）。
+    static func runH3RhoSweepTest() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+        let env = ProcessInfo.processInfo.environment
+        let inDir = "/Users/huachayui/Library/Application Support/com.tencent.mac.marvis/MarvisData/User/99999343CE761436DB7BAC928475A2A3/workspace/conv_1ef541d443984dc7885a9e7586114321/temp/h3_53_ab_input"
+        let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
+        let firstImage = env["H3_FIRST_IMG"] ?? "\(inDir)/first.png"
+        let lastImage = env["H3_LAST_IMG"] ?? "\(inDir)/last.png"
+        let width = Int(env["H3_AB_W"] ?? "1344") ?? 1344
+        let height = Int(env["H3_AB_H"] ?? "768") ?? 768
+        let framesRaw = UInt32(env["H3_AB_FRAMES"] ?? "33") ?? 33
+        let aligned = H3Const.alignFrameCount(framesRaw)
+        let latentT = H3Const.videoLatentT(frameCount: aligned)
+        let prompt = env["H3_PROMPT"] ?? (
+            "integrated_multimodal_description: [Shot 1] 赵阳在摇晃中缓缓睁开眼，入目便是一张清秀的脸庞。"
+            + "赵阳 (S1) 看着那双忧郁的眼睛道：<d>[Chinese] 你是？</d> 那张清秀脸庞的主人 (S2) 答："
+            + "<d>[Chinese] 果然还活着，哦，我叫江作人。咱们都被抓壮丁了，诶，等等，你自己看吧。</d>"
+            + "江作人 (S2) 给他讲述了自己睁开眼看到的一切。赵阳 (S1) 道：<d>[Chinese] 原来是这样吗。</d>"
+            + "赵阳顶着大光头，双手抱头，眼神空洞，久久不语。"
+        )
+
+        func log(_ s: String) { print("[RHOSWEEP] \(s)"); fflush(stdout) }
+
+        log("rho 扫描：\(width)×\(height) / \(aligned) 帧 / turbo 6 步 / seed=42，learned × rho 0.25→0.6→0.9")
+        Task {
+            do {
+                let runs: [(rho: Double, tag: String)] = [(0.25, "025"), (0.6, "060"), (0.9, "090")]
+                for run in runs {
+                    setenv("NA_H3_UPSCALER", "learned", 1)
+                    setenv("NA_H3_SELFLIFT_RHO", "\(run.rho)", 1)
+                    let out = "\(outDir)/h3_rho_\(run.tag).mp4"
+                    let probe = "\(outDir)/h3_rho_\(run.tag)_probe.png"
+                    log("组 ρ=\(run.rho) 开始 → \(out)")
+                    let p = try await H3FL2VAPipeline.generateVideo(
+                        prompt: prompt,
+                        firstImagePath: firstImage,
+                        lastImagePath: lastImage,
+                        outPath: out,
+                        width: width,
+                        height: height,
+                        steps: 6,
+                        latentT: latentT,
+                        seed: 42,
+                        sparsePolicy: .mix,
+                        scheduleStyle: .official,
+                        selfLiftEnabled: true,
+                        log: { log("[ρ=\(run.rho)] \($0)") }
+                    )
+                    log("✅ ρ=\(run.rho) 完成：\(p)")
+                    probeMp4MiddleFrame(mp4Path: p, pngPath: probe, log: log)
+                    MLX.Memory.clearCache()
+                }
+                code = 0
+            } catch {
+                log("❌ rho 扫描失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+
+        _ = sem.wait(timeout: .now() + 5400)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
+    }
+
+    /// NA_H3TEST=23：h3_53 真实场景高分辨率 A/B —— 用资产库 h3_53 首/尾帧 + 原始 prompt，
+    /// 1344×768 / 62 帧，A=nearest（默认）、B=learned（NA_H3_UPSCALER=learned），
+    /// 抽多个探针帧供面部重影复核。
+    static func runH3SceneABTest() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+        let env = ProcessInfo.processInfo.environment
+        let inDir = "/Users/huachayui/Library/Application Support/com.tencent.mac.marvis/MarvisData/User/99999343CE761436DB7BAC928475A2A3/workspace/conv_1ef541d443984dc7885a9e7586114321/temp/h3_53_ab_input"
+        let outDir = "/Users/huachayui/Desktop/无限画布/model/minimax h3"
+        let firstImage = env["H3_FIRST_IMG"] ?? "\(inDir)/first.png"
+        let lastImage = env["H3_LAST_IMG"] ?? "\(inDir)/last.png"
+        let width = Int(env["H3_AB_W"] ?? "1344") ?? 1344
+        let height = Int(env["H3_AB_H"] ?? "768") ?? 768
+        let framesRaw = UInt32(env["H3_AB_FRAMES"] ?? "62") ?? 62
+        let aligned = H3Const.alignFrameCount(framesRaw)
+        let latentT = H3Const.videoLatentT(frameCount: aligned)
+        let prompt = env["H3_PROMPT"] ?? (
+            "integrated_multimodal_description: [Shot 1] 赵阳在摇晃中缓缓睁开眼，入目便是一张清秀的脸庞。"
+            + "赵阳 (S1) 看着那双忧郁的眼睛道：<d>[Chinese] 你是？</d> 那张清秀脸庞的主人 (S2) 答："
+            + "<d>[Chinese] 果然还活着，哦，我叫江作人。咱们都被抓壮丁了，诶，等等，你自己看吧。</d>"
+            + "江作人 (S2) 给他讲述了自己睁开眼看到的一切。赵阳 (S1) 道：<d>[Chinese] 原来是这样吗。</d>"
+            + "赵阳顶着大光头，双手抱头，眼神空洞，久久不语。"
+        )
+        let outNearest = "\(outDir)/h3_scene_ab_nearest.mp4"
+        let outLearned = "\(outDir)/h3_scene_ab_learned.mp4"
+        let outDecoupleV2 = "\(outDir)/h3_scene_ab_decouple_v2.mp4"
+        let probeNearest = "\(outDir)/h3_scene_ab_nearest_probe.png"
+        let probeLearned = "\(outDir)/h3_scene_ab_learned_probe.png"
+        let probeDecoupleV2 = "\(outDir)/h3_scene_ab_decouple_v2_probe.png"
+
+        func log(_ s: String) { print("[H3SCENEAB] \(s)"); fflush(stdout) }
+
+        log("h3_53 场景 A/B：\(width)×\(height) / \(aligned) 帧 / turbo 6 步 / seed=42，nearest → learned")
+        Task {
+            do {
+                // A 组：nearest（显式回退，h3_53 历史配置）
+                setenv("NA_H3_UPSCALER", "nearest", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "", 1)
+                let p1 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outNearest,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[A-nearest] \($0)") }
+                )
+                log("✅ A 组 nearest 完成：\(p1)")
+                probeMp4MiddleFrame(mp4Path: p1, pngPath: probeNearest, log: log)
+                MLX.Memory.clearCache()
+
+                // B 组：learned upscaler
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                let p2 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outLearned,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[B-learned] \($0)") }
+                )
+                log("✅ B 组 learned 完成：\(p2)")
+                probeMp4MiddleFrame(mp4Path: p2, pngPath: probeLearned, log: log)
+                MLX.Memory.clearCache()
+
+                // C 组：当前 UI v2 解耦档（learned + 解耦 LOW_K=0.9→低清2步 σ_k≈0.9231 + 高清3步等距，
+                // 总 NFE=5 < 官方 6 步直出）。对照 B 组：验证重影消除且步数更少。
+                setenv("NA_H3_UPSCALER", "learned", 1)
+                setenv("NA_H3_SELFLIFT_RHO", "0", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE", "1", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K", "0.9", 1)
+                setenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS", "3", 1)
+                let p3 = try await H3FL2VAPipeline.generateVideo(
+                    prompt: prompt,
+                    firstImagePath: firstImage,
+                    lastImagePath: lastImage,
+                    outPath: outDecoupleV2,
+                    width: width,
+                    height: height,
+                    steps: 6,
+                    latentT: latentT,
+                    seed: 42,
+                    sparsePolicy: .mix,
+                    scheduleStyle: .official,
+                    selfLiftEnabled: true,
+                    log: { log("[C-decouple-v2] \($0)") }
+                )
+                log("✅ C 组 decouple-v2 完成：\(p3)")
+                probeMp4MiddleFrame(mp4Path: p3, pngPath: probeDecoupleV2, log: log)
+                code = 0
+            } catch {
+                log("❌ h3_53 场景 A/B 失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+
+        _ = sem.wait(timeout: .now() + 5400)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
     }
 }

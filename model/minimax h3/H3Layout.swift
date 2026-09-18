@@ -111,7 +111,12 @@ public func adaptCanvas(_ w: UInt32, _ h: UInt32) -> Canvas {
 }
 
 public enum RefImageSizing {
-    case match, max
+    /// 缩到与生成画面同面积（序列最短，最快；细节有损）
+    case match
+    /// 短边上限 1024（速度/细节折中）
+    case mid
+    /// 短边上限 2048（官方设定，细节最好，序列最长）
+    case max
 }
 
 func snap32(_ v: Double) -> UInt32 {
@@ -128,6 +133,8 @@ public func refImageCanvas(_ w: UInt32, _ h: UInt32, genW: UInt32, genH: UInt32,
     switch mode {
     case .match:
         scale = min(1.0, sqrt((Double(genW) * Double(genH)) / (fw * fh)))
+    case .mid:
+        scale = min(1.0, 1024.0 / Double(min(w, h)))
     case .max:
         scale = min(1.0, Double(H3Const.refImageShortEdge) / Double(min(w, h)))
     }

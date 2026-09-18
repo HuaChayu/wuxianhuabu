@@ -591,12 +591,17 @@ struct InputValidity {
     var applies: Bool = false
     /// 明确无效的连线 ID 集合（UI：这些线禁用灰色；发送：跳过这些线不收集）
     var invalidConnectionIDs: Set<UUID> = []
-    /// 合规图片路径（按连线顺序，最多 2 张）
+    /// 合规图片路径（按源节点画布 y 排序；上限按模型：ltx2.5 最多 2 张、MiniMax H3 最多 9 张）
     var imagePaths: [String] = []
-    /// 合规音频路径（最多 1 个）
-    var audioPath: String? = nil
-    /// 不可生成原因（非 nil 时发送按钮应拒绝：如 H3 条件图不足 2 张）；nil = 无阻断
+    /// 合规音频路径（上限按模型：ltx2.5 最多 1 个、MiniMax H3 最多 3 个）
+    var audioPaths: [String] = []
+    /// 合规参考视频路径（仅 MiniMax H3 支持，最多 3 个；ltx2.5 不接受视频输入）
+    var videoPaths: [String] = []
+    /// 不可生成原因（非 nil 时发送按钮应拒绝：如 H3 无任何条件输入）；nil = 无阻断
     var errorMessage: String? = nil
+
+    /// 单个音频（ltx2.5 语义：只用 1 个）；H3 消费 audioPaths 全量
+    var audioPath: String? { audioPaths.first }
 }
 
 extension CanvasStore {
@@ -663,7 +668,7 @@ extension CanvasStore {
                 if audioCount < 1 {
                     if let path = inputFilePath(for: fromNode) {
                         audioCount += 1
-                        result.audioPath = path
+                        result.audioPaths = [path]
                     } else {
                         result.invalidConnectionIDs.insert(conn.id)   // 空节点
                     }
@@ -695,57 +700,78 @@ extension CanvasStore {
         return result
     }
     
-    /// MiniMax H3 规则：
-    /// - 恰好 2 张条件图（首帧 + 尾帧）：图片/角色/场景节点 → 图片线，最多 2 条；
-    ///   开尾帧的视频节点视作图片（沿用 ltx25Distill 的 tailFrameImagePath 提取末帧）；
-    ///   超过 2 条无效。
-    /// - 少于 2 张时 errorMessage 给出明确不可生成原因（提示需 2 张条件图）。
-    /// - 音频/未开尾帧视频/文本等其它类型 → 无效线（H3 不支持）。
+    /// MiniMax H3 规则（ref2va 多参考条件，对齐 H3Const：9 图 / 3 视频 / 3 音频 / 总数 12）：
+    /// - 图片/角色/场景节点 → 图片条件，最多 9 张；
+    /// - 开尾帧的视频节点视作图片（沿用 ltx25Distill 的 tailFrameImagePath 提取末帧）；
+    ///   未开尾帧的视频节点 → 参考视频条件，最多 3 个；
+    /// - 音频节点 → 参考音频条件，最多 3 个；
+    /// - 三类总数上限 12，超出部分记为无效线；文本等其它类型不判不禁（不参与条件）。
+    /// - 至少 1 个有效条件；全空时 errorMessage 给出明确不可生成原因。
     private func minimaxH3InputValidity(for videoNode: CanvasNode) -> InputValidity {
         var result = InputValidity()
         result.applies = true
-        var imageCount = 0
-        var imageCandidates: [(y: CGFloat, path: String)] = []   // 有效图片输入：记录画布 y 用于定首尾帧
+        var imageCandidates: [(y: CGFloat, path: String)] = []   // 图片条件：记录画布 y 用于排序
+        var videoCandidates: [(y: CGFloat, path: String)] = []   // 参考视频条件
+        var audioCandidates: [(y: CGFloat, path: String)] = []   // 参考音频条件
         for conn in connections where conn.toID == videoNode.id {
             guard let fromNode = nodes.first(where: { $0.id == conn.fromID }) else { continue }
+            let totalCount = imageCandidates.count + videoCandidates.count + audioCandidates.count
             switch fromNode.type {
             case .image, .scene, .character:
-                if imageCount < 2 {
+                if totalCount < H3Const.maxRefTotal, imageCandidates.count < H3Const.maxRefImages {
                     if let path = inputFilePath(for: fromNode) {
-                        imageCount += 1
                         imageCandidates.append((fromNode.position.y, path))
                     } else {
                         result.invalidConnectionIDs.insert(conn.id)   // 空节点
                     }
                 } else {
-                    result.invalidConnectionIDs.insert(conn.id)       // 图片超限
+                    result.invalidConnectionIDs.insert(conn.id)       // 图片/总数超限
                 }
             case .video:
                 if fromNode.tailFrameEnabled {
-                    // 开尾帧视频节点视作图片：提取最后一帧为临时 PNG 作为输出图条件
-                    if imageCount < 2 {
+                    // 开尾帧视频节点视作图片：提取最后一帧为临时 PNG 作为图片条件
+                    if totalCount < H3Const.maxRefTotal, imageCandidates.count < H3Const.maxRefImages {
                         if let path = tailFrameImagePath(for: fromNode) {
-                            imageCount += 1
                             imageCandidates.append((fromNode.position.y, path))
                         } else {
                             result.invalidConnectionIDs.insert(conn.id)
                         }
                     } else {
-                        result.invalidConnectionIDs.insert(conn.id)   // 图片超限
+                        result.invalidConnectionIDs.insert(conn.id)   // 图片/总数超限
                     }
                 } else {
-                    result.invalidConnectionIDs.insert(conn.id)       // 不允许视频输入
+                    // 未开尾帧视频节点 → 参考视频条件（H3 最多 3 个）
+                    if totalCount < H3Const.maxRefTotal, videoCandidates.count < H3Const.maxRefVideos {
+                        if let path = inputFilePath(for: fromNode) {
+                            videoCandidates.append((fromNode.position.y, path))
+                        } else {
+                            result.invalidConnectionIDs.insert(conn.id)
+                        }
+                    } else {
+                        result.invalidConnectionIDs.insert(conn.id)   // 视频/总数超限
+                    }
+                }
+            case .audio:
+                if totalCount < H3Const.maxRefTotal, audioCandidates.count < H3Const.maxRefAudios {
+                    if let path = inputFilePath(for: fromNode) {
+                        audioCandidates.append((fromNode.position.y, path))
+                    } else {
+                        result.invalidConnectionIDs.insert(conn.id)
+                    }
+                } else {
+                    result.invalidConnectionIDs.insert(conn.id)       // 音频/总数超限
                 }
             default:
-                // 音频/文本/其它：H3 不支持，一律无效线
-                result.invalidConnectionIDs.insert(conn.id)
+                break   // 文本等其它类型：不参与 H3 条件，不判不禁
             }
         }
-        // 首尾帧规则：有效图片输入按画布上下位置排序，y 小（上方）为首帧，y 大（下方）为尾帧
+        // 各类条件分别按画布上下位置排序（y 小在上，顺序稳定）
         result.imagePaths = imageCandidates.sorted { $0.y < $1.y }.map(\.path)
-        // H3 要求恰好 2 张条件图：不足时给出明确不可生成原因
-        if result.imagePaths.count < 2 {
-            result.errorMessage = "MiniMax H3 需要 2 张条件图（首帧+尾帧），当前仅 \(result.imagePaths.count) 张，请再连接 1 张图片或开启尾帧的视频"
+        result.videoPaths = videoCandidates.sorted { $0.y < $1.y }.map(\.path)
+        result.audioPaths = audioCandidates.sorted { $0.y < $1.y }.map(\.path)
+        // 至少 1 个条件输入，否则给出明确不可生成原因
+        if result.imagePaths.isEmpty && result.videoPaths.isEmpty && result.audioPaths.isEmpty {
+            result.errorMessage = "MiniMax H3 至少需要 1 个条件输入（图片≤9 张 / 视频≤3 个 / 音频≤3 个），当前无任何有效条件"
         }
         return result
     }

@@ -758,10 +758,15 @@ func fillFrameForPixelBuffer(_ frame: MLXArray, width: Int, height: Int,
 /// - Parameters:
 ///   - fillFrame: 帧填充闭包 (frameIndex, baseAddress, bytesPerRow, isV210) -> Bool；
 ///     isV210 = true 表示本次 writer 的像素缓冲为 v210（ProRes 422 10bit），必须走 v210 打包填充。
+///   - overrideFrames: 「直写通道」帧填充闭包 (frameIndex, pixelBuffer) -> Bool（可选，默认 nil）。
+///     非 nil 时由调用方**直接往 writer 池缓冲写像素**（返回值 = 该帧是否写成功），
+///     跳过下方基于源像素格式的 fillFrame 分流逻辑；既有调用（H3 / LTX / 自检）均传 fillFrame，行为完全不变。
+///     第三套二采（Apple VideoToolbox 超分）用它把 SR 输出经 VTPixelTransferSession 转写进池缓冲。
 func writeMp4(frameCount: Int, width: Int, height: Int, fps: Int, to path: String,
               proRes: Bool = false,
               h264MaxQuality: Bool = false,
-              fillFrame: (Int, UnsafeMutableRawPointer?, Int, Bool) -> Bool) throws {
+              overrideFrames: ((Int, CVPixelBuffer) -> Bool)? = nil,
+              fillFrame: ((Int, UnsafeMutableRawPointer?, Int, Bool) -> Bool)? = nil) throws {
     let url = URL(fileURLWithPath: path)
     try? FileManager.default.removeItem(at: url)
     // ProRes 422 只支持 .mov 容器封装（mp4 容器官方不支持 ProRes 轨道），h264 保持原 .mp4；
@@ -802,8 +807,12 @@ func writeMp4(frameCount: Int, width: Int, height: Int, fps: Int, to path: Strin
     writer.startSession(atSourceTime: .zero)
     let frameDur = CMTime(value: 1, timescale: CMTimeScale(fps))
     for i in 0..<frameCount {
+        // 等待编码器就绪：自适应退避（1ms 起步、上限 20ms）。语义与固定 20ms 轮询等价（仍是轮询让出），
+        // 但编码器短暂背压时不必空等一个整周期；持续背压下退避到 20ms，不比原实现多占 CPU。
+        var readyWait: TimeInterval = 0.001
         while !input.isReadyForMoreMediaData {
-            Thread.sleep(forTimeInterval: 0.02)
+            Thread.sleep(forTimeInterval: readyWait)
+            if readyWait < 0.02 { readyWait = min(readyWait * 2, 0.02) }
         }
         var pb: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &pb)
@@ -815,8 +824,16 @@ func writeMp4(frameCount: Int, width: Int, height: Int, fps: Int, to path: Strin
         CVPixelBufferLockBaseAddress(pixelBuffer, [])
         // isV210 = proRes：ProRes 分支像素缓冲为 v210，闭包内须走 10bit 打包（fillPixelBufferV210），
         // 由 fillFrameForPixelBuffer 按此布尔分流，避免 8/10bit 混填。
-        let filled = fillFrame(i, CVPixelBufferGetBaseAddress(pixelBuffer),
+        // 直写通道（overrideFrames 非 nil，如 Apple SR 二采）：由调用方直接写像素，不再走上述分流。
+        let filled: Bool
+        if let overrideFrames {
+            filled = overrideFrames(i, pixelBuffer)
+        } else if let fillFrame {
+            filled = fillFrame(i, CVPixelBufferGetBaseAddress(pixelBuffer),
                                CVPixelBufferGetBytesPerRow(pixelBuffer), proRes)
+        } else {
+            filled = false
+        }
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
         guard filled else { continue }
         let t = CMTimeMultiply(frameDur, multiplier: Int32(i))

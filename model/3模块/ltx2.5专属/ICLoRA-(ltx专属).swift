@@ -10,7 +10,9 @@
 //       ff.net.0.proj（4096→16384）/ ff.net.2（16384→4096）
 //   · 无 to_gate_logits、无音频流、无 AV 交叉、无 patchify 注入
 //   · rank=32；A [rank,in]，B [out,rank]（键名 lora_A.weight / lora_B.weight）
-//   · metadata 无 scale 字段；官方模型卡 scale=1.0 且权重预缩放 → 直接相加，不乘系数
+//   · metadata 无 scale 字段；官方 DFR detailing 用法把强度硬编码为 0.5
+//     （dfr_pipeline.py:108 `_DETAILING_LORA_STRENGTH = 0.5`，L424-426 构造 LoraPathStrengthAndSDOps
+//      时无条件套用，命令行传入的 strength 被忽略）→ 旁路增量按 icLoRAStrength(=0.5) 缩放后相加
 //   · dtype f16（327MB），attach 时统一 cast 到 PrecisionPolicy.defaultMainDType
 //
 // 键前缀 diffusion_model.transformer_blocks.N.<suffix>，
@@ -22,17 +24,29 @@
 import Foundation
 @preconcurrency import MLX
 
-/// LoRA 权重对：delta(x) = (x·Aᵀ)·Bᵀ（数值等价 W' = W + B@A 的秩分解增量）
+/// 官方 DFR detailing 阶段对该 IC-LoRA 的硬编码应用强度：
+/// `dfr_pipeline.py:108 _DETAILING_LORA_STRENGTH = 0.5`（L424-426 构造 `LoraPathStrengthAndSDOps`
+/// 时无条件套用，不读命令行 strength；L457 融合进 stage_detailing）。故旁路等效 W' = W + 0.5·B@A。
+let icLoRAStrength: Float = 0.5
+
+/// 通用 LoRA 权重对：delta(x) = scale·(x·Aᵀ)·Bᵀ（数值等价 W' = W + scale·B@A 的秩分解增量）。
+/// 主干 icLoraQ/K/V/O、icLoraIn/Out 槽位是**通用增量槽**，被两条通道复用：
+///   · IC-LoRA（像素桥二采）：scale 默认 = icLoRAStrength(0.5)，即官方 DFR detailing 硬编码强度；
+///   · CQ Enhancer（清晰度增强通道）：构造时显式传 scale = (alpha/rank)×strength（官方 strength=1.0），
+///     两通道互斥执行、各自 defer 关闭 icActive，故互不串味（详见 CQEnhancer-(ltx专属).swift）。
 struct ICLoRAPair {
     let a: MLXArray?   // [rank, in]
     let b: MLXArray?   // [out, rank]
+    /// 应用强度；默认 0.5 保持 IC-LoRA 原行为不变（CQ 通道传 1.0）
+    var scale: Float = icLoRAStrength
     var isPresent: Bool { a != nil && b != nil }
 
     /// 对输入 x（特征维在最后）应用旁路增量；A/B 需已 cast 到 x.dtype。
     func delta(_ x: MLXArray) -> MLXArray? {
         guard let a, let b else { return nil }
         // x [.., in] · a.T [in, rank] → [.., rank]；再 · b.T [rank, out] → [.., out]
-        return x.matmul(a.transposed()).matmul(b.transposed())
+        // IC-LoRA 官方 DFR detailing 硬编码强度 0.5（dfr_pipeline.py:108）→ scale 默认取 icLoRAStrength
+        return x.matmul(a.transposed()).matmul(b.transposed()) * scale
     }
 }
 

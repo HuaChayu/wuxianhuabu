@@ -64,6 +64,30 @@ let ltx25DistilledSigmas: [Float] = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909
 /// 使用方：LTX-2.5（视频模型调用&回执.swift vaeDecodeTest）
 let ltx25Stage2Sigmas: [Float] = [0.909375, 0.725, 0.421875, 0.0]
 
+/// LTX-2.5 IC 二采保守档（2026-09-18，H3 低清画面锚定增强）：
+/// σ0=0.85 起步（主序列 init = 升频 latent*(1-0.85)+noise*0.85，保留 15% 原画面），
+/// 不再用官方 0.909375 高噪档（该档对模糊半清/空文本输入会让模型先验主导、参考 KV
+/// 锁不住人脸 → 换脸）。尾部 0.421875→0 保留官方高清细节步几何，仍 3 步确定性 Euler。
+/// 使用方：runLTXStage2RefineOnLatent（IC 通道，decoupledRefLatent == nil 时默认档）。
+let ltx25Stage2SigmasConserve: [Float] = [0.85, 0.65, 0.421875, 0.0]
+
+/// SelfLift 解耦（LTX IC 二采版，2026-09-17）：低清段 / 高清段两段式 σ 曲线，总 NFE = 2+2 = 4。
+/// 语义与 H3 一采 SelfLift 解耦同源：低清段先在半清网格上浅跑 2 步（σ0=0.909375 保留升频锚点，
+/// 末点 σ_k=0.421875 残留），锁定时间-光照一致的结构 → 升频 ×2 后重加噪到 σ_next=0.421875 →
+/// 高清段 IC 官方骨架跑 2 步收细节。官方 IC 3 步全清；本档低清 2 步跑 1/4 网格
+/// （算力 ≈ 2.5 全清步，更省），且低清段先锁时序能缓解高分辨率短步数下的帧间闪烁。
+/// 使用方：runLTXStage2RefineOnLatent（IC 通道，NA_PIX_SELFLIFT_DECOUPLE=1 时启用，默认开）。
+let ltx25Stage2SigmasDecoupleLow: [Float] = [0.909375, 0.725, 0.421875]
+let ltx25Stage2SigmasDecoupleHigh: [Float] = [0.421875, 0.2109375, 0.0]
+
+/// 【新增】官方 CQ Video Enhancer LoRA 工作流 ManualSigmas（9 段 / 8 步，σ0 = 1.0）。
+/// 原文："1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+/// 使用方：第二阶段·CQ 清晰度增强通道（ltx2.5-(ltx专属).swift runLTXStage2RefineOnLatent 的
+/// cqRequested 分支）。该档 σ0=1.0，主序列从纯噪声起采，依赖 CQ 工作流的 in-context 参考
+/// （低清视频整段 latent 作 KV）+ CQ LoRA 重建细节；官方采样器为 euler_ancestral。
+/// 与 lt25Stage2Sigmas（IC 二采 4 步 σ0=0.909375）并存、互不影响。
+let cqEnhancerSigmas: [Float] = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
 /// Ancestral (SDE) Euler 步进：对齐官方 EulerAncestralDiffusionStep（eta=1.0, s_noise=1.0）。
 /// 先确定性插值到中间噪声档 sigma_down，再注入噪声回升到 sigma_next。
 /// LTX-2.5 蒸馏 stage1 官方默认 ancestral 采样，确定性 Euler 会丢细节。

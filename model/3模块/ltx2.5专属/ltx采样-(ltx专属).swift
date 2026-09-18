@@ -174,6 +174,20 @@ final class CompiledForwardCache {
     var isCompiled: Bool { !cache.isEmpty }
 }
 
+// MARK: - in-context LoRA 旁路通道标签（编译缓存隔离）
+
+/// 当前生效的 in-context LoRA 旁路通道标签，参与 MLX 编译图缓存 key。
+/// 背景：编译图会把「旁路权重常量 + 各层 icActive 状态」一并固化进图结构，故：
+///   · 原生路径（无旁路）与 IC 二采 / CQ 清晰度增强 必须分开编译槽位；
+///   · IC 与 CQ 虽共用同一批槽位、序列布局也相同（若 σ 步数一并相同则 shape key 完全一致），
+///     但注入的 LoRA 权重完全不同 → 绝不能互相复用编译图；
+///   · 同一通道换权重文件 / 换 strength 同样需要重新编译。
+/// 取值："off" | "ic-<权重文件名>[-s<强度>]" | "cq-<权重文件名>-s<强度>"。
+/// 由 runLTXStage2RefineOnLatent 在挂载旁路前设置、函数级 defer 复位为 "off"。
+enum LoRABypassTag {
+    static var current: String = "off"
+}
+
 // MARK: - 单步 x0 预测（含可选 CFG 负向）
 
 /// 一次 sigma 步：cond 前向；若提供 neg 条件再做 neg 前向做 CFG。
@@ -608,7 +622,9 @@ func sampleLatentsCore(
     }() : nil
     if config.useCompile {
         // 编译图依赖 latent/text 的 shape（rope/位置常量由 shape 隐含决定）+ 是否音频条件 + 是否 I2V + 是否 keyframes 标记 + 扰动参数
-        let shapeKey = "\(noiseV.shape)-\(noiseA.shape)-\(condV.shape)-\(condA.shape)-frozen\(frozenAudio != nil)-i2v\(isI2V)-kf\(keyframesMLX != nil)-stg\(stgOn ? "\(config.stgBlocksV)|\(config.stgBlocksA)" : "off")-mod\(modOn ? "on" : "off")-sol\(config.sparseVideo?.cacheTag ?? "off")"
+        // + in-context LoRA 旁路通道标签（LoRABypassTag：原生 off / IC / CQ 及权重·强度差异必须分槽，
+        //   否则同 shape 下会命中他通道的编译图 → LoRA 不注入或串味。仅标签变化，不改变任何数值语义）
+        let shapeKey = "\(noiseV.shape)-\(noiseA.shape)-\(condV.shape)-\(condA.shape)-frozen\(frozenAudio != nil)-i2v\(isI2V)-kf\(keyframesMLX != nil)-stg\(stgOn ? "\(config.stgBlocksV)|\(config.stgBlocksA)" : "off")-mod\(modOn ? "on" : "off")-sol\(config.sparseVideo?.cacheTag ?? "off")-lora\(LoRABypassTag.current)"
         // 主图 emitMidAt 改变编译图结构，缓存 key 带 mid 后缀区分
         let midSuffix = (stgSegStart != nil) ? "-mid\(stgSegStart!)" : ""
         let fwdKey = (useForwardBatch ? shapeKey + "-batch\(batchCount)" : shapeKey) + midSuffix

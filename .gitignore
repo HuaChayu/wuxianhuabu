@@ -6,3 +6,7 @@ xcuserdata/
 # 备份与系统文件
 *.bak
 .DS_Store
+# 本地调试产物
+model/minimax h3/temp/
+__pycache__/
+*.pyc

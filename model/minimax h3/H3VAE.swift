@@ -969,7 +969,12 @@ public final class H3VAEDecoder {
         let ps = MLXArray(H3VAEConst.imagenetStd, [1, 3, 1, 1, 1])
         let a1 = df * ps + pm
         let cl = MLX.minimum(MLX.maximum(a1, MLXArray.scalar(0.0, like: a1)), MLXArray.scalar(1.0, like: a1))
-        return cl * 2.0 - 1.0
+        let out = cl * 2.0 - 1.0
+        // 返回边界物化（与 encodeTiled 的 `MLX.eval(raw)` 同款纪律）：parts / decAll / df / a1 / cl
+        // 全是本函数局部量，末尾这段懒图若直接交给调用方，则函数返回后局部中间 buffer 已无宿主，
+        // 外部 eval 提交 GPU 命令时才引用的对象可能已被分配器回收 → preCommit UAF。
+        MLX.eval(out)
+        return out
     }
 }
 

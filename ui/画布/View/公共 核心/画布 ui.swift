@@ -743,25 +743,26 @@ struct CanvasView: View {
         // 收集有效输入：走公共判定（视频节点选了模型后，不符合要求的线禁用跳过，只收集合规线）
         let validity = store.inputValidity(for: nodeID)
         let imagePaths = validity.imagePaths
-        let audioPath = validity.audioPath
+        let videoPaths = validity.videoPaths
+        let audioPaths = validity.audioPaths
         if !validity.invalidConnectionIDs.isEmpty {
             debugLog("视频生成：存在 \(validity.invalidConnectionIDs.count) 条无效连线（已禁用跳过），本次仅用合规输入")
         }
-        // 模型专属阻断：H3 等模型要求恰好 2 张条件图，不足时拒绝发送并给出明确原因
+        // 模型专属阻断：H3 无任何有效条件输入时拒绝发送并给出明确原因
         if let reason = validity.errorMessage {
             inputValidationErrors[nodeID] = reason
             debugLog("视频生成：输入不满足模型要求，取消运行（\(reason)）")
             return
         }
-        // 误触保护：提示词为空且无任何输入条件（图片/音频）时直接取消，不启动管线
+        // 误触保护：提示词为空且无任何输入条件（图片/视频/音频）时直接取消，不启动管线
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmedPrompt.isEmpty && imagePaths.isEmpty && audioPath == nil {
-            inputValidationErrors[nodeID] = "提示词为空且未连接图片/音频条件，已取消运行（请填写提示词或接入条件）"
-            debugLog("视频生成：误触保护（无提示词、无图片、无音频），取消运行")
+        if trimmedPrompt.isEmpty && imagePaths.isEmpty && videoPaths.isEmpty && audioPaths.isEmpty {
+            inputValidationErrors[nodeID] = "提示词为空且未连接图片/视频/音频条件，已取消运行（请填写提示词或接入条件）"
+            debugLog("视频生成：误触保护（无提示词、无图片、无视频、无音频），取消运行")
             return
         }
         inputValidationErrors[nodeID] = nil
-        debugLog("视频生成：输入收集完成（图片 \(imagePaths.count) 张，音频 \(audioPath != nil ? "1" : "0") 个）")
+        debugLog("视频生成：输入收集完成（图片 \(imagePaths.count) 张，视频 \(videoPaths.count) 个，音频 \(audioPaths.count) 个）")
         // 尺寸（动态表）：有图按图最接近比例 × 档位；无图按节点私有比例（nil 跟随全局）× 档位
         let node = store.nodes.first(where: { $0.id == nodeID })
         let quality = node?.quality ?? .standard
@@ -780,7 +781,8 @@ struct CanvasView: View {
             nodeID: nodeID,
             prompt: trimmedPrompt,
             imagePaths: imagePaths,
-            audioPath: audioPath,
+            videoPaths: videoPaths,
+            audioPaths: audioPaths,
             videoWidth: size.width,
             videoHeight: size.height,
             duration: duration,

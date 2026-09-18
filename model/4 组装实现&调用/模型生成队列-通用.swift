@@ -8,6 +8,10 @@
 
 import SwiftUI
 import Combine
+// setenv/unsetenv（SelfLift 二阶段解耦环境变量）
+import Darwin
+// H3→LTX latent 直通通道需读取 MLXArray（bridge.ltxHalfLatent 的形状打印）
+import MLX
 
 // MARK: - 取消错误（管线检查点抛出）
 
@@ -65,8 +69,14 @@ struct QueueTask: Identifiable, Sendable {
     var referencePaths: [String] = []
 
     // 视频参数（kind == .video 时有效）
+    /// 条件图片（ltx2.5：首尾帧最多 2 张；MiniMax H3：多参考最多 9 张）
     var imagePaths: [String] = []
-    var audioPath: String? = nil
+    /// 参考视频（仅 MiniMax H3 支持，最多 3 个）
+    var videoPaths: [String] = []
+    /// 参考音频（ltx2.5 只用第 1 个；MiniMax H3 最多 3 个）
+    var audioPaths: [String] = []
+    /// 单个音频（ltx2.5 管线入参语义）
+    var audioPath: String? { audioPaths.first }
     var videoWidth: Int = 0
     var videoHeight: Int = 0
     var duration: VideoDuration = .fiveSeconds
@@ -233,11 +243,16 @@ final class GenerationQueue: ObservableObject {
     }
 
     /// MiniMax H3 视频分派：QueueTask → H3FL2VAPipeline
-    /// - 首/尾帧：imagePaths[0] / imagePaths[1]（H3 恰好 2 张条件图，由 inputValidity 保证）
+    /// - 条件通路：imagePaths 恰好 2 张且无视频/音频参考 → fl2va 首尾帧；
+    ///   其余（1 张、3~9 张，或带视频/音频参考）→ ref2va 多参考图通路（首/尾帧入参被忽略）
+    /// - 参考视频/音频：条件层已放开收集，管线侧编码尚未接入 → 明确日志提示后忽略
     /// - 分辨率规则（与 LTX 同口径，读偏好设置「第二阶段」开关 AppSettings.videoUseStage2）：
     ///   开 → 输入目标 ÷2（32 对齐）跑 H3 turbo 直出（stage1 半清，含 H3 自产音轨），
     ///        随后走 LTX 通用升频×2 + Stage2 3 步 refine（像素桥，产物音轨沿用半清视频，首尾帧钉入）；
-    ///   关 → 不除2、不升频、不二采：目标分辨率单遍直出。
+    ///   关 → 不除2、不升频、不跑像素桥 refine：目标分辨率单遍直出。
+    /// - Apple 超分通道（第三套二采）与上述阶段2 开关**解耦**：它只消费 stage1 的内存像素
+    ///   （H3Stage2MemoryBridge），不需要除2生成、也不需要像素桥升频/refine。
+    ///   故阶段2 关 + Apple 超分开 → 目标分辨率直出后单独做逐帧 Apple 超分（本次改造引入的组合）。
     /// - 时长：duration.numFrames → alignFrameCount → videoLatentT（latentT）
     /// - 产物：mp4 写入 output/视频，回传路径交给 onTaskResult → attachGeneratedVideo
     nonisolated private func runH3VideoPipeline(task: QueueTask) async -> String? {
@@ -245,81 +260,246 @@ final class GenerationQueue: ObservableObject {
         // 二采 refine 的文本条件统一为完全静态空条件（loadStaticEmptyTextCond：常量读张量 / 缺失全零兜底，
         // 零模型权重调用，不加载 Gemma/connector）；
         // 画面由 stage1 音轨 IC（frozen_a 锁口型）与画面结构/guide/首尾帧参考控制，不重画内容。
-        guard task.imagePaths.count >= 2 else {
-            pipelineLog("H3 视频生成：条件图不足 2 张（当前 \(task.imagePaths.count)），取消运行")
+        guard !task.imagePaths.isEmpty else {
+            pipelineLog("H3 视频生成：至少需要 1 张条件图（当前 \(task.imagePaths.count) 张，视频/音频参考编码尚未接入），取消运行")
             return nil
         }
+        // 参考视频/音频：UI 条件层已放开收集，但管线侧编码通路未接入 → 明确提示，不静默忽略
+        if !task.videoPaths.isEmpty {
+            pipelineLog("H3 视频生成：收到 \(task.videoPaths.count) 个参考视频（上限 \(H3Const.maxRefVideos)），当前管线未接入视频参考编码，本次忽略")
+        }
+        if !task.audioPaths.isEmpty {
+            pipelineLog("H3 视频生成：收到 \(task.audioPaths.count) 个参考音频（上限 \(H3Const.maxRefAudios)），当前管线未接入音频参考编码，本次忽略")
+        }
+        // 多参考（ref2va）通路判定：非「恰好 2 张图片、无视频/音频参考」的纯首尾帧场景 → 走多参考
+        // ★ 2026-09-18 fl2va→refs 开关：NA_H3_FL2VA_AS_REFS=1 时「恰好 2 张首尾帧」也走 ref2va 通路
+        //   （首尾帧作为 2 个软参考块 + 视觉块，语言固定首尾）。背景重影根因是 keyframes 时间硬锚 +
+        //   低清/高清双网格竞争（h3_62/h3_65），refs 软参考无端点锚定（h3_64 已验证无重影），
+        //   且高清条件行直接用原生全分辨率参考块，顺带消除低清提升导致的"首尾毛玻璃"（h3_65）。
+        // ★ 2026-09-18 fl2va→refs 开关：默认开启（UI 直跑即生效）；设 NA_H3_FL2VA_AS_REFS=0 可回退旧 fl2va
+        let fl2vaAsRefs = (ProcessInfo.processInfo.environment["NA_H3_FL2VA_AS_REFS"].flatMap { Int($0) } ?? 1) > 0
+        // 开关值显式写入 env：默认开启时用户未设变量，管线层也要能读到（用于首/尾帧文本标签）
+        if fl2vaAsRefs { setenv("NA_H3_FL2VA_AS_REFS", "1", 1) } else { unsetenv("NA_H3_FL2VA_AS_REFS") }
+        let useRef2VA = !task.videoPaths.isEmpty || !task.audioPaths.isEmpty || task.imagePaths.count != 2 || fl2vaAsRefs
+        // ref2va 通路下首/尾帧入参被忽略，仅作占位；图片不足 2 张时用首张补位
+        let firstPath = task.imagePaths[0]
+        let lastPath = task.imagePaths.count >= 2 ? task.imagePaths[1] : firstPath
         let alignedFrames = H3Const.alignFrameCount(UInt32(task.duration.numFrames))
         let latentT = H3Const.videoLatentT(frameCount: alignedFrames)
         let outDir = outputVideoDirURL.path
         try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
         let baseName = nextAssetName(prefix: "h3")
 
-        // 第二阶段开：生成尺寸 = 目标 ÷2 并对齐 32（升频 ×2 后还原目标；与 LTX 相同策略）
+        // ★ 2026-09-17：H3 SelfLift 内部已有 ×0.5 除2（低清段自己半清自己高清），外部不再 ÷2。
+        //   阶段2 开启时同样直出全清目标尺寸：H3 全清 latent → H3-to-LTX-Latent-Adapter 转域
+        //   → LTX 二采（runLTXStage2RefineOnLatent 收到全清网格，不再升频×2、不再跑解耦低清段）。
+        //   Apple 超分通道只要 stage1 的内存像素，同样按目标分辨率直出。
         let stage2On = AppSettings.shared.videoUseStage2
-        let genW = stage2On ? max(32, (task.videoWidth / 2 / 32) * 32) : task.videoWidth
-        let genH = stage2On ? max(32, (task.videoHeight / 2 / 32) * 32) : task.videoHeight
-        // 方案 C：二采开时 stage1 以 h264 最高质量 mp4 落盘，仅作“给用户看”的预览 + 音轨源
-        //（二采像素已走内存直通，不落盘）；二采关：单遍直出维持 h264 (.mp4) 原样
-        let genPath = "\(outDir)/\(baseName)\(stage2On ? "_stage1_preview" : "").mp4"
-        if stage2On {
-            pipelineLog("H3 视频生成：目标÷2=\(genW)×\(genH) 先 turbo 直出，再接像素桥升频×2+Stage2 refine（第二阶段开）@ \(alignedFrames) 帧（latentT=\(latentT)），首帧 \(task.imagePaths[0])，尾帧 \(task.imagePaths[1])")
+        let appleSROn = appleSRSecondPassEnabled()
+        let needMemoryBridge = stage2On || appleSROn   // 两套二采都吃 stage1 内存像素
+        let genW = task.videoWidth
+        let genH = task.videoHeight
+        // 方案 C：只要还有二采（阶段2 或 Apple 超分），stage1 落盘就仅作“给用户看”的预览 + 音轨源
+        //（二采像素已走内存直通，不落盘）；两者都关：单遍直出维持 h264 (.mp4) 原样
+        let stage1IsPreview = stage2On || appleSROn
+        let genPath = "\(outDir)/\(baseName)\(stage1IsPreview ? "_stage1_preview" : "").mp4"
+        let condSummary: String
+        if useRef2VA {
+            if fl2vaAsRefs && task.videoPaths.isEmpty && task.audioPaths.isEmpty && task.imagePaths.count == 2 {
+                condSummary = "首/尾帧作参考图 ×2（fl2va→refs 软参考 + 视觉块，语言固定首尾）"
+            } else {
+                condSummary = "多参考 \(task.imagePaths.count) 张图（ref2va）"
+            }
         } else {
-            pipelineLog("H3 视频生成：直出目标 \(genW)×\(genH) 6 步 turbo，不除2/不升频/不二采（第二阶段关）@ \(alignedFrames) 帧（latentT=\(latentT)），首帧 \(task.imagePaths[0])，尾帧 \(task.imagePaths[1])")
+            condSummary = "首/尾帧 \(task.imagePaths[0]) / \(task.imagePaths[1])（fl2va）"
+        }
+        // ★ H3 一采第一阶段总步数 N：单一取自偏好设置「模型管理 → H3 一采设置」滑杆（4–12，默认 6）。
+        // 该值经 generateVideo(steps:) → sigmaSchedule(steps:) → N = sigmas.count - 1 进入一采链路；
+        // SelfLift 第三分支的 transition_step 不写死，由官方 75% 规则随 N 推导（ts = clamp(floor(0.75N),1,N-1)）。
+        let h3Stage1Steps = AppSettings.shared.h3Stage1Steps
+        let h3Stage1Ts = SelfLiftScheduleSplit.transitionStep(forTotalSteps: h3Stage1Steps)
+        // ★ SelfLift 第三分支开关：同一偏好设置页「H3 一采设置」的开关，透传给管线（不改管线默认行为）
+        let h3SelfLiftOn = AppSettings.shared.h3SelfLiftEnabled
+        // ★ IC 链路 lowOnly（2026-09-18 架构纠正）：「H3 低分 + LTX 高分」两个模型组成 lift——
+        //   阶段2（IC/CQ 像素桥或 adapter 直通）开启且无 Apple 超分竞争时，H3 一采只跑低分半清段，
+        //   LTX 二采负责升频×2 + 高清精修（fullResInput=false）；Apple 超分开启时保留 H3 全清直出
+        //   （Apple SR 吃全清像素做独立放大），SelfLift 关闭时 lowOnly 无意义（自动走原单遍全清）。
+        let h3LowOnly = h3SelfLiftOn && stage2On && !appleSROn
+        // ★ lowOnly 分工下 LTX 二采不再跑自己的半清低清段（NA_PIX_SELFLIFT_DECOUPLE=0）：
+        //   H3 已出低分半清 latent，LTX 低清段再以 σ0=0.909375 加噪重绘会把参考/主序列源
+        //   漂移成 LTX 想象内容（同帧对比实测：人物替换/结构扭曲/色彩偏移）；
+        //   关闭后 IC 参考回到 H3 原 latent（factor=2 官方语义），主序列升频直接进高清段。
+        if h3LowOnly {
+            setenv("NA_PIX_SELFLIFT_DECOUPLE", "0", 1)
+            // ★ 音频条件打卡（2026-09-18）：lowOnly 二采开启 frozen_a 音频条件（LTX_IC_AUDIO=1），
+            //   用源音轨锁口型（此前诊断：空文本 + 无音频 → 模型先验主导重画，亚洲人变西方面孔；
+            //   音频条件给生成提供音素时序锚定）。注意 frozen_a 会扩大 Nv，需确认显存余量。
+            setenv("LTX_IC_AUDIO", "1", 1)
+        } else {
+            unsetenv("NA_PIX_SELFLIFT_DECOUPLE")
+            unsetenv("LTX_IC_AUDIO")
+        }
+        // ★ SelfLift 二阶段解耦采样开关（自研解耦调度，默认开）：开启时 setenv 三个解耦变量，
+        //   管线 H3Pipeline 读到后绕开官方 75% 耦合调度，改走「低清独立 L NFE → 放大重加噪 →
+        //   高清独立 3 NFE」；关闭时清掉变量走官方耦合调度。仅 h3SelfLiftOn=true 时有意义。
+        let h3SelfLiftDecoupleOn = AppSettings.shared.h3SelfLiftDecouple
+        if h3SelfLiftDecoupleOn {
+            setenv("NA_H3_SELFLIFT_DECOUPLE", "1", 1)
+            // 2026-09-18 步数配置 v5：跟随面板步数 N 动态拆分——低清 N-1 + 高清 1（固定最后一步高清）。
+            // 输入 7 → 6+1、输入 4 → 3+1；总 NFE = N，与滑杆一致，不再写死 3+3。
+            // LOW_STEPS=N-1 → 低清跑到曲线实际终点 σ_k=12/((N-1)+11)；低清终点即「过渡用的值」= σ_next，
+            // 高清等距 1 步从 σ_next 一次直达 0（最后一步全分辨率收细节）。
+            let slLowSteps = max(h3Stage1Steps - 1, 2)
+            let slLowK = 12.0 / Double(slLowSteps + 11)
+            setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_STEPS", "\(slLowSteps)", 1)
+            setenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K", String(format: "%.4f", slLowK), 1)
+            setenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS", "1", 1)
+        } else {
+            unsetenv("NA_H3_SELFLIFT_DECOUPLE")
+            unsetenv("NA_H3_SELFLIFT_DECOUPLE_LOW_STEPS")
+            unsetenv("NA_H3_SELFLIFT_DECOUPLE_LOW_K")
+            unsetenv("NA_H3_SELFLIFT_DECOUPLE_HIGH_STEPS")
+        }
+        // ★ CFG 引导（2026-09-18 重影根因修复，对齐官方 SelfLiftH3Sampler cfg=5.0）：
+        //   实测 cfg=5.0 对 600 turbo LoRA（蒸馏模型，训练目标 cfg=1）过强：高对比度马赛克/过曝/
+        //   网格噪点，画面崩坏；官方 cfg=5.0 面向原版 H3（非 turbo）。故默认注入 0=关闭（恢复
+        //   单路正常画面）；机制保留，显式设 NA_H3_SELFLIFT_CFG=1.5~3.0 可实验性开启。
+        setenv("NA_H3_SELFLIFT_CFG", "0", 1)
+        // 日志描述：解耦开启时 ts 被绕开（固定低清 3 + 高清 3 = NFE 6），否则官方 75% ts
+        let h3SlDesc = h3SelfLiftDecoupleOn
+            ? "SelfLift 解耦（低清 \(max(h3Stage1Steps - 1, 2)) NFE + 高清 1 NFE = NFE \(max(h3Stage1Steps - 1, 2) + 1)，固定最后一步高清，无过渡）"
+            : "SelfLift ts=\(h3Stage1Ts)"
+        if stage2On {
+            pipelineLog("H3 视频生成：目标直出 \(genW)×\(genH)（SelfLift 内部×0.5 除2，外部不再÷2）\(h3Stage1Steps) 步 turbo（\(h3SlDesc)），再接 Stage2 refine（第二阶段开，\(h3LowOnly ? "lowOnly 分工：H3 只出低分半清，LTX 二采升频×2 + 高清精修" : "全清 latent 直通、不再升频×2")；Apple 超分\(appleSROn ? "开" : "关")）@ \(alignedFrames) 帧（latentT=\(latentT)），条件：\(condSummary)")
+        } else if appleSROn {
+            pipelineLog("H3 视频生成：目标直出 \(genW)×\(genH) \(h3Stage1Steps) 步 turbo（\(h3SlDesc)；第二阶段关：不除2/不升频/不跑像素桥 refine），随后单独走 Apple 超分通道二采（与阶段2 解耦）@ \(alignedFrames) 帧（latentT=\(latentT)），条件：\(condSummary)")
+        } else {
+            pipelineLog("H3 视频生成：直出目标 \(genW)×\(genH) \(h3Stage1Steps) 步 turbo（\(h3SlDesc)），不除2/不升频/不二采（第二阶段关，Apple 超分关）@ \(alignedFrames) 帧（latentT=\(latentT)），条件：\(condSummary)")
         }
         do {
-            // 方案 C：stage2 开时创建内存直通桥（generateVideo 内部把 stage1 解码像素交给它，
-            // 不落盘；随后由像素桥内存入口消费）；stage1 落盘统一 h264（不再 ProRes 中间件）
-            let stage2Bridge = stage2On ? H3Stage2MemoryBridge() : nil
+            // 方案 C：只要有二采（阶段2 或 Apple 超分）就建内存直通桥（generateVideo 内部把 stage1
+            // 解码像素交给它，不落盘；随后由二采通道按需消费）；stage1 落盘统一 h264（不再 ProRes 中间件）
+            let stage2Bridge = needMemoryBridge ? H3Stage2MemoryBridge() : nil
+            // ★ H3→LTX latent 直通（H3-to-LTX-Latent-Adapter，可选）：适配器在 H3 VAE 解码之前
+            //   拦截 clean latent 并映射为 LTX 归一化 latent，二采由此省去像素往返。
+            //   权重缺失/加载失败/未启用 → nil，管线内部自动回退原像素桥（不影响出片）。
+            let h3Adapter = loadH3ToLTXAdapterIfEnabled(stage2On: stage2On)
             let stage1Path = try await H3FL2VAPipeline.generateVideo(
                 prompt: task.prompt,
-                firstImagePath: task.imagePaths[0],
-                lastImagePath: task.imagePaths[1],
+                firstImagePath: firstPath,
+                lastImagePath: lastPath,
                 outPath: genPath,
                 width: genW,
                 height: genH,
-                steps: 6,
+                // ★ N 来自偏好设置「模型管理 → H3 一采设置」滑杆（4–12，默认 6），不再写死 6；
+                //   管线内 N = sigmas.count - 1 = stage1SegmentCount，即 SelfLift 第三分支消费的总步数 N。
+                steps: UInt32(h3Stage1Steps),
                 latentT: latentT,
                 scheduleStyle: .official,
+                // ★ SelfLift 第三分支开关（见上）：true 时 stage1 走渐进采样
+                selfLiftEnabled: h3SelfLiftOn,
+                // ★ IC 链路 lowOnly：阶段2 无 Apple 超分竞争时，H3 一采只出低分半清 latent，
+                //   高分（升频×2 + 精修）交由 LTX 二采（fullResInput=false 配套）。
+                selfLiftLowOnly: h3LowOnly,
                 log: { pipelineLog("[H3] \($0)") },
                 proResOutput: false,
-                stage2MemBridge: stage2Bridge
+                stage2MemBridge: stage2Bridge,
+                // 多参考（ref2va）：非纯首尾帧场景把全部合规图片作为多参考传入（首/尾帧入参被忽略）
+                referenceImagePaths: useRef2VA ? task.imagePaths : [],
+                // ★ H3→LTX latent 直通：h3Adapter 非空即启用（仅阶段2 开启时才可能非空）；
+                //   是否连 H3 VAE 解码一并跳过，取决于 Apple 超分通道——它需要 stage1 内存像素，
+                //   故 Apple 超分开启时保留解码（skip=false），只省 LTX 编码那一步。
+                //   参数顺序须与函数声明一致（两者均位于签名末位）。
+                h3ToLTXAdapter: h3Adapter,
+                adapterSkipH3Decode: !appleSROn
             )
             pipelineLog("H3 视频生成完成（stage1）：\(stage1Path)")
-            guard stage2On else {
-                return stage1Path
+            guard stage2On || appleSROn else {
+                return stage1Path   // 阶段2 与 Apple 超分全关：stage1 直出即最终产物
             }
             // 第二阶段：像素桥（LTX 通用升频×2 + Stage2 3步），音轨沿用半清源视频
             // 改造 B：二采无提示词 —— refine 不再编码/传递任何文本条件（原“传保真型 stage2RefinePrompt
             // 而非 task.prompt”的语义已被空串常量取代：Gemma 空串编码与正常 prompt 同构、不注入创作指令）。
-            // 参考条件来源（v1.3）：直接用 H3 生成时传入的用户原图 task.imagePaths[0]/[1] 作 refine
-            // 首/尾帧参考（stage1 本来就是拿这两张原图当条件的，内容一致且信息量无损）。
-            // 历史沿革：v1.1 直接钉原图，当时出现整体 RGB 色边/内容漂移，判定根因是"H3 实际画面与
-            // 创作图有出入时外来参考会把精修往创作图拽"；v1.2 因此改为自抽 stage1 首/尾帧作自引用参考。
-            // 但自抽帧是半清（genW×genH）产物，像素桥会把它放大到 fullPixelWidth×fullPixelHeight 再
-            // VAE 编码钉入，细节全是插值，首尾帧画质反而被拉低——低清帧作全清钉帧参考不可用。
-            // 综合：默认走原图（v1.1 语义）；若需对照色边是否复发，PIX_REF_SOURCE=video 切回自抽路径。
-            let refSource = ProcessInfo.processInfo.environment["PIX_REF_SOURCE"] ?? "image"
-            var refineRefs: [String] = []
-            if refSource == "video" {
-                if let refV = readVideoFramesToBCFHW(videoPath: stage1Path), refV.frameCount >= 9 {
-                    let refFirst = "\(outDir)/_pb_ref_\(baseName)_first.png"
-                    let refLast = "\(outDir)/_pb_ref_\(baseName)_last.png"
-                    h3WriteFramePNG(refV.pixels, frame: 0, path: refFirst)
-                    h3WriteFramePNG(refV.pixels, frame: refV.frameCount - 1, path: refLast)
-                    refineRefs = [refFirst, refLast]
-                    pipelineLog("H3 像素桥：自抽 stage1 首/尾帧作 refine 参考（\(refV.width)×\(refV.height)，共 \(refV.frameCount) 帧）→ \(refFirst)")
-                } else {
-                    pipelineLog("H3 像素桥：stage1 首尾帧自抽失败，refine 将无参考条件（不推荐，会退回自由重画）")
-                }
-            } else {
-                refineRefs = [task.imagePaths[0], task.imagePaths[1]]
-                pipelineLog("H3 像素桥：直接用用户传入原图作 refine 首/尾帧参考（\(refineRefs.count) 张）→ \(refineRefs[0]) / \(refineRefs[1])")
+            // 改造 C（IC 官方模式）：二采只吃一采产出的低清视频作 in-context 参考——由 LTX VAE 在
+            // 像素桥内把整段半清像素编码为 halfLatent，再逐帧 token 追加进 transformer 输入序列；
+            // 不再引入任何外部参考图：既不做首/尾帧图满锁，也不做 image 来源的 guide 软引导。
+            // 历史沿革（v1.1~v1.3 参考图路径已废弃）：v1.1 直接钉创作原图 → 整体 RGB 色边/内容漂移
+            // （H3 实际画面与创作图有出入时外来参考会把精修往创作图拽）；v1.2 改自抽 stage1 半清首尾帧
+            // → 放大到 fullPixel 后细节全是插值，首尾帧画质反被拉低；v1.3 复归原图。三者均不再启用。
+            guard let bridge = stage2Bridge else {
+                pipelineLog("H3 二采：内存桥为空，放弃二采")
+                // 阶段2 关（仅 Apple 超分）时无 CQ/IC 可回退，保留 stage1 直出结果
+                return stage2On ? nil : stage1Path
             }
-            guard let bridge = stage2Bridge,
-                  let stage2Pixels = bridge.pixels, bridge.frameCount >= 9 else {
-                pipelineLog("H3 像素桥：stage1 内存像素不可用（bridge 为空/帧数不足），放弃二采")
+            // 注意：adapter 跳解码模式（adapterSkipH3Decode=true）下 bridge.pixels 为 nil，
+            // 但「latent 直通」分支不需要像素，故像素可用性校验下放到 Apple 超分/像素桥各自入口。
+            // ★ 第三套二采通道（与下方 CQ/IC 二采互斥，本通道优先）：
+            //   偏好设置「启用 Apple 超分二采（优先）」开启时，H3 一采出的内存像素优先走 Apple VideoToolbox
+            //   超分（VTSuperResolutionScaler / VTFrameProcessor）。本通道内部完成：运行期能力探测 →
+            //   模型资产准备（downloadRequired 时异步下载并带进度）→ 逐帧超分 → 编码落盘（复用 writeMp4 直写通道）
+            //   → 复用源视频音轨；不落任何中间文件。
+            //   任何不可用/失败（运行期不支持、模型未就绪、源尺寸越界、像素格式无交集、写盘格式不匹配、
+            //   startSession 失败、任务取消等）统一返回 nil，随即回退下方原 CQ/IC 二采并打日志，绝不中断生成。
+            //   LTX 原生管线、IC/CQ 老路径与内存桥语义均不受影响（本分支不命中时下方代码逐字不变）。
+            //   ★ 与「阶段2」开关解耦：本通道只看 appleSRSecondPassEnabled()（videoUseAppleSR / LTX_APPLE_SR）。
+            //   阶段2 关但本通道开时：stage1 已按目标分辨率直出，本通道产出即最终产物；失败则回退 stage1 直出
+            //   （无 CQ/IC 像素桥可回退，因为像素桥属于阶段2 的升频 refine 链路）。
+            //   环境变量 LTX_APPLE_SR=1/0 优先级高于设置项，可强制开/关本通道。
+            //   （本通道必须吃 stage1 内存像素；adapter 跳解码模式下 pixels 为空，此处自然跳过。）
+            if appleSROn, let stage2Pixels = bridge.pixels {
+                pipelineLog("H3 二采分派：Apple 超分通道已启用（优先），先尝试第三套二采（倍率 \(AppSettings.shared.appleSRScaleFactor > 0 ? "×\(AppSettings.shared.appleSRScaleFactor)" : "×4（默认）")）")
+                if let appleSRFinalPath = await appleSuperResolutionSecondPass(
+                    pixels: stage2Pixels,
+                    pixelWidth: bridge.width,
+                    pixelHeight: bridge.height,
+                    pixelFps: Double(bridge.fps),
+                    sourceAudioVideoPath: stage1Path,
+                    isCancelled: { task.cancelToken.isCancelled }) {
+                    pipelineLog("H3 视频生成完成（Apple 超分最终产物）：\(appleSRFinalPath)")
+                    return appleSRFinalPath
+                }
+                if task.cancelToken.isCancelled {
+                    pipelineLog("H3 二采分派：任务已取消，不再回退 CQ/IC 二采")
+                    return nil
+                }
+                guard stage2On else {
+                    // 阶段2 关：像素桥（升频 refine）未启用 → 无 CQ/IC 可回退，保留 stage1 目标分辨率直出结果
+                    pipelineLog("H3 二采分派：Apple 超分通道未产出（原因见上方 AppleSR 日志），且第二阶段关闭、无 CQ/IC 可回退 → 保留 stage1 直出结果：\(stage1Path)")
+                    return stage1Path
+                }
+                pipelineLog("H3 二采分派：Apple 超分通道未产出（原因见上方 AppleSR 日志），回退原 CQ/IC 二采")
+            }
+            // ★ H3→LTX latent 直通二采（adapter 分支）：H3 clean latent 已由适配器映射为 LTX 归一化
+            //   latent（bridge.ltxHalfLatent），此处直接交给二采的 latent 入口——不读像素、不跑 LTX VAE
+            //   编码（H3 VAE 解码亦可能已跳过）；音轨取 adapter 模式单独落盘的 wav（bridge.audioTrackPath）。
+            //   本分支优先于下方像素桥；未启用/未产出时原样落到像素桥路径（语义不变）。
+            if stage2On, let adapterBridge = stage2Bridge, let adapterLatent = adapterBridge.ltxHalfLatent {
+                pipelineLog("H3 二采分派：latent 直通通道（H3-to-LTX Adapter）优先，latent \(adapterLatent.shape)（\(h3LowOnly ? "lowOnly 半清直通：H3 只出低分，LTX 二采升频×2 + 高清 IC 精修（factor=2）" : "全清直通：H3 SelfLift 内部已升频，LTX 二采跳过升频×2/解耦低清段，IC 参考 factor=1 同格同位")）")
+                if let finalPath = await ltxEnhanceExternalVideoWithStage2(
+                    videoPath: stage1Path,
+                    sourceAudioVideoPath: adapterBridge.audioTrackPath ?? stage1Path,
+                    imagePaths: [],
+                    isCancelled: { task.cancelToken.isCancelled },
+                    icLoRAEnable: true,
+                    cqEnhancerEnable: AppSettings.shared.videoUseCQEnhancer,
+                    precomputedHalfLatent: adapterLatent,
+                    precomputedFrameRate: Double(adapterBridge.fps),
+                    fullResInput: !h3LowOnly) {
+                    pipelineLog("H3 视频生成完成（latent 直通最终产物）：\(finalPath)")
+                    return finalPath
+                }
+                pipelineLog("H3 二采分派：latent 直通未产出，回退原像素桥路径")
+            }
+            // 像素可用性与帧数下限仅像素桥（CQ/IC 的 LTX VAE 编码）需要，故从这里才开始校验：
+            // adapter 跳解码模式下 pixels 为空且无 stage1 mp4 可回退，此时若 latent 直通也没产出，
+            // 只能如实返回失败（不能返回并不存在的 stage1 文件）。
+            guard let stage2Pixels = bridge.pixels else {
+                pipelineLog("H3 二采：adapter 直通未产出且无 stage1 内存像素可回退，放弃二采")
                 return nil
+            }
+            guard bridge.frameCount >= 9 else {
+                pipelineLog("H3 像素桥：stage1 帧数不足（\(bridge.frameCount) < 9），跳过 CQ/IC 二采（stage1 预览保留：\(stage1Path)）")
+                return stage1Path
             }
             guard let finalPath = await ltxEnhanceExternalVideoWithStage2Pixels(
                 pixels: stage2Pixels,
@@ -327,11 +507,22 @@ final class GenerationQueue: ObservableObject {
                 pixelHeight: bridge.height,
                 pixelFps: Double(bridge.fps),
                 sourceAudioVideoPath: stage1Path,
-                imagePaths: refineRefs,
+                // 二采不引入任何参考图（改造 C：IC 官方模式只用一采视频自身作 in-context 参考），
+                // 也不做首/尾帧软引导（官方 stage2 无此机制，故不再传 tailGuideMask）。
+                imagePaths: [],
                 isCancelled: { task.cancelToken.isCancelled },
-                // 尾帧软引导（对齐官方 keyframe-guide 语义，不再 100% 硬钉外部图）：
-                // 默认 0.6，消除末段清晰度被高清参考图硬接管的接缝；复现旧硬钉行为设 PIX_TAIL_M=0。
-                tailGuideMask: (Float(ProcessInfo.processInfo.environment["PIX_TAIL_M"] ?? "") ?? 0.6)) else {
+                // 默认切 IC 官方模式（in-context 参考 + 官方 4 步 σ 档 + ancestral SDE）；
+                // 如需回退旧非 IC refine 路径，设 LTX_IC_LORA=0。
+                // 注：参数顺序须与函数声明一致（isCancelled 在 icLoRAEnable 之前）。
+                icLoRAEnable: true,
+                // ★ 「第二阶段·CQ 清晰度增强」通道（新增分支）：偏好设置「二采改用 CQ 清晰度增强」开启时，
+                //   二采改走官方 CQ Video Enhancer LoRA（σ0=1.0 / 9 段 / euler_ancestral，权重 strength=1.0），
+                //   只对 H3 半清画面做清晰度增强，不换脸/不重绘构图；关闭时仍走原 IC 像素桥二采（行为不变）。
+                //   CQ 与 IC 互斥、CQ 优先；LTX_CQ_ENHANCER=1/0 可强制覆盖本设置项。
+                cqEnhancerEnable: AppSettings.shared.videoUseCQEnhancer,
+                // ★ 输入几何随 lowOnly 联动：H3 一采只出低分半清 → LTX 二采升频×2 + 高清精修（false）；
+                //   H3 全清直出（SelfLift 关闭 / Apple 超分竞争）→ 全清直通跳过升频（true）。
+                fullResInput: !h3LowOnly) else {
                 pipelineLog("H3 像素桥升频+二采失败（stage1 预览保留：\(stage1Path)）")
                 return nil
             }
@@ -367,3 +558,37 @@ final class GenerationQueue: ObservableObject {
     }
 }
 
+
+// MARK: - H3→LTX latent 直通适配器（可选通道）
+
+/// 按开关加载 H3→LTX latent 直通适配器；任何不满足/失败都返回 nil，管线自动回退原像素桥路径。
+///
+/// 开关优先级：环境变量 `LTX_H3_ADAPTER`（"1" 强制开 / "0" 强制关）> 设置项 `videoUseH3LTXAdapter`。
+/// 仅在「阶段2 开启」时才有意义：该通道服务的是 LTX 二采（CQ 增强 / IC 像素桥），
+/// Apple 超分通道吃的是 stage1 内存像素、不经 LTX，故与其并行时由调用点保留 H3 解码
+/// （`adapterSkipH3Decode=false`），此时只省下 LTX VAE 编码一步。
+/// 权重路径取设置项 `h3LTXAdapterPath`（默认 ~/Downloads/h3-fused/H3-to-LTX-Latent-Adapter.safetensors）。
+private func loadH3ToLTXAdapterIfEnabled(stage2On: Bool) -> H3ToLTXLatentAdapter? {
+    guard stage2On else { return nil }
+    let env = ProcessInfo.processInfo.environment["LTX_H3_ADAPTER"]
+    let enabled = (env == "1") || (env != "0" && AppSettings.shared.videoUseH3LTXAdapter)
+    guard enabled else {
+        pipelineLog("H3→LTX 适配器：未启用（LTX_H3_ADAPTER=\(env ?? "未设")，设置项 videoUseH3LTXAdapter=\(AppSettings.shared.videoUseH3LTXAdapter)），走原像素桥路径")
+        return nil
+    }
+    let path = AppSettings.shared.h3LTXAdapterPath
+    guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else {
+        pipelineLog("H3→LTX 适配器：权重不存在，回退像素桥路径（\(path)）")
+        return nil
+    }
+    do {
+        let t0 = Date()
+        let adapter = try H3ToLTXLatentAdapter.load(weightsURL: URL(fileURLWithPath: path))
+        let sec = String(format: "%.1f", Date().timeIntervalSince(t0))
+        pipelineLog("H3→LTX 适配器已加载（\(sec)s，dtype=\(adapter.weightDType)，权重 \(path)）")
+        return adapter
+    } catch {
+        pipelineLog("H3→LTX 适配器加载失败，回退像素桥路径：\(error.localizedDescription)")
+        return nil
+    }
+}

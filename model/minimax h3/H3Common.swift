@@ -255,11 +255,18 @@ public final class H3Weights {
     }
 
     /// Quantized triple fetch: "prefix.weight" (U32 packed) + scales + biases.
+    /// 兼容两套命名：mlx-serve 的 `prefix.scales/.biases`，以及 comfy/HF 风格的
+    /// `prefix.weight.scales/.weight.biases`（H3 pruned/fused 权重即后者）。
+    /// 缺这一层 fallback 会把 U32 打包权当稠密 BF16 读入，前向立刻形状崩溃。
     public func getQuantized(_ prefix: String) -> (weight: MLXArray, scales: MLXArray, biases: MLXArray)? {
-        guard let w = get(prefix + ".weight"),
-              let s = get(prefix + ".scales"),
-              let b = get(prefix + ".biases") else { return nil }
-        return (w, s, b)
+        guard let w = get(prefix + ".weight") else { return nil }
+        if let s = get(prefix + ".scales"), let b = get(prefix + ".biases") {
+            return (w, s, b)
+        }
+        if let s = get(prefix + ".weight.scales"), let b = get(prefix + ".weight.biases") {
+            return (w, s, b)
+        }
+        return nil
     }
 
     public func clearCache() { cache.removeAll() }

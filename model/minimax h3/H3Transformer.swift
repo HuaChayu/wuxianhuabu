@@ -295,6 +295,48 @@ public final class H3TimeEmbedder {
     }
 }
 
+// MARK: - Lookup AdaLN (pruned / fused checkpoints)
+
+/// 剪枝/融合权重的查表式时间调制，替代 `time_embedder + adaln_proj` 大矩阵通路。
+///
+/// 社区 pruned/fused 权重把时刻嵌入投影到 rank 维正交基上：
+///     silu(tEmb(t)) ≈ adaln_mean + adaln_t_table[idx] · adaln_basis,  idx = round(t·1024)
+/// 并把 `adaln_proj.linear` 折叠为 [out, rank]，其 bias 已吸收 `W·adaln_mean` 项。
+/// 于是调制可直接由查表系数得到：
+///     mod = W[out, rank] · c + b[out]
+/// 该式已与原版权重逐层端到端比对，余弦 ≥ 0.999（层 0/25/49 × t∈[0,1]）。
+public final class H3AdalnLUT {
+    public let basis: MLXArray    // [rank, timeEmbedDim] fp32
+    public let mean: MLXArray     // [timeEmbedDim] fp32（存档用，bias 已折叠）
+    public let tTable: MLXArray   // [1025, rank] fp32
+    public let rank: Int
+
+    public init(basis: MLXArray, mean: MLXArray, tTable: MLXArray) {
+        self.basis = basis
+        self.mean = mean
+        self.tTable = tTable
+        self.rank = basis.shape[0]
+    }
+
+    /// 存在 `adaln_basis` + `adaln_t_table` 时启用；否则返回 nil（走原版通路）。
+    public static func load(_ w: H3Weights) -> H3AdalnLUT? {
+        guard let b = w.get("adaln_basis"), let t = w.get("adaln_t_table") else { return nil }
+        let m = w.get("adaln_mean") ?? MLXArray.zeros([b.shape[1]])
+        return H3AdalnLUT(basis: b, mean: m, tTable: t)
+    }
+
+    /// 时间步 t ∈ [0,1]（即 `TimestepPlan.uniqueT`）→ 查表系数 [m, rank]。
+    public func coeffs(_ ts: [Double]) -> MLXArray {
+        let n = tTable.shape[0]
+        var idx = [Int32](repeating: 0, count: ts.count)
+        for (i, t) in ts.enumerated() {
+            let r = Int((t * Double(n - 1)).rounded())
+            idx[i] = Int32(min(max(r, 0), n - 1))
+        }
+        return tTable.take(MLXArray(idx, [ts.count]), axis: 0)
+    }
+}
+
 // MARK: - AdaLN
 
 public final class H3AdalnW {
@@ -312,7 +354,17 @@ public final class H3AdalnW {
 
     public static func load(_ w: H3Weights, prefix: String, timeEmbedDim: Int,
                             expand: Int, modalities: Int, dtype: DType = PrecisionPolicy.defaultMainDType) throws -> H3AdalnW {
-        let lin = try MfLinear.load(w, prefix: prefix + ".linear", inFeatures: timeEmbedDim, dtype: dtype)
+        // 剪枝/融合权重把 adaln_proj 折叠成 [out, rank]（rank ≪ timeEmbedDim）；
+        // dense 分支的入维以权重视图为准，量化分支仍需 timeEmbedDim 解析打包几何。
+        let resolvedIn: Int
+        if w.contains(prefix + ".linear.scales") {
+            resolvedIn = timeEmbedDim
+        } else if let rw = w.get(prefix + ".linear.weight") {
+            resolvedIn = rw.shape[1]
+        } else {
+            resolvedIn = timeEmbedDim
+        }
+        let lin = try MfLinear.load(w, prefix: prefix + ".linear", inFeatures: resolvedIn, dtype: dtype)
         // MfLinear.load 已加载 prefix+".linear.bias" 并在 forward 内部加一次，
         // 此处若再传同一 bias 会双加，导致 AdaLN 调制整体偏移、输出全噪点。
         return H3AdalnW(linear: lin, bias: nil, expand: expand, modalities: modalities)
@@ -647,6 +699,8 @@ public final class H3DiT {
     public var refinerFinalNorm: MLXArray?
 
     public var adalnTables: H3AdalnTables?
+    /// 剪枝/融合权重的查表式时间调制（非 nil 时替代 time_embedder 通路）。
+    public var adalnLUT: H3AdalnLUT?
     public var sparsePolicy: SparsePolicy = .off
 
 
@@ -683,23 +737,33 @@ public final class H3DiT {
 
         guard let vpw = w.get("video_patch_proj.weight"),
               let apw = w.get("audio_patch_proj.weight"),
-              let teIn = w.get("time_embedder.proj_in.weight"),
-              let teOut = w.get("time_embedder.proj_out.weight"),
               let inv = w.get("rope.inv_freq"),
               let fnorm = w.get("final_layer.norm.weight") ?? w.get("final_norm.weight"),
               let vout = w.get("final_layer.video_out.weight") ?? w.get("video_out_proj.weight"),
               let aout = w.get("final_layer.audio_out.weight") ?? w.get("audio_out_proj.weight") else {
             throw H3Error.badFile("transformer.safetensors missing core projections")
         }
+        // 时间调制两条通路：原版 time_embedder（sin/cos + MLP，2688 维输入）
+        // 或剪枝/融合权重的查表（8 维系数，见 H3AdalnLUT）。
+        m.adalnLUT = H3AdalnLUT.load(w)
+        let teIn = w.get("time_embedder.proj_in.weight")
+        let teOut = w.get("time_embedder.proj_out.weight")
+        if teIn == nil || teOut == nil {
+            guard m.adalnLUT != nil else {
+                throw H3Error.badFile("transformer.safetensors: neither time_embedder nor adaln_t_table present")
+            }
+        }
         // safetensors 中 dense 投影权重为 [out, in]，denseLinear 按 x.matmul(w) 需 [in, out]，统一转置。
         m.videoPatchW = vpw.transposed(1, 0)
         m.videoPatchB = w.get("video_patch_proj.bias")
         m.audioPatchW = apw.transposed(1, 0)
         m.audioPatchB = w.get("audio_patch_proj.bias")
-        m.teInW = teIn.transposed(1, 0)
-        m.teInB = w.get("time_embedder.proj_in.bias")
-        m.teOutW = teOut.transposed(1, 0)
-        m.teOutB = w.get("time_embedder.proj_out.bias")
+        if let teIn, let teOut {
+            m.teInW = teIn.transposed(1, 0)
+            m.teInB = w.get("time_embedder.proj_in.bias")
+            m.teOutW = teOut.transposed(1, 0)
+            m.teOutB = w.get("time_embedder.proj_out.bias")
+        }
         m.invFreq = inv
         m.finalNorm = fnorm.asType(dtype)
         m.videoOutW = vout.transposed(1, 0)
@@ -763,9 +827,22 @@ public final class H3DiT {
     /// Returns the number of modules patched. Reuses H3Common's H3LoraFile parser
     /// and pushes each adapter onto the target MfLinear's LoraSlot (module naming:
     /// blocks.{i}.attn.qkv_proj | attn.out_proj | mlp.fc1 | mlp.fc2).
+    /// 仅当 LoRA 适配器的输入维与目标 linear 一致时才挂载。
+    /// 剪枝/融合权重把 adaln_proj 折叠成 [out, rank]（rank ≪ timeEmbedDim），
+    /// 与原版 LoRA（输入维 = timeEmbedDim）不兼容，硬挂会在前向 matmul 处形状崩溃。
+    @discardableResult
+    static func attachLoRA(_ lin: MfLinear, _ refs: [LoraRef]) -> Bool {
+        if let a = refs.first?.a, a.shape.count >= 2, a.shape[0] != lin.inDim {
+            return false
+        }
+        lin.lora.set(refs)
+        return true
+    }
+
     @discardableResult
     public func attachLoras(from urls: [URL], scales: [Double] = []) throws -> Int {
         var patched = 0
+        var skipped = 0
         for (i, url) in urls.enumerated() {
             let scale = scales.indices.contains(i) ? Float(scales[i]) : 1.0
             let f = try H3LoraFile.load(from: url)
@@ -774,41 +851,46 @@ public final class H3DiT {
                 // 1) blocks.{i}.attn.qkv_proj / attn.out_proj / mlp.fc1 / mlp.fc2 / adaln_proj.linear
                 if let parsed = Self.parseLoraModule(e.module), parsed.layer < blocks.count {
                     let b = blocks[parsed.layer]
+                    let ok: Bool
                     switch parsed.kind {
-                    case .qkv: b.attn.qkv.lora.set(refs)
-                    case .out: b.attn.out.lora.set(refs)
-                    case .fc1: b.mlp.fc1.lora.set(refs)
-                    case .fc2: b.mlp.fc2.lora.set(refs)
-                    case .adaln: b.adaln?.linear.lora.set(refs)
+                    case .qkv: ok = Self.attachLoRA(b.attn.qkv, refs)
+                    case .out: ok = Self.attachLoRA(b.attn.out, refs)
+                    case .fc1: ok = Self.attachLoRA(b.mlp.fc1, refs)
+                    case .fc2: ok = Self.attachLoRA(b.mlp.fc2, refs)
+                    case .adaln: ok = b.adaln.map { Self.attachLoRA($0.linear, refs) } ?? false
                     }
-                    patched += 1
+                    if ok { patched += 1 } else { skipped += 1 }
                     continue
                 }
                 // 2) token_refiner.blocks.{i}.attn.qkv_proj / attn.out_proj / mlp.fc1 / mlp.fc2
                 if let rp = Self.parseRefinerLoraModule(e.module), rp < refiner.count {
                     let rb = refiner[rp]
+                    let ok: Bool
                     switch Self.refinerKind(of: e.module) {
-                    case .qkv: rb.attn.qkv.lora.set(refs)
-                    case .out: rb.attn.out.lora.set(refs)
-                    case .fc1: rb.mlp.fc1.lora.set(refs)
-                    case .fc2: rb.mlp.fc2.lora.set(refs)
-                    case .adaln: break
+                    case .qkv: ok = Self.attachLoRA(rb.attn.qkv, refs)
+                    case .out: ok = Self.attachLoRA(rb.attn.out, refs)
+                    case .fc1: ok = Self.attachLoRA(rb.mlp.fc1, refs)
+                    case .fc2: ok = Self.attachLoRA(rb.mlp.fc2, refs)
+                    case .adaln: ok = false
                     }
-                    patched += 1
+                    if ok { patched += 1 } else { skipped += 1 }
                     continue
                 }
                 // 3) final_layer.adaln_proj.linear (or final_adaln_proj.linear)
                 if e.module.hasPrefix("final_layer.adaln_proj") || e.module.hasPrefix("final_adaln_proj") {
-                    finalAdaln?.linear.lora.set(refs)
-                    patched += 1
+                    if let fa = finalAdaln, Self.attachLoRA(fa.linear, refs) { patched += 1 } else { skipped += 1 }
                     continue
                 }
                 // 4) legacy flat "adaln_proj" catch-all (rare)
                 if e.module == "adaln_proj" {
-                    for b in blocks { b.adaln?.linear.lora.set(refs) }
-                    patched += 1
+                    for b in blocks {
+                        if let ad = b.adaln, Self.attachLoRA(ad.linear, refs) { patched += 1 }
+                    }
                 }
             }
+        }
+        if skipped > 0 {
+            print("[H3DiT.attachLoras] 跳过 \(skipped) 个形状不匹配的 LoRA 模块（剪枝后折叠的 adaln_proj 通路）"); fflush(stdout)
         }
         return patched
     }
@@ -855,23 +937,32 @@ public final class H3DiT {
     /// Fold AdaLN modulation into tables once per (ts, plan). After this the
     /// per-block adaln weights are no longer touched in the sampling loop.
     public func precomputeAdaln(ts: [Double]) {
-        let embedder = H3TimeEmbedder(inputDim: 256, outDim: cfg.timeEmbedDim,
-                                      projInW: teInW, projInB: teInB,
-                                      projOutW: teOutW, projOutB: teOutB)
-        let tEmb32 = embedder.forward(ts)
-        let tEmb = tEmb32.asType(dtype)
+        // 时间调制两条通路：查表（pruned/fused，8 维系数直接喂折叠后的 adaln_proj）
+        // 或原版 time_embedder（2688 维嵌入，需 silu）。
+        let tEmb: MLXArray
+        let applySilu: Bool
+        if let lut = adalnLUT {
+            tEmb = lut.coeffs(ts).asType(dtype)
+            applySilu = false
+        } else {
+            let embedder = H3TimeEmbedder(inputDim: 256, outDim: cfg.timeEmbedDim,
+                                          projInW: teInW, projInB: teInB,
+                                          projOutW: teOutW, projOutB: teOutB)
+            tEmb = embedder.forward(ts).asType(dtype)
+            applySilu = true
+        }
 
         var blocksMods: [[MLXArray]] = []
         for b in blocks {
             if let ad = b.adaln {
-                blocksMods.append(ad.forward(tEmb).map { $0.asType(dtype) })
+                blocksMods.append(ad.forward(tEmb, applySilu: applySilu).map { $0.asType(dtype) })
             } else {
                 // Ablated/absent: zeros.
                 let zero = MLXArray.zeros([ts.count, cfg.hiddenSize]).asType(dtype)
                 blocksMods.append((0..<6).map { _ in zero })
             }
         }
-        let finalMods = finalAdaln?.forward(tEmb, applySilu: true) ?? []
+        let finalMods = finalAdaln?.forward(tEmb, applySilu: applySilu) ?? []
         adalnTables = H3AdalnTables(ts: ts, blocks: blocksMods, final: finalMods)
         if getenv("NA_H3PROF") != nil {
             print(String(format: "[PROF] adaln: tEmb=%@ blk0_0=%@ zeroDt=%@", String(describing: tEmb.dtype), String(describing: blocksMods[0][0].dtype), String(describing: MLXArray.zeros([1, cfg.hiddenSize]).dtype))); fflush(stdout)
