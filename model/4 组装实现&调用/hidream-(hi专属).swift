@@ -160,7 +160,7 @@ private func editTargetSize(
 public func runImagePipeline(prompt: String = "", referencePaths: [String] = [], width: Int? = nil, height: Int? = nil, isCancelled: @escaping () -> Bool = { false }) async -> String? {
     MonitorCenter.shared.taskStart("图像生成")
     defer { MonitorCenter.shared.taskEnd("图像生成") }
-    let base = "/Users/huachayui/Downloads/HiDream-O1-Image-Dev-mlx-bf16"
+    let base = "\(CommonPaths.modelRoot)/HiDream-O1-Image-Dev-mlx-bf16"
     memProfilePoint("图像管线开始 基线")
     // 图像任务开始：互斥（≤64GB）时卸对方（LTX 视频侧 Gemma/Connector/DiT），保护 HiDream
     MemoryPolicy.unloadIfNeededMidway(task: .image, current: .sampling, next: nil)

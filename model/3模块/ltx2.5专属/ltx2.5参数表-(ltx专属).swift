@@ -35,7 +35,7 @@ struct Stage1Config {
 
     // ==================== 公共路径（两方案共用） ====================
 
-    static let base = "/Users/huachayui/Downloads/ltx2.5/LTX-2.5-MLX-Serve-4bit"
+    static let base = CommonPaths.ltxServeDir
     static let vaeEncoder = "\(base)/vae_encoder.safetensors"   // I2V 首帧编码
 
     // ==================== 表字段（所有参数） ====================
@@ -101,7 +101,7 @@ struct Stage2Config {
 
     // ==================== 公共路径（两方案共用） ====================
 
-    static let base = "/Users/huachayui/Downloads/ltx2.5/LTX-2.5-MLX-Serve-4bit"
+    static let base = CommonPaths.ltxServeDir
     static let spatialUpscaler = "\(base)/spatial_upscaler_x2_v1_1.safetensors"   // 空间 ×2 起步
     static let vaeDecoder = "\(base)/vae_decoder.safetensors"                     // mean/std 统计
     static let vaeEncoder = "\(base)/vae_encoder.safetensors"                     // I2V 首尾帧重编码
@@ -140,8 +140,13 @@ struct Stage2Config {
 // MARK: - 非流程公共资源（文本编码 / 音频 / VAE 解码 使用；不属于 Stage1/2 流程表）
 
 enum CommonPaths {
-    static let ltxServeDir = "/Users/huachayui/Downloads/ltx2.5/LTX-2.5-MLX-Serve-4bit"
-    static let gemmaDir = "/Users/huachayui/Downloads/ltx2.5/gemma4-12b-ltx-v1"
+    /// 统一模型根：项目文档地址/model（跟随偏好设置的项目地址，模型不再散落 Downloads）
+    static var modelRoot: String {
+        URL(fileURLWithPath: AppSettings.shared.canvasRootPath)
+            .appendingPathComponent("model").path
+    }
+    static let ltxServeDir = "\(CommonPaths.modelRoot)/ltx2.5/LTX-2.5-MLX-Serve-4bit"
+    static let gemmaDir = "\(CommonPaths.modelRoot)/ltx2.5/gemma4-12b-ltx-v1"
     static let vaeDecoder = "\(ltxServeDir)/vae_decoder.safetensors"
     // LTX-2.5 扩散视频解码器（Diffusion Video Decoder）权重：官方 PyTorch 原版
     // ltx-2.5-video-vae-bf16.safetensors（1.4GB，bf16，decoder 部分为 det_stages+diff_blocks，

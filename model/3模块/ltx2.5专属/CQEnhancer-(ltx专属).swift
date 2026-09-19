@@ -44,8 +44,7 @@ import Foundation
 // MARK: - 常量
 
 /// 官方 CQ Video Enhancer LoRA 权重默认位置（可用环境变量 LTX_CQ_ENHANCER_PATH 覆盖）
-let cqEnhancerDefaultPath: String = NSString(string: "~/Downloads/ltx2.5/ltx2.5-CQ-enhancer-lora-for-videos-rank128.safetensors")
-    .expandingTildeInPath
+let cqEnhancerDefaultPath: String = "\(CommonPaths.modelRoot)/ltx2.5/ltx2.5-CQ-enhancer-lora-for-videos-rank128.safetensors"
 
 /// 官方应用强度：工作流中 LoraLoaderModelOnly 的 strength_model = 1.0
 let cqEnhancerStrength: Float = 1.0

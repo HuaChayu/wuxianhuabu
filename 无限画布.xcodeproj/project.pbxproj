@@ -11,6 +11,8 @@
 		5A31860B30331AFC004031FC /* 快捷键.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A31860630331AFC004031FC /* 快捷键.swift */; };
 		5A392BBC3031C1410045162C /* 读取&保存.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A392BBA3031C1370045162C /* 读取&保存.swift */; };
 		5A392BCF303238890045162C /* 偏好设置.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A392BBD303238890045162C /* 偏好设置.swift */; };
+		5A5E5140305E881400DF476E /* 开篇.mov in Resources */ = {isa = PBXBuildFile; fileRef = 5A5E513F305E881400DF476E /* 开篇.mov */; };
+		5A5E54DE305EAA0000DF476E /* 模型下载.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A5E54DD305EA9FC00DF476E /* 模型下载.swift */; };
 		5A79E3AA3039A43C00ED9732 /* 本地化包的方式.txt in Resources */ = {isa = PBXBuildFile; fileRef = 5A79E3A93039A43C00ED9732 /* 本地化包的方式.txt */; };
 		5AA4CF8830484ED30044BADF /* 服务器.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AA4CF8730484ECB0044BADF /* 服务器.swift */; };
 		5AB062303036DC9F0091017D /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = 5A365035B10F1C2E6293B67A /* MLX */; };
@@ -34,6 +36,8 @@
 		5A31860630331AFC004031FC /* 快捷键.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "快捷键.swift"; sourceTree = "<group>"; };
 		5A392BBA3031C1370045162C /* 读取&保存.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "读取&保存.swift"; sourceTree = "<group>"; };
 		5A392BBD303238890045162C /* 偏好设置.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "偏好设置.swift"; sourceTree = "<group>"; };
+		5A5E513F305E881400DF476E /* 开篇.mov */ = {isa = PBXFileReference; lastKnownFileType = video.quicktime; path = "开篇.mov"; sourceTree = "<group>"; };
+		5A5E54DD305EA9FC00DF476E /* 模型下载.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "模型下载.swift"; sourceTree = "<group>"; };
 		5A79E3A93039A43C00ED9732 /* 本地化包的方式.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "本地化包的方式.txt"; sourceTree = "<group>"; };
 		5AA4CF8730484ECB0044BADF /* 服务器.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "服务器.swift"; sourceTree = "<group>"; };
 		5ACA61D3302EE9E400C0EF7D /* 说明.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "说明.txt"; sourceTree = "<group>"; };
@@ -77,6 +81,7 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				5A5E54DD305EA9FC00DF476E /* 模型下载.swift */,
 				5AA4CF8730484ECB0044BADF /* 服务器.swift */,
 				5A21C637303444A60015B325 /* 图标预览.swift */,
 				5A392BBA3031C1370045162C /* 读取&保存.swift */,
@@ -95,6 +100,7 @@
 				5A31860630331AFC004031FC /* 快捷键.swift */,
 				5AD7A09830358BF8007525F8 /* 接收逻辑.swift */,
 				5AD7A09930358BF8007525F8 /* 媒体播放.swift */,
+				5A5E513F305E881400DF476E /* 开篇.mov */,
 			);
 			sourceTree = "<group>";
 		};
@@ -224,6 +230,7 @@
 			isa = PBXResourcesBuildPhase;
 			files = (
 				5A79E3AA3039A43C00ED9732 /* 本地化包的方式.txt in Resources */,
+				5A5E5140305E881400DF476E /* 开篇.mov in Resources */,
 				5ACA61DC302EEA3E00C0EF7D /* 更新日志.txt in Resources */,
 				5ACA61D4302EE9E400C0EF7D /* 说明.txt in Resources */,
 			);
@@ -240,6 +247,7 @@
 				5ACA61E9302EEFE700C0EF7D /* 调试中心.swift in Sources */,
 				5A31860B30331AFC004031FC /* 快捷键.swift in Sources */,
 				5A392BBC3031C1410045162C /* 读取&保存.swift in Sources */,
+				5A5E54DE305EAA0000DF476E /* 模型下载.swift in Sources */,
 				5AD7A0A530358BF8007525F8 /* 接收逻辑.swift in Sources */,
 				5AD7A0A630358BF8007525F8 /* 媒体播放.swift in Sources */,
 				5A21C638303444BA0015B325 /* 图标预览.swift in Sources */,

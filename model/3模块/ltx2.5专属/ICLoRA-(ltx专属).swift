@@ -163,5 +163,4 @@ extension LTXVideoDiT {
 
 /// 官方 IC-LoRA（Pixel Spatial Upscaler x2）权重默认位置；
 /// 可通过环境变量 LTX_IC_LORA_PATH 覆盖。
-let ICLoRADefaultPath: String = NSString(string: "~/Downloads/ltx2.5/ic_lora/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors")
-    .expandingTildeInPath
+let ICLoRADefaultPath: String = "\(CommonPaths.modelRoot)/ltx2.5/ic_lora/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors"

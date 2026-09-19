@@ -150,8 +150,17 @@ public enum H3FL2VAPipeline {
         adapterSkipH3Decode: Bool = true
     ) async throws -> String {
         let t0 = Date()
-        let modelDir = "/Users/huachayui/Downloads/h3-fused/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
-        let wURL = { (name: String) in URL(fileURLWithPath: "\(modelDir)/\(name)") }
+        let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
+        // ★ 2026-09-19 嵌套目录兼容：下载落位历史上可能产生「根目录/同名子目录」嵌套
+        //   （远端 listFiles 的 Path 自带与模型目录同名的顶层前缀）。生成侧一律按真实
+        //   落位解析：根目录直拼优先，不存在时任意深度递归查找（FileFinder），保证
+        //   嵌套场景也能加载；两者皆无时回退直拼路径（后续加载自然报错，便于定位）。
+        let modelRootURL = URL(fileURLWithPath: modelDir, isDirectory: true)
+        let wURL = { (name: String) -> URL in
+            let direct = modelRootURL.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: direct.path) { return direct }
+            return FileFinder.first(named: name, under: modelRootURL) ?? direct
+        }
 
         // ── 内存打点（RSS phys_footprint + MLX activeMemory）──
         func memFootprintKB() -> UInt64 {
@@ -316,7 +325,15 @@ public enum H3FL2VAPipeline {
         log("VAE 编码器已释放")
 
         // ── 2. tokenizer + 文本编码 ──
-        let lmConfig = LanguageModelConfigurationFromHub(modelFolder: URL(fileURLWithPath: modelDir))
+        // 语言模型目录同样按真实落位解析：根目录直拼 config.json 存在则用根目录，
+        // 否则递归定位 config.json 所在目录（兼容历史嵌套落位）。
+        let lmFolderURL: URL = {
+            if FileManager.default.fileExists(atPath: modelRootURL.appendingPathComponent("config.json").path) {
+                return modelRootURL
+            }
+            return FileFinder.first(named: "config.json", under: modelRootURL)?.deletingLastPathComponent() ?? modelRootURL
+        }()
+        let lmConfig = LanguageModelConfigurationFromHub(modelFolder: lmFolderURL)
         guard let tokConfig = try? await lmConfig.tokenizerConfig,
               let tokData = try? await lmConfig.tokenizerData,
               let tokenizer = try? AutoTokenizer.from(tokenizerConfig: tokConfig, tokenizerData: tokData) else {
@@ -879,7 +896,7 @@ public enum H3FL2VAPipeline {
             }
         }
 
-        // ── 5. VAE 解码 + 写无声 mp4（同一池内完成：像素大数组写完立即释放，再进音频段） ──
+        // ── 5. VAE 解码 + 写无声视频（proResOutput=true → .mov/ProRes422，否则 .mp4/h264；同一池内完成：像素大数组写完立即释放，再进音频段） ──
         // adapter 直通且要求跳解码时不进此段：无 stage1 mp4，音轨改由 5.1 单独落 wav 承载。
         if adapterActive && adapterSkipDecode {
             h = stage2MemBridge?.adapterPixelHeight ?? 0
@@ -890,7 +907,7 @@ public enum H3FL2VAPipeline {
             stage2MemBridge?.height = h
             stage2MemBridge?.frameCount = fCount
             stage2MemBridge?.fps = Int(H3Const.fps)
-            log("⏭️ adapter 直通模式：跳过 H3 VAE 解码，不写 stage1 mp4"
+            log("⏭️ adapter 直通模式：跳过 H3 VAE 解码，不写 stage1 视频文件"
                 + "（像素几何 \(w)×\(h) @ \(fCount) 帧，仅供 LTX 侧尺寸推导）")
         } else {
         var decWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
@@ -903,7 +920,8 @@ public enum H3FL2VAPipeline {
             h = pixels.shape[3]
             w = pixels.shape[4]
             // 内存直通（方案 C）：stage1 像素帧不落盘，由 bridge 持有供像素桥直接 VAE 编码；
-            // 落盘仅为“给用户看”的 h264 最高质量预览（writeMp4 h264MaxQuality）。
+            // 落盘为 ProRes 422 .mov（proResOutput=true，10bit v210；无二采时即最终产物，
+            // 有二采时作高质量预览/音轨源）。
             if let bridge = stage2MemBridge {
                 bridge.pixels = pixels
                 bridge.width = w
@@ -923,7 +941,7 @@ public enum H3FL2VAPipeline {
         decoder = nil
         decWeights = nil
         MLX.Memory.clearCache()
-        log("无声 mp4 已写出：\(silentPath)（\(fCount) 帧 \(w)×\(h)），VAE 解码器与像素数组已释放")
+        log("无声视频已写出：\(silentPath)（\(fCount) 帧 \(w)×\(h)），VAE 解码器与像素数组已释放")
         }
 
         // ── 5.1 音频 vocoder 解码 + 混入音轨 ──
@@ -954,7 +972,7 @@ public enum H3FL2VAPipeline {
                 // adapter 直通：无 stage1 视频可混流，保留 wav 作为音轨载体，
                 // 由 LTX 二采在最终出片时混流（见 bridge.audioTrackPath）。
                 stage2MemBridge?.audioTrackPath = wavPath
-                log("音轨载体已保留（adapter 直通，无 stage1 mp4）：\(wavPath)")
+                log("音轨载体已保留（adapter 直通，无 stage1 视频文件）：\(wavPath)")
             } else {
                 try muxAudio(videoPath: silentPath, wavPath: wavPath, to: outPath, proRes: proResOutput)
                 log("音轨已混入：\(outPath)")
@@ -962,8 +980,8 @@ public enum H3FL2VAPipeline {
                 try? FileManager.default.removeItem(atPath: silentPath)
             }
         } catch {
-            // 音频失败不丢视频：无声 mp4 兜底保留为 outPath
-            log("⚠️ 音频解码/混流失败（\(error.localizedDescription)），保留无声 mp4")
+            // 音频失败不丢视频：无声视频兜底保留为 outPath
+            log("⚠️ 音频解码/混流失败（\(error.localizedDescription)），保留无声视频")
             if adapterActive && adapterSkipDecode {
                 log("   （adapter 直通模式无 stage1 视频，需由 LTX 侧无声产物兜底）")
             } else {

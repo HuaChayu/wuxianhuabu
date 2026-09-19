@@ -300,9 +300,11 @@ final class GenerationQueue: ObservableObject {
         let genW = task.videoWidth
         let genH = task.videoHeight
         // 方案 C：只要还有二采（阶段2 或 Apple 超分），stage1 落盘就仅作“给用户看”的预览 + 音轨源
-        //（二采像素已走内存直通，不落盘）；两者都关：单遍直出维持 h264 (.mp4) 原样
+        //（二采像素已走内存直通，不落盘）；两者都关：单遍直出即最终产物。
+        // 2026-09-19：H3 一采统一改 .mov + ProRes 422（直出与 SelfLift 分支不再接 LTX 二采时
+        // 一采即最终产物，ProRes 10bit 优于 h264 8bit；有二采时同步升级为高质量预览/音轨源）。
         let stage1IsPreview = stage2On || appleSROn
-        let genPath = "\(outDir)/\(baseName)\(stage1IsPreview ? "_stage1_preview" : "").mp4"
+        let genPath = "\(outDir)/\(baseName)\(stage1IsPreview ? "_stage1_preview" : "").mov"
         let condSummary: String
         if useRef2VA {
             if fl2vaAsRefs && task.videoPaths.isEmpty && task.audioPaths.isEmpty && task.imagePaths.count == 2 {
@@ -378,7 +380,8 @@ final class GenerationQueue: ObservableObject {
         }
         do {
             // 方案 C：只要有二采（阶段2 或 Apple 超分）就建内存直通桥（generateVideo 内部把 stage1
-            // 解码像素交给它，不落盘；随后由二采通道按需消费）；stage1 落盘统一 h264（不再 ProRes 中间件）
+            // 解码像素交给它，不落盘；随后由二采通道按需消费）；stage1 落盘统一 ProRes 422 .mov
+            //（2026-09-19：直出/无二采时一采即最终产物，h264 → ProRes 提升最终输出质量）
             let stage2Bridge = needMemoryBridge ? H3Stage2MemoryBridge() : nil
             // ★ H3→LTX latent 直通（H3-to-LTX-Latent-Adapter，可选）：适配器在 H3 VAE 解码之前
             //   拦截 clean latent 并映射为 LTX 归一化 latent，二采由此省去像素往返。
@@ -402,7 +405,7 @@ final class GenerationQueue: ObservableObject {
                 //   高分（升频×2 + 精修）交由 LTX 二采（fullResInput=false 配套）。
                 selfLiftLowOnly: h3LowOnly,
                 log: { pipelineLog("[H3] \($0)") },
-                proResOutput: false,
+                proResOutput: true,
                 stage2MemBridge: stage2Bridge,
                 // 多参考（ref2va）：非纯首尾帧场景把全部合规图片作为多参考传入（首/尾帧入参被忽略）
                 referenceImagePaths: useRef2VA ? task.imagePaths : [],

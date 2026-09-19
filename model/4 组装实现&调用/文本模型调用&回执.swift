@@ -33,7 +33,7 @@ func chatWithGemma(
     temperature: Float = 1.0,
     topK: Int = 64
 ) async -> String {
-    let modelDir = "/Users/huachayui/Downloads/ltx2.5/gemma4-12b-ltx-v1"
+    let modelDir = CommonPaths.gemmaDir
     let gemmaPath = "\(modelDir)/model.safetensors"
     let t0 = Date()
 

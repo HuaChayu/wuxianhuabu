@@ -32,6 +32,7 @@ struct CanvasView: View {
     @EnvironmentObject var store: CanvasStore
     @EnvironmentObject var projectStore: ProjectStore
     @ObservedObject var assetStore = AssetStore.shared
+    @ObservedObject var modelDownloadManager = ModelDownloadManager.shared
     @Binding var canvasName: String
     @State var showRatioMenu = false
     @State var showColorMenu = false
@@ -113,7 +114,26 @@ struct CanvasView: View {
     let gridSize: Double = 40
     let gridColor: Color = Color(red: 0.85, green: 0.85, blue: 0.88)
     let majorGridColor: Color = Color(red: 0.75, green: 0.75, blue: 0.78)
-    
+
+    /// 模型下载面板（画布中间）：下载时显示标题+总进度+活动文件列表，水色跟随全局颜色
+    @ViewBuilder
+    private var modelDownloadProgressView: some View {
+        if modelDownloadManager.isDownloading || modelDownloadManager.errorMessage != nil {
+            ModelDownloadPanel(
+                progress: modelDownloadManager.progress,
+                activeFiles: modelDownloadManager.activeFiles,
+                errorMessage: modelDownloadManager.errorMessage,
+                accentColor: AppSettings.shared.defaultNodeColor,
+                onRetry: { modelDownloadManager.retryDownload() },
+                onDismiss: { modelDownloadManager.dismissError() }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // 下载中纯展示不拦截画布交互；错误态放行以便"重试/关闭"按钮可点击
+            .allowsHitTesting(modelDownloadManager.errorMessage != nil)
+            .transition(.opacity)
+        }
+    }
+
     var body: some View {
         ZStack {
             // 背景网格（可拖拽）
@@ -360,6 +380,9 @@ struct CanvasView: View {
                 historyPanel(nodeID: nodeID)
                     .position(historyPanelPos)
             }
+            
+            // ===== 模型下载试管进度条（画布中间）：下载时显示，水色跟随全局颜色 =====
+            modelDownloadProgressView
         }
         .background(GeometryReader { geo in
             Color.clear
@@ -775,6 +798,15 @@ struct CanvasView: View {
             size = videoSize(ratio: ratio, quality: quality)
         }
         let modelName = node?.model.displayName ?? "?"
+        // ★ 模型就绪检查：生成前确认所选模型权重已下载；未下载则自动下载（画布中间显示试管进度条），
+        //   下载完成后自动续跑本次生成（不同模型走各自下载地址，见 ModelDownloadSpec.all）
+        if let node, let dlSpec = ModelDownloadSpec.spec(for: node.model), !dlSpec.isReady {
+            debugLog("视频生成：模型 \(node.model.displayName) 权重未下载（\(dlSpec.localDir)），先下载后生成")
+            modelDownloadManager.ensureModel(node.model) {
+                self.startVideoGeneration(nodeID: nodeID, prompt: prompt, visited: visited)
+            }
+            return
+        }
         debugLog("视频生成：入队（节点 \(nodeID)，模型 \(modelName)，提示词「\(trimmedPrompt)」，尺寸 \(size.width)×\(size.height)，时长 \(duration.displayName)）")
         let task = QueueTask(
             kind: .video,
@@ -958,6 +990,16 @@ struct CanvasView: View {
             return
         }
         inputValidationErrors[nodeID] = nil
+        // ★ 模型就绪检查：图像模型（HiDream-O1）权重未下载则自动下载（画布中间显示试管进度条），
+        //   下载完成后自动续跑本次生成（与视频模型 H3 同款流程，见 ModelDownloadSpec.all）
+        if let targetNode = store.nodes.first(where: { $0.id == nodeID }),
+           let dlSpec = ModelDownloadSpec.spec(forImage: targetNode.imageModel), !dlSpec.isReady {
+            debugLog("图像生成：模型 \(targetNode.imageModel.displayName) 权重未下载（\(dlSpec.localDir)），先下载后生成")
+            modelDownloadManager.ensureModel(targetNode.imageModel) {
+                self.startImageGeneration(nodeID: nodeID, prompt: prompt)
+            }
+            return
+        }
         // 收集合规图像输入（HiDream-O1 规则：图像/角色/场景节点最多 5 张，音频/视频/文本/空节点禁用跳过）。
         let validity = store.inputValidity(for: nodeID)
         let referencePaths = validity.imagePaths
@@ -1193,7 +1235,14 @@ struct CanvasView: View {
                     onSend: { sendPrompt() },
                     onRatioChange: makeNodeFieldUpdater(node.id, keyPath: \.ratio) { "节点输入框：写入节点私有比例 \($0.displayName)" },
                     onModelChange: makeNodeFieldUpdater(node.id, keyPath: \.model) { "节点输入框：写入视频节点模型 \($0.displayName)" },
-                    onImageModelChange: makeNodeFieldUpdater(node.id, keyPath: \.imageModel) { "节点输入框：写入图像节点模型 \($0.displayName)" },
+                    onImageModelChange: { model in
+                        makeNodeFieldUpdater(node.id, keyPath: \.imageModel) { "节点输入框：写入图像节点模型 \($0.displayName)" }(model)
+                        // ★ 选择 HiDream 时检查权重：未下载自动开始下载（下载面板显示），已就绪直接可用
+                        if let spec = ModelDownloadSpec.spec(forImage: model), !spec.isReady {
+                            debugLog("图像模型 \(model.displayName) 权重未下载（\(spec.localDir)），自动开始下载")
+                            modelDownloadManager.ensureModel(model)
+                        }
+                    },
                     hasValidImageInput: !store.inputValidity(for: node.id).imagePaths.isEmpty,
                     onQualityChange: makeNodeFieldUpdater(node.id, keyPath: \.quality) { "节点输入框：写入视频节点档位 \($0.displayName)" },
                     onDurationChange: makeNodeFieldUpdater(node.id, keyPath: \.duration) { "节点输入框：写入视频节点时长 \($0.displayName)" },
@@ -1230,7 +1279,14 @@ struct CanvasView: View {
                     },
                     onRatioChange: makeNodeFieldUpdater(node.id, keyPath: \.ratio) { "展开输入框：写入节点私有比例 \($0.displayName)" },
                     onModelChange: makeNodeFieldUpdater(node.id, keyPath: \.model) { "展开输入框：写入视频节点模型 \($0.displayName)" },
-                    onImageModelChange: makeNodeFieldUpdater(node.id, keyPath: \.imageModel) { "展开输入框：写入图像节点模型 \($0.displayName)" },
+                    onImageModelChange: { model in
+                        makeNodeFieldUpdater(node.id, keyPath: \.imageModel) { "展开输入框：写入图像节点模型 \($0.displayName)" }(model)
+                        // ★ 选择 HiDream 时检查权重：未下载自动开始下载（下载面板显示），已就绪直接可用
+                        if let spec = ModelDownloadSpec.spec(forImage: model), !spec.isReady {
+                            debugLog("图像模型 \(model.displayName) 权重未下载（\(spec.localDir)），自动开始下载")
+                            modelDownloadManager.ensureModel(model)
+                        }
+                    },
                     hasValidImageInput: !store.inputValidity(for: node.id).imagePaths.isEmpty,
                     onQualityChange: makeNodeFieldUpdater(node.id, keyPath: \.quality) { "展开输入框：写入视频节点档位 \($0.displayName)" },
                     onDurationChange: makeNodeFieldUpdater(node.id, keyPath: \.duration) { "展开输入框：写入视频节点时长 \($0.displayName)" },
@@ -1733,4 +1789,103 @@ struct CanvasEditorView: View {
         canvasStore.save()
     }
 
+}
+
+// ============================================================
+//  模型下载面板：画布中间显示"正在下载模型"标题 + 总进度百分比 +
+//  当前活动下载文件列表（并发 N 个显示 N 项；完成消失、自动补上下一个；
+//  每行该文件独立速度 + 文件级进度条；错误态保留重试/关闭按钮）
+// ============================================================
+
+struct ModelDownloadPanel: View {
+    let progress: Double
+    let activeFiles: [ActiveFileDownload]
+    let errorMessage: String?
+    let accentColor: Color
+    var onRetry: (() -> Void)?
+    var onDismiss: (() -> Void)?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.callout)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 300)
+                HStack(spacing: 12) {
+                    Button("重试") { onRetry?() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(accentColor)
+                    Button("关闭") { onDismiss?() }
+                        .buttonStyle(.bordered)
+                }
+            } else {
+                // 标题 + 总进度百分比
+                HStack(spacing: 8) {
+                    Text("正在下载模型")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text("\(Int(progress * 100))%")
+                        .font(.headline)
+                        .foregroundColor(accentColor)
+                        .monospacedDigit()
+                }
+                // 活动文件列表：在下载几个就显示几个，完成消失、自动补上下一个
+                if activeFiles.isEmpty {
+                    Text("准备中…")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(activeFiles, id: \.name) { item in
+                            fileRow(item)
+                        }
+                    }
+                    .frame(maxWidth: 340)
+                }
+            }
+        }
+        .padding(26)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(accentColor.opacity(0.35), lineWidth: 1.5)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 24, y: 10)
+    }
+
+    /// 单文件行：文件名 + 该文件独立实时速度 + 文件级进度条
+    private func fileRow(_ item: ActiveFileDownload) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(item.name)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 8)
+                let speedText = ModelDownloadManager.formatSpeed(item.speedBytesPerSec)
+                Text(speedText.isEmpty ? "…" : speedText)
+                    .font(.caption.monospacedDigit())
+                    .foregroundColor(accentColor)
+            }
+            // 文件级进度（written/total）
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.black.opacity(0.08))
+                    Capsule()
+                        .fill(accentColor.opacity(0.75))
+                        .frame(width: geo.size.width * fileProgress(item))
+                }
+            }
+            .frame(height: 4)
+        }
+    }
+
+    private func fileProgress(_ item: ActiveFileDownload) -> CGFloat {
+        guard item.total > 0 else { return 0 }
+        return CGFloat(min(Double(item.written) / Double(item.total), 1.0))
+    }
 }

@@ -14,7 +14,7 @@ enum H3VAETestRun {
 
         let firstImage = "/Users/huachayui/Desktop/000 媒体素材/雷电法王.png"
         let lastImage = "/Users/huachayui/Desktop/蝴蝶/2.png"
-        let modelDir = "/Users/huachayui/Downloads/minimax h3/MiniMax-H3-FL2VA-MLX-Serve-4bit"
+        let modelDir = "\(CommonPaths.modelRoot)/minimax h3/MiniMax-H3-FL2VA-MLX-Serve-4bit"
 
         func log(_ s: String) { print("[H3VAETEST] \(s)"); fflush(stdout) }
 

@@ -47,7 +47,7 @@ enum H3PostProcessMode: String, CaseIterable, Identifiable {
         case .none:
             return "啥都不走：H3 一采直出目标尺寸"
         case .selflift:
-            return "恒定最后一步为高清，前面都是半尺寸"
+            return "恒定最后一步为半尺寸，前面都是半尺寸。（前面跑结构，最后一步补细节。模糊是分辨率不足或运动模糊，脸结构崩溃扭曲是步数不足，5步不行改6步。）"
         case .apple:
             return "H3 直出目标尺寸后走 Apple 超分（预留位，暂未重点调优）"
         }
@@ -212,7 +212,10 @@ final class AppSettings: ObservableObject {
         wheelAccelerationPrecise = d.object(forKey: "wheelAccelerationPrecise") as? Double ?? 2.0
         wheelAccelerationWheel = d.object(forKey: "wheelAccelerationWheel") as? Double ?? 30.0
         let savedPath = d.string(forKey: "canvasRootPath") ?? ""
-        canvasRootPath = savedPath.isEmpty ? Self.defaultRootPath : savedPath
+        // ★ 2026-09-19 崩溃修复：根路径存局部变量，供 init 后续阶段拼默认路径使用
+        // （两阶段初始化期间禁止访问 self 属性，故不能直接引用 canvasRootPath）。
+        let resolvedRootPath = savedPath.isEmpty ? Self.defaultRootPath : savedPath
+        canvasRootPath = resolvedRootPath
         // ★ H3 一采第一阶段总步数 N：默认 6（turbo LoRA 标定值）；存量/越界值按 4–12 夹取，
         // 保证传给采样链路的 N 永远落在滑杆量程内（ts 推导侧另有 1 ≤ ts ≤ N-1 的 clamp）。
         let savedH3Steps = d.object(forKey: "h3Stage1Steps") as? Int ?? 6
@@ -266,7 +269,15 @@ final class AppSettings: ObservableObject {
         // 故默认开启不影响可用性（回退链路完整保留）。
         videoUseH3LTXAdapter = d.object(forKey: "videoUseH3LTXAdapter") as? Bool ?? true
         let savedAdapterPath = d.string(forKey: "h3LTXAdapterPath") ?? ""
-        h3LTXAdapterPath = savedAdapterPath.isEmpty ? Self.defaultH3LTXAdapterPath : savedAdapterPath
+        if savedAdapterPath.isEmpty {
+            // ★ 2026-09-19 崩溃修复：init 期间禁止经 CommonPaths.modelRoot / Self.defaultH3LTXAdapterPath
+            // 反向访问 AppSettings.shared（static let 初始化重入 → dispatch_once EXC_BREAKPOINT）。
+            // 直接用 init 已解析的局部变量 resolvedRootPath 拼默认路径（两阶段初始化禁访问 self 属性）。
+            h3LTXAdapterPath = URL(fileURLWithPath: resolvedRootPath)
+                .appendingPathComponent("model/H3-to-LTX-Latent-Adapter.safetensors").path
+        } else {
+            h3LTXAdapterPath = savedAdapterPath
+        }
     }
 
     // 默认文档地址（~/Documents/无限画布）
@@ -275,10 +286,15 @@ final class AppSettings: ObservableObject {
         return docs.appendingPathComponent("无限画布").path
     }
 
-    /// H3→LTX latent 直通适配器权重默认路径（与 h3-fused 模型目录同级，便于随模型一起分发）
+    /// H3→LTX latent 直通适配器权重默认路径（统一模型根下，便于随模型一起分发）
+    /// ★ 2026-09-19 崩溃修复：不依赖 CommonPaths.modelRoot（其会访问 AppSettings.shared，
+    /// 在 AppSettings.init 期间调用会形成 static let 初始化重入 → EXC_BREAKPOINT）。
+    /// 直接读 UserDefaults 的 canvasRootPath 拼路径；defaultRootPath 为纯函数，不触 shared，安全。
     static var defaultH3LTXAdapterPath: String {
-        (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Downloads/h3-fused/H3-to-LTX-Latent-Adapter.safetensors")
+        let saved = UserDefaults.standard.string(forKey: "canvasRootPath") ?? ""
+        let root = saved.isEmpty ? defaultRootPath : saved
+        return URL(fileURLWithPath: root)
+            .appendingPathComponent("model/H3-to-LTX-Latent-Adapter.safetensors").path
     }
 
     // 可选节点主题色（有序，与工具栏一致）
@@ -459,25 +475,27 @@ struct PreferencesView: View {
     // 通用设置页
     private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 18) {
-            // 项目文件地址
+            // 项目文件地址（仅展示与打开所在位置；修改地址在启动预览界面选择）
             VStack(alignment: .leading, spacing: 6) {
                 Text("项目文件地址")
                     .font(.system(size: 13, weight: .medium))
                 HStack(spacing: 8) {
-                    TextField("", text: $settings.canvasRootPath)
-                        .textFieldStyle(.roundedBorder)
-                    Button("选择…") {
-                        debugLog("偏好设置：选择项目文件地址")
-                        let panel = NSOpenPanel()
-                        panel.canChooseDirectories = true
-                        panel.canChooseFiles = false
-                        panel.allowsMultipleSelection = false
-                        panel.directoryURL = URL(fileURLWithPath: settings.canvasRootPath)
-                        if panel.runModal() == .OK, let url = panel.url {
-                            // 文档库根 = 选择目录/无限画布（补上根文件夹）
-                            let newRoot = url.appendingPathComponent("无限画布", isDirectory: true).path
-                            settings.changeCanvasRootPath(to: newRoot)
-                        }
+                    Text(settings.canvasRootPath)
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color(red: 0.95, green: 0.95, blue: 0.97))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5)
+                                .stroke(Color.gray.opacity(0.35), lineWidth: 1)
+                        )
+                    Button("打开该地址") {
+                        debugLog("偏好设置：打开项目文件地址")
+                        NSWorkspace.shared.open(URL(fileURLWithPath: settings.canvasRootPath))
                     }
                 }
             }

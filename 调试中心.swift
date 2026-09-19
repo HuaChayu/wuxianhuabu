@@ -169,9 +169,9 @@ final class MonitorCenter: ObservableObject {
     /// 常驻权重静态清单（路径与各调用文件一致）
     private static let weightDefs: [(id: String, name: String, path: String?)] = [
         ("hhdream", "HiDream 骨架", "/Users/huachayui/Downloads/HiDream-O1-Image-Dev-mlx-bf16/model.safetensors"),
-        ("dit", "LTX DiT", "/Users/huachayui/Downloads/ltx2.5/LTX-2.5-MLX-Serve-4bit/transformer-distilled.safetensors"),
-        ("gemma", "Gemma 文本", "/Users/huachayui/Downloads/ltx2.5/gemma4-12b-ltx-v1/model.safetensors"),
-        ("connector", "Connector", "/Users/huachayui/Downloads/ltx2.5/LTX-2.5-MLX-Serve-4bit/connector.safetensors"),
+        ("dit", "LTX DiT", "\(CommonPaths.ltxServeDir)/transformer-distilled.safetensors"),
+        ("gemma", "Gemma 文本", "\(CommonPaths.gemmaDir)/model.safetensors"),
+        ("connector", "Connector", "\(CommonPaths.ltxServeDir)/connector.safetensors"),
         ("compiled", "LTX 编译图", nil),
     ]
     /// 上一轮各权重状态（用于页缓存回收播报）
