@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 2a3ad4afc341e3a7b9ee947e156d9b72_31e26b6eb4be11f19ef152540024e231
-    ReservedCode1: caE2FM2W3UEYEXSyhltDL2P5JkWFLV7DRn+SVqgZ1S702nXdOWl+eJc3bQRwbik57FNp1fCtQivCN91NFm+2bun/8XVSlKIdzRz6pIC3XaVaCWGHdmtGjbD/P2v5lR4E4ewFLo/o1XgdaX1W4GquEtTVL8IcvtcTVblkj6UACXlQtRfBKSBQHSwO9+Y=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 2a3ad4afc341e3a7b9ee947e156d9b72_31e26b6eb4be11f19ef152540024e231
-    ReservedCode2: caE2FM2W3UEYEXSyhltDL2P5JkWFLV7DRn+SVqgZ1S702nXdOWl+eJc3bQRwbik57FNp1fCtQivCN91NFm+2bun/8XVSlKIdzRz6pIC3XaVaCWGHdmtGjbD/P2v5lR4E4ewFLo/o1XgdaX1W4GquEtTVL8IcvtcTVblkj6UACXlQtRfBKSBQHSwO9+Y=
----
-
 # 无限画布（wuxianhuabu）
 
 基于 SwiftUI + MLX 的本地多模态视频/图像生成应用，macOS 原生运行，主打**无限画布节点式工作流**：节点即资源，连线即生成，全程本地推理，无需云端 API。
