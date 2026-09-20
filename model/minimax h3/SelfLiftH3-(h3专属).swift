@@ -109,8 +109,15 @@ private func h3LearnedUpscalerForCurrentEnv() -> H3LatentUpscaler? {
     if let c = h3LearnedUpscalerCache, c.key == key { return c.up }
     var up: H3LatentUpscaler? = nil
     if key != "nearest" {
+        let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
+        let modelRootURL = URL(fileURLWithPath: modelDir, isDirectory: true)
+        let wURL = { (name: String) -> URL in
+            let direct = modelRootURL.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: direct.path) { return direct }
+            return FileFinder.first(named: name, under: modelRootURL) ?? direct
+        }
         let path = ProcessInfo.processInfo.environment["NA_H3_UPSCALER_PATH"]
-            ?? "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit/minimax_h3_latent_upscaler_3d_bf16.safetensors"
+            ?? wURL("minimax_h3_latent_upscaler_3d_bf16.safetensors").path
         if let w = try? H3Weights(url: URL(fileURLWithPath: path)) {
             up = try? H3LatentUpscaler(weights: w)
         } else {

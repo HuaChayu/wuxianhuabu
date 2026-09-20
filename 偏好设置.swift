@@ -590,7 +590,7 @@ struct PreferencesView: View {
                                     Text("\(n)")
                                         .font(.system(size: 10))
                                         .foregroundColor(n == settings.h3Stage1Steps ? .primary : .secondary)
-                                    Text(n == 4 ? "测试" : n == 5 ? "推荐" : n == 6 ? "更佳" : " ")
+                                    Text(n == 4 ? "崩坏" : n == 5 ? "勉强" : n == 6 ? "推荐" : " ")
                                         .font(.system(size: 9))
                                         .foregroundColor(.secondary)
                                 }

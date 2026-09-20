@@ -254,6 +254,9 @@ final class CanvasStore: ObservableObject {
         didSet { inputValidityCache = nil }
     }
     
+    // 画布级临时提示（底部黑胶囊，自动消失；连线限制等即时反馈用）
+    @Published var toastMessage: String? = nil
+    
     /// 输入合规性判定缓存（[nodeID: InputValidity]）：滚动/平移画布只改 offset，nodes/connections 不变
     /// → 判定结果不变；nodes/connections 的 didSet 已负责失效。避免内容层 ForEach 每帧对每条连线
     /// 重复重算 O(入度×n) 的线性查找 + 文件路径解析
@@ -848,5 +851,21 @@ extension CanvasStore {
             guard let fileName = mediaFileName(for: node) else { return nil }
             return assetLibraryURL.appendingPathComponent(fileName).path
         }
+    }
+}
+
+// MARK: - H3 尾帧延续前置源（2026-09-20 重装）
+
+extension CanvasStore {
+    /// H3 视频节点的尾帧延续前置源：连接顺序第一条入边 from.type == .video && from.tailFrameEnabled
+    ///（与发光连线共用 tailFrameEnabled 语义；nil = 无前置，首节点从头生成零回归）。
+    func h3ChainSourceID(for videoNodeID: UUID) -> UUID? {
+        for conn in connections where conn.toID == videoNodeID {
+            if let from = nodes.first(where: { $0.id == conn.fromID }),
+               from.type == .video, from.tailFrameEnabled {
+                return from.id
+            }
+        }
+        return nil
     }
 }

@@ -225,14 +225,28 @@ extension CanvasView {
     // MARK: - 引用该节点生成面板（拖拽连线在空白处松手时弹出）
     
     var generatePanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        // 视频→视频唯一连线限制（与 finishConnectDrag 同口径）：被拖出方为视频节点且已连 ≥1 个视频目标时，
+        // 面板不再提供「视频」选项（再生成视频会违反"视频只能连到一个视频"）
+        let hideVideoOption: Bool = {
+            guard let fromID = generateFromNodeID,
+                  store.nodes.first(where: { $0.id == fromID })?.type == .video else { return false }
+            let existingVideoCount = store.connections.filter { conn in
+                conn.fromID == fromID
+                    && (store.nodes.first { $0.id == conn.toID }?.type == .video)
+            }.count
+            return existingVideoCount >= 1
+        }()
+        
+        return VStack(alignment: .leading, spacing: 0) {
             Text("引用该节点生成")
                 .font(.headline)
                 .padding(.horizontal, 14)
                 .padding(.top, 12)
                 .padding(.bottom, 8)
             
-            ForEach([NodeType.image, .video, .audio, .character, .scene]) { type in
+            ForEach([NodeType.image, .video, .audio, .character, .scene].filter { type in
+                !(hideVideoOption && type == .video)
+            }) { type in
                 contextMenuItem(icon: type.icon, title: type.rawValue) {
                     generateNode(of: type)
                     showGeneratePanel = false

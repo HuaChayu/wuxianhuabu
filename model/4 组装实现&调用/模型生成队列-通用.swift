@@ -83,6 +83,14 @@ struct QueueTask: Identifiable, Sendable {
     /// 视频生成模型（kind == .video 时有效；runPipeline 按此分派管线）
     var model: VideoModel = .ltx25Distill
 
+    // ★ 尾帧延续（.h3cc）链路（2026-09-20 重装）：由 UI 构造时透传；默认值保证旧构造点零回归
+    /// 本视频节点是否开启尾帧延续落盘（= 节点数据模型.tailFrameEnabled）
+    var h3TailFrameEnabled: Bool = true
+    /// 前置延续源节点 ID（连接顺序第一条入边 from.type == .video && from.tailFrameEnabled；nil = 无前置）
+    var h3ChainSourceID: UUID? = nil
+    /// 前置延续源分支 ID（多分支输出时区分，可选）
+    var h3ChainBranchID: String? = nil
+
     // 状态
     var status: QueueTaskStatus = .pending
     let cancelToken = CancelToken()
@@ -379,6 +387,31 @@ final class GenerationQueue: ObservableObject {
             pipelineLog("H3 视频生成：直出目标 \(genW)×\(genH) \(h3Stage1Steps) 步 turbo（\(h3SlDesc)），不除2/不升频/不二采（第二阶段关，Apple 超分关）@ \(alignedFrames) 帧（latentT=\(latentT)），条件：\(condSummary)")
         }
         do {
+            // ★ 尾帧延续（.h3cc）消费侧（2026-09-20 重装）：前置开尾帧视频节点（连接顺序第一条入边
+            //   from.type == .video && from.tailFrameEnabled）存在 .h3cc 时 load 读回尾段 latent，
+            //   经指纹校验后作为 continuationSource 注入 generateVideo（真正参与采样，非空转）。
+            //   未命中 / 校验失败 → nil，管线回退从头生成（零回归）。生成成功后再删被消费缓存。
+            let contCacheRoot = "\(AppSettings.shared.canvasRootPath)/cache/h3-continuation"
+            var continuationSource: H3ContinuationCache.Loaded? = nil
+            if task.h3TailFrameEnabled, let srcID = task.h3ChainSourceID {
+                let contFrameCount = UInt32(h3PlanTemporal(Int(latentT)).outputFrames)
+                let contExpect = H3ContinuationCache.Expect(
+                    modelKey: H3ContinuationCache.currentModelKey,
+                    width: genW, height: genH,
+                    steps: UInt32(h3Stage1Steps),
+                    latentT: latentT,
+                    frameCount: contFrameCount,
+                    refCount: useRef2VA ? task.imagePaths.count : 0
+                )
+                continuationSource = H3ContinuationCache.load(
+                    nodeID: srcID, branchID: task.h3ChainBranchID,
+                    rootDir: contCacheRoot, expect: contExpect)
+                if continuationSource != nil {
+                    pipelineLog("H3 尾帧延续：命中前置节点 \(srcID.uuidString) 的 .h3cc，尾段 latent 将注入采样")
+                } else {
+                    pipelineLog("H3 尾帧延续：前置节点 \(srcID.uuidString) 无有效 .h3cc（不存在/指纹不匹配/损坏），本次从头生成")
+                }
+            }
             // 方案 C：只要有二采（阶段2 或 Apple 超分）就建内存直通桥（generateVideo 内部把 stage1
             // 解码像素交给它，不落盘；随后由二采通道按需消费）；stage1 落盘统一 ProRes 422 .mov
             //（2026-09-19：直出/无二采时一采即最终产物，h264 → ProRes 提升最终输出质量）
@@ -414,7 +447,15 @@ final class GenerationQueue: ObservableObject {
                 //   故 Apple 超分开启时保留解码（skip=false），只省 LTX 编码那一步。
                 //   参数顺序须与函数声明一致（两者均位于签名末位）。
                 h3ToLTXAdapter: h3Adapter,
-                adapterSkipH3Decode: !appleSROn
+                adapterSkipH3Decode: !appleSROn,
+                // ★ 尾帧延续（.h3cc）：续接源三元组（前置 .h3cc load 结果，nil = 从头）、
+                //   本节点落盘开关 / 缓存根 / 被消费前置 ID（生成成功后幂等删除）/ 本节点 ID。
+                continuationSource: continuationSource,
+                tailFrameEnabled: task.h3TailFrameEnabled,
+                continuationCacheRoot: contCacheRoot,
+                continuationConsumedSourceID: task.h3ChainSourceID,
+                continuationNodeID: task.nodeID,
+                continuationBranchID: task.h3ChainBranchID
             )
             pipelineLog("H3 视频生成完成（stage1）：\(stage1Path)")
             guard stage2On || appleSROn else {

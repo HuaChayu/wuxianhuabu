@@ -334,6 +334,19 @@ struct NodeCanvasView: View {
         .mediaDropReceiver(store: store) { location in
             Optional(viewToCanvas(location, offset: store.offset, zoom: store.zoom))
         }
+        // 画布级临时提示（底部黑胶囊，自动消失）：连线限制等即时反馈
+        .overlay(alignment: .bottom) {
+            if let msg = store.toastMessage {
+                Text(msg)
+                    .font(.subheadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .background(Capsule().fill(Color.black.opacity(0.75)))
+                    .padding(.bottom, 40)
+                    .transition(.opacity)
+            }
+        }
     }
     
     // 加号拖拽中：节点本地坐标 → 屏幕坐标，公共入口更新临时连线 + 命中检测（实现见下方 updateConnectDrag）
@@ -490,6 +503,31 @@ func finishConnectDrag(screenPos: CGPoint, fromNodeID: UUID, side: ConnectSide, 
         return true
     }
     // 连线方向固定为 输出 → 输入（fromNodeID 是普通节点；目标可能是组内多个节点）
+    // ★ 视频→视频唯一连线限制：被拖出方是视频节点 && 目标是视频节点时，
+    //   若被拖出方已连过 ≥1 个视频目标则取消整次建连并提示（避免视频节点连多个视频节点）。
+    let fromNodeType = store.nodes.first { $0.id == fromNodeID }?.type
+    if fromNodeType == .video {
+        let hasVideoTarget = targetIDs.contains { tid in
+            store.nodes.first { $0.id == tid }?.type == .video
+        }
+        if hasVideoTarget {
+            let existingVideoCount = store.connections.filter { conn in
+                conn.fromID == fromNodeID
+                    && (store.nodes.first { $0.id == conn.toID }?.type == .video)
+            }.count
+            if existingVideoCount >= 1 {
+                store.toastMessage = "视频只能连到一个视频"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if store.toastMessage == "视频只能连到一个视频" {
+                        store.toastMessage = nil
+                    }
+                }
+                debugLog("连线拖拽结束：视频节点 \(fromNodeID) 已连 \(existingVideoCount) 个视频目标，取消本次视频连线")
+                store.draggingConnection = nil
+                return true
+            }
+        }
+    }
     let newConnections: [NodeConnection] = targetIDs.compactMap { targetID in
         guard targetID != fromNodeID else { return nil }
         let fromID: UUID

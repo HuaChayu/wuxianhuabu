@@ -818,7 +818,11 @@ struct CanvasView: View {
             videoWidth: size.width,
             videoHeight: size.height,
             duration: duration,
-            model: node?.model ?? .ltx25Distill
+            model: node?.model ?? .ltx25Distill,
+            // ★ 尾帧延续（.h3cc）链路（2026-09-20 重装）：透传本节点开关 + 前置延续源 ID
+            //   （连接顺序第一条入边 from.type == .video && from.tailFrameEnabled，队列端据此 load 前置缓存）
+            h3TailFrameEnabled: node?.tailFrameEnabled ?? true,
+            h3ChainSourceID: store.h3ChainSourceID(for: nodeID)
         )
         GenerationQueue.shared.enqueue(task)
     }

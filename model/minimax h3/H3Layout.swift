@@ -307,15 +307,18 @@ public final class PackedLayout {
     }
 
     public convenience init(textLen: UInt32, latentT: UInt32, latentH: UInt32, latentW: UInt32,
-                            audioT: UInt32, keyframes: [KeyframeAnchor], frameCount: UInt32) {
+                            audioT: UInt32, keyframes: [KeyframeAnchor], frameCount: UInt32,
+                            preCondRows: UInt32 = 0) {
         self.init(textLen: textLen, latentT: latentT, latentH: latentH, latentW: latentW,
-                  audioT: audioT, keyframes: keyframes, frameCount: frameCount, refs: [])
+                  audioT: audioT, keyframes: keyframes, frameCount: frameCount, refs: [],
+                  preCondRows: preCondRows)
     }
 
     /// Full layout construction (text + fl2va keyframe rows + ref2va blocks +
     /// target audio + target video), mirroring initFull.
     public convenience init(textLen: UInt32, latentT: UInt32, latentH: UInt32, latentW: UInt32,
-                audioT: UInt32, keyframes: [KeyframeAnchor], frameCount: UInt32, refs: [RefBlock]) {
+                audioT: UInt32, keyframes: [KeyframeAnchor], frameCount: UInt32, refs: [RefBlock],
+                preCondRows: UInt32 = 0) {
         self.init(seqLen: 0, segments: [], positionIds: [], imgUpdate: [], audioUpdate: [], textTags: [],
                   textLen: textLen, latentT: latentT, latentH: latentH, latentW: latentW, audioT: audioT)
         let area = sqrt(Double(latentH) * Double(latentW))
@@ -351,11 +354,11 @@ public final class PackedLayout {
             }
         }
 
-        let seqLen = textLen + nCond * frameRows + refImgRows + refAudioRows + nAudioRows + nVideoRows
+        let seqLen = textLen + preCondRows + nCond * frameRows + refImgRows + refAudioRows + nAudioRows + nVideoRows
         var segments: [Segment] = []
         segments.reserveCapacity(Int(3 + nCond + refSegments))
         var positionIds = [Double](repeating: 0, count: Int(seqLen) * 3)
-        var imgUpdate = [Bool](repeating: false, count: Int(nCond * frameRows + refImgRows + nVideoRows))
+        var imgUpdate = [Bool](repeating: false, count: Int(preCondRows + nCond * frameRows + refImgRows + nVideoRows))
         var audioUpdate = [Bool](repeating: false, count: Int(refAudioRows + nAudioRows))
 
         var row: UInt32 = 0
@@ -369,6 +372,23 @@ public final class PackedLayout {
 
         // Cursor shared by the target streams.
         var cursor = Double(textLen)
+
+        // 前置条件段（上游延续节点的干净 condRows，直接拼入）：共享目标网格，
+        // t 与 first keyframe 同起点 cursor，行内 (h,w) 按网格循环填充。
+        if preCondRows > 0 {
+            segments.append(Segment(start: row, end: row + preCondRows, kind: .cond))
+            var written: UInt32 = 0
+            while written < preCondRows {
+                let chunk = min(frameRows, preCondRows - written)
+                writeFrameGrid(&positionIds, row: row + written, t: cursor, hAxis: hAxis, wAxis: wAxis)
+                written += chunk
+            }
+            for _ in 0..<Int(preCondRows) {
+                imgUpdate[imgRow] = false
+                imgRow += 1
+            }
+            row += preCondRows
+        }
 
         // fl2va keyframe condition rows, sharing the target spatial grid.
         for anchor in keyframes {
