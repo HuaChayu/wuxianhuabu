@@ -81,6 +81,7 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				5A5E5792305FB95D00DF476E /* 演示&启动画面 */,
 				5A5E54DD305EA9FC00DF476E /* 模型下载.swift */,
 				5AA4CF8730484ECB0044BADF /* 服务器.swift */,
 				5A21C637303444A60015B325 /* 图标预览.swift */,
@@ -100,7 +101,6 @@
 				5A31860630331AFC004031FC /* 快捷键.swift */,
 				5AD7A09830358BF8007525F8 /* 接收逻辑.swift */,
 				5AD7A09930358BF8007525F8 /* 媒体播放.swift */,
-				5A5E513F305E881400DF476E /* 开篇.mov */,
 			);
 			sourceTree = "<group>";
 		};
@@ -110,6 +110,14 @@
 				000000000000000000000120 /* 无限画布.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		5A5E5792305FB95D00DF476E /* 演示&启动画面 */ = {
+			isa = PBXGroup;
+			children = (
+				5A5E513F305E881400DF476E /* 开篇.mov */,
+			);
+			path = "演示&启动画面";
 			sourceTree = "<group>";
 		};
 		5ACA61F4302EFB4700C0EF7D /* skill */ = {

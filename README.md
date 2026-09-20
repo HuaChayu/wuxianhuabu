@@ -17,7 +17,7 @@ AIGC:
 
 ## 演示视频
 
-<video src="开篇.mp4" controls="controls" width="720" preload="metadata"></video>
+<img src="演示%26启动画面/开篇.gif" width="640" alt="开篇演示">
 
 ## 核心特性
 
