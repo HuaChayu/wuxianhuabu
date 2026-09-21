@@ -246,6 +246,9 @@ public struct Segment {
 
 public enum KeyframeAnchor {
     case first, last
+    /// 续接锚点（2026-09-21）：t 为相对时间轴起点（cursor）的 latent 时间偏移（0 = 首帧）。
+    /// 前置尾段每 latent step 一个锚点，ComfyUI 式 never-denoised 条件行。
+    case at(Double)
 }
 
 /// One ref2va reference block, in request order (images → videos → standalone
@@ -316,8 +319,12 @@ public final class PackedLayout {
 
     /// Full layout construction (text + fl2va keyframe rows + ref2va blocks +
     /// target audio + target video), mirroring initFull.
+    /// - Parameter contRefs: 续接前置节点的 refImg 块（按各自参考图网格重建，
+    ///   解决 ref2va 续接条件行错配目标视频网格的位置编码问题），
+    ///   行序紧接 keyframes 之后、本节点 refs 之前。
     public convenience init(textLen: UInt32, latentT: UInt32, latentH: UInt32, latentW: UInt32,
                 audioT: UInt32, keyframes: [KeyframeAnchor], frameCount: UInt32, refs: [RefBlock],
+                contRefs: [RefBlock] = [],
                 preCondRows: UInt32 = 0) {
         self.init(seqLen: 0, segments: [], positionIds: [], imgUpdate: [], audioUpdate: [], textTags: [],
                   textLen: textLen, latentT: latentT, latentH: latentH, latentW: latentW, audioT: audioT)
@@ -329,6 +336,24 @@ public final class PackedLayout {
         let nCond = UInt32(keyframes.count)
         let nAudioRows = audioT * 2
         let nVideoRows = latentT * frameRows
+
+        // Continuation refImg row budget (image blocks only; v3 续接前置均为参考图块).
+        var contRefRows: UInt32 = 0
+        var contRefAudioRows: UInt32 = 0
+        for b in contRefs {
+            switch b.kind {
+            case .image:
+                contRefRows += refFrameRows(b)
+            case .audio:
+                // v3 音频续接（2026-09-21）：前置尾段音频 latent 作 refAudio 段（never-denoised）
+                if b.audioT > 0 {
+                    contRefAudioRows += b.audioT * 2
+                }
+            case .video:
+                // 续接前置缓存只落参考图 latent 行；视频块不在此路径（防御性跳过）
+                contRefRows += b.kind == .video ? b.latentT * refFrameRows(b) : 0
+            }
+        }
 
         // Reference row budgets.
         var refImgRows: UInt32 = 0
@@ -354,12 +379,12 @@ public final class PackedLayout {
             }
         }
 
-        let seqLen = textLen + preCondRows + nCond * frameRows + refImgRows + refAudioRows + nAudioRows + nVideoRows
+        let seqLen = textLen + preCondRows + nCond * frameRows + contRefRows + refImgRows + refAudioRows + contRefAudioRows + nAudioRows + nVideoRows
         var segments: [Segment] = []
-        segments.reserveCapacity(Int(3 + nCond + refSegments))
+        segments.reserveCapacity(Int(3 + nCond + refSegments + UInt32(contRefs.count)))
         var positionIds = [Double](repeating: 0, count: Int(seqLen) * 3)
-        var imgUpdate = [Bool](repeating: false, count: Int(preCondRows + nCond * frameRows + refImgRows + nVideoRows))
-        var audioUpdate = [Bool](repeating: false, count: Int(refAudioRows + nAudioRows))
+        var imgUpdate = [Bool](repeating: false, count: Int(preCondRows + nCond * frameRows + contRefRows + refImgRows + nVideoRows))
+        var audioUpdate = [Bool](repeating: false, count: Int(contRefAudioRows + refAudioRows + nAudioRows))
 
         var row: UInt32 = 0
         var imgRow = 0
@@ -390,7 +415,7 @@ public final class PackedLayout {
             row += preCondRows
         }
 
-        // fl2va keyframe condition rows, sharing the target spatial grid.
+        // keyframe condition rows (fl2va + 续接前置尾段锚点), sharing the target spatial grid.
         for anchor in keyframes {
             let condT: Double
             switch anchor {
@@ -400,6 +425,8 @@ public final class PackedLayout {
                 var spans: Double = 0
                 for k in 0..<Int(latentT) { spans += videoTSpan(k) }
                 condT = cursor + spans - H3Const.frameRescale
+            case .at(let t):
+                condT = cursor + t
             }
             segments.append(Segment(start: row, end: row + frameRows, kind: .cond))
             writeFrameGrid(&positionIds, row: row, t: condT, hAxis: hAxis, wAxis: wAxis)
@@ -413,6 +440,42 @@ public final class PackedLayout {
 
         let targetWLow = wAxis[0]
         let targetWHigh = wAxis[wAxis.count - 1]
+
+        // 续接前置 refImg 块（v3）：按各自参考图网格重建位置编码（而非目标视频网格），
+        // 解决 ref2va 续接前置条件行网格错位导致画面被参考图特征主导的问题。
+        // t 从 cursor 起依次递增，与下方本节点 refs 共用同一时间游标。
+        for b in contRefs {
+            switch b.kind {
+            case .image:
+                let g = refGrid(b)
+                segments.append(Segment(start: row, end: row + g.rows, kind: .refImg))
+                writeFrameGrid(&positionIds, row: row, t: cursor, hAxis: g.hAxis, wAxis: g.wAxis)
+                for _ in 0..<Int(g.rows) {
+                    imgUpdate[imgRow] = false
+                    imgRow += 1
+                }
+                row += g.rows
+                cursor += 1.0
+            case .audio:
+                // v3 音频续接（2026-09-21）：前置尾段音频 latent 作 refAudio 段注入 audio stream，
+                // audioUpdate=false → never-denoised（只被注意力看到，不出现在输出）。
+                if b.audioT > 0 {
+                    let n = b.audioT * 2
+                    segments.append(Segment(start: row, end: row + n, kind: .refAudio))
+                    writeAudioGrid(&positionIds, row: row, cursor: cursor, audioT: b.audioT,
+                                   wLow: targetWLow, wHigh: targetWHigh)
+                    for _ in 0..<Int(n) {
+                        audioUpdate[audioRow] = false
+                        audioRow += 1
+                    }
+                    row += n
+                }
+                cursor += Double(b.audioT)
+            case .video:
+                // 续接前置缓存只落参考图 latent 行；视频块不在此路径（防御性跳过）
+                break
+            }
+        }
 
         // ref2va blocks, in request order; each advances the cursor.
         for b in refs {
@@ -503,6 +566,13 @@ public final class PackedLayout {
     public var videoSegment: Segment { segments[segments.count - 1] }
     /// The target audio segment — second to last by construction.
     public var audioSegment: Segment { segments[segments.count - 2] }
+    /// 条件行总行数（preCond + keyframes + contRefs + refs 的 refImg 行）。
+    /// 必须与注入的 condRows 行数严格一致（续接错位回归防线）。
+    public var condSegmentRows: UInt32 {
+        segments.reduce(UInt32(0)) { acc, seg in
+            (seg.kind == .cond || seg.kind == .refImg) ? acc + (seg.end - seg.start) : acc
+        }
+    }
 }
 
 struct RefGrid {

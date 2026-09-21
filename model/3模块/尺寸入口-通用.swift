@@ -78,6 +78,23 @@ func nearestRatio(for width: Int, height: Int) -> CanvasStore.Ratio {
     } ?? .ratio16_9
 }
 
+/// 实际像素尺寸 → 最近清晰度档位（与 videoResolution 正向口径反查）：
+/// - standard：最长边 512 基准，短边 ≤ 512（1:1 时最大 512）
+/// - p720 / p1080：短边对齐 720→768、1080→1088
+/// 按短边与各档位短边基准的距离取最近档位；宽高任一非正 → standard。
+func videoQuality(for width: Int, height: Int) -> VideoQuality {
+    guard width > 0, height > 0 else { return .standard }
+    let shortSide = min(width, height)
+    let candidates: [(quality: VideoQuality, shortSide: Int)] = [
+        (.standard, 512),                  // standard 最长边 512，短边最大 512（1:1）
+        (.p720, alignedShortSide(720)),    // 768
+        (.p1080, alignedShortSide(1080)),  // 1088
+    ]
+    return candidates.min {
+        abs($0.shortSide - shortSide) < abs($1.shortSide - shortSide)
+    }?.quality ?? .standard
+}
+
 /// 视频生成目标尺寸：有图按图最接近比例查表；无图按传入比例（nil → 16:9）。
 /// 供 UI 收集阶段（startVideoGeneration）与管线兜底共用。
 func videoSize(imageWidth: Int? = nil, imageHeight: Int? = nil, ratio: CanvasStore.Ratio? = nil, quality: VideoQuality = .standard) -> (width: Int, height: Int) {

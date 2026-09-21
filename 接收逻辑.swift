@@ -27,11 +27,11 @@ func assetCategory(for url: URL) -> AssetCategory {
 ///   - urls: 拖入的文件 URL 列表
 ///   - store: 画布 store；nil 表示总资产库区域（直接导入资产库），非 nil 表示画布区域（导入成节点）
 ///   - nodePosition: 画布区域建节点的落点（视图坐标；nil 用默认位置）
-func receiveDroppedMedia(urls: [URL], store: CanvasStore?, nodePosition: CGPoint? = nil) {
+func receiveDroppedMedia(urls: [URL], store: CanvasStore?, nodePosition: CGPoint? = nil) async {
     guard !urls.isEmpty else { return }
     var index = 0
     for url in urls {
-        guard let thumb = thumbnailImage(for: url) else { continue }
+        guard let thumb = await thumbnailImage(for: url) else { continue }
         let category = assetCategory(for: url)
         let isImage = category == .image
         // 画布区域：节点在落点基础上斜向错开，避免重叠
@@ -67,7 +67,13 @@ struct MediaDropReceiver: ViewModifier {
     func body(content: Content) -> some View {
         content
             .dropDestination(for: URL.self) { urls, location in
-                receiveDroppedMedia(urls: urls, store: store, nodePosition: nodePositionProvider(location))
+                // 拖放闭包需同步返回：取帧/解码全部放后台（receiveDroppedMedia 内部 await thumbnailImage），
+                // 回主线程仅做 importAsset / UI 更新，不阻塞拖放事件处理线程
+                let targetStore = store
+                let pos = nodePositionProvider(location)
+                Task { @MainActor in
+                    await receiveDroppedMedia(urls: urls, store: targetStore, nodePosition: pos)
+                }
                 return true
             }
     }

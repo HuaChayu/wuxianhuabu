@@ -161,11 +161,8 @@ final class AppSettings: ObservableObject {
             videoUseAppleSR = true
         }
     }
-    // LTX-2.5 扩散视频解码器开关：true=VAE 解码改用扩散视频解码器（vaeDiffusionDecoder 权重）；
-    // false=使用原卷积 VAE 解码器（vaeDecoder）。默认 false（扩散解码器内存/耗时显著更高）
-    @Published var videoUseDiffusionDecoder: Bool {
-        didSet { defaults.set(videoUseDiffusionDecoder, forKey: "videoUseDiffusionDecoder") }
-    }
+    // （2026-09-21：扩散视频解码器设置项已移除，videoUseDiffusionDecoder 字段删除，
+    //  代码侧 ltx2.5-(ltx专属).swift 中 useDiffDecoder 已硬编码 false，固定走卷积 VAE）
 
     // ★ 第三套二采·Apple VideoToolbox 超分（VTSuperResolutionScaler / VTFrameProcessor）总开关：
     // true=H3 stage1 出的内存态视频**优先**走 Apple 超分通道（并存的 CQ/IC 二采保留为失败回退）；
@@ -234,7 +231,7 @@ final class AppSettings: ObservableObject {
         // 需要回退原 IC 二采时在本页关闭本项即可（两通道并存、互斥、CQ 优先）。
         let cq = d.object(forKey: "videoUseCQEnhancer") as? Bool ?? true
         videoUseCQEnhancer = cq
-        videoUseDiffusionDecoder = d.object(forKey: "videoUseDiffusionDecoder") as? Bool ?? false
+        // （2026-09-21：videoUseDiffusionDecoder 设置字段已移除，不再读取）
         // ★ 第三套二采·Apple 超分：默认开启（运行期不支持/失败会自动回退 CQ/IC 二采，故默认开启不影响可用性）；
         // 倍率固定 ×4（面板已无倍率选择），质量默认 1=normal，预计算光流默认关（耗时/显存更高）。
         let appleSR = d.object(forKey: "videoUseAppleSR") as? Bool ?? true
@@ -648,18 +645,7 @@ struct PreferencesView: View {
                         // 固定默认开启（AppSettings 默认 true），权重缺失/形状不符/推理失败自动回退原像素桥路径；
                         // 需要关闭时用环境变量 LTX_H3_ADAPTER=0（与解耦等底层开关同一处理口径）。
 
-                        // 扩散视频解码器开关：true=VAE 解码改用扩散视频解码器（vaeDiffusionDecoder 权重）；
-                        // false=使用原卷积 VAE 解码器（vaeDecoder）。默认 false（扩散解码器内存/耗时显著更高）
-                        Toggle(isOn: $settings.videoUseDiffusionDecoder) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("扩散视频解码器")
-                                    .font(.system(size: 13))
-                                Text("开启：视频解码改用扩散解码器（vaeDiffusionDecoder），内存/耗时更高")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .toggleStyle(.checkbox)
+                        // （2026-09-21：「扩散视频解码器」设置项已移除，固定使用卷积 VAE 解码）
                     }
                     .padding(.leading, 12)
                 }

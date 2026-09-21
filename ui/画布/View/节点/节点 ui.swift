@@ -701,6 +701,10 @@ struct NodePromptBar: View {
     @Binding var text: String
     var onExpand: () -> Void
     var onSend: () -> Void
+    /// 尾帧续接链路展示信息：非 nil = 本视频节点处于尾帧续接链路（h3ChainSourceID 命中且前置
+    /// 视频节点有实际像素尺寸），生成尺寸强制跟随前置视频；尺寸档位/比例下拉改为展示前置视频
+    /// 实际档位/比例并禁用（延续前置视频，仅告知不可改）
+    var chainDisplayInfo: CanvasStore.ChainVideoDisplayInfo? = nil
     var onRatioChange: (CanvasStore.Ratio) -> Void
     /// 视频节点模型选择回调
     var onModelChange: (VideoModel) -> Void = { _ in }
@@ -813,7 +817,7 @@ struct NodePromptBar: View {
                         items: CanvasStore.Ratio.allCases,
                         isSelected: { node.ratio == $0 },
                         displayName: { $0.displayName },
-                        disabled: hasValidImageInput,
+                        disabled: hasValidImageInput || chainDisplayInfo != nil,
                         onSelect: { ratio in
                             debugLog("节点输入框：选择私有比例 \(ratio.displayName)")
                             onRatioChange(ratio)
@@ -821,7 +825,7 @@ struct NodePromptBar: View {
                     ) {
                         HStack(spacing: 4) {
                             Image(systemName: "crop")
-                            Text(node.ratio?.displayName ?? currentGlobalRatio.displayName)
+                            Text(chainDisplayInfo?.ratio.displayName ?? node.ratio?.displayName ?? currentGlobalRatio.displayName)
                         }
                         .font(.system(size: 12))
                         .foregroundColor(.secondary)
@@ -834,6 +838,7 @@ struct NodePromptBar: View {
                             items: VideoQuality.allCases,
                             isSelected: { node.quality == $0 },
                             displayName: { $0.displayName },
+                            disabled: chainDisplayInfo != nil,
                             onSelect: { q in
                                 debugLog("节点输入框：视频节点选择档位 \(q.displayName)")
                                 onQualityChange(q)
@@ -841,7 +846,7 @@ struct NodePromptBar: View {
                         ) {
                             HStack(spacing: 4) {
                                 Image(systemName: "rectangle.arrowtriangle.2.inward")
-                                Text(node.quality.displayName)
+                                Text(chainDisplayInfo?.quality.displayName ?? node.quality.displayName)
                             }
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
@@ -1005,6 +1010,10 @@ struct ExpandedNodePromptView: View {
     @Binding var text: String
     var onClose: () -> Void
     var onSend: () -> Void
+    /// 尾帧续接链路展示信息：非 nil = 本视频节点处于尾帧续接链路（h3ChainSourceID 命中且前置
+    /// 视频节点有实际像素尺寸），生成尺寸强制跟随前置视频；尺寸档位/比例下拉改为展示前置视频
+    /// 实际档位/比例并禁用（延续前置视频，仅告知不可改）
+    var chainDisplayInfo: CanvasStore.ChainVideoDisplayInfo? = nil
     var onRatioChange: (CanvasStore.Ratio) -> Void
     /// 视频节点模型选择回调
     var onModelChange: (VideoModel) -> Void = { _ in }
@@ -1097,7 +1106,7 @@ struct ExpandedNodePromptView: View {
                             items: CanvasStore.Ratio.allCases,
                             isSelected: { node.ratio == $0 },
                             displayName: { $0.displayName },
-                            disabled: hasValidImageInput,
+                            disabled: hasValidImageInput || chainDisplayInfo != nil,
                             onSelect: { ratio in
                                 debugLog("展开输入框：选择私有比例 \(ratio.displayName)")
                                 onRatioChange(ratio)
@@ -1105,7 +1114,7 @@ struct ExpandedNodePromptView: View {
                         ) {
                             HStack(spacing: 4) {
                                 Image(systemName: "crop")
-                                Text(node.ratio?.displayName ?? currentGlobalRatio.displayName)
+                                Text(chainDisplayInfo?.ratio.displayName ?? node.ratio?.displayName ?? currentGlobalRatio.displayName)
                             }
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
@@ -1118,6 +1127,7 @@ struct ExpandedNodePromptView: View {
                                 items: VideoQuality.allCases,
                                 isSelected: { node.quality == $0 },
                                 displayName: { $0.displayName },
+                                disabled: chainDisplayInfo != nil,
                                 onSelect: { q in
                                     debugLog("展开输入框：视频节点选择档位 \(q.displayName)")
                                     onQualityChange(q)
@@ -1125,7 +1135,7 @@ struct ExpandedNodePromptView: View {
                             ) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "rectangle.arrowtriangle.2.inward")
-                                    Text(node.quality.displayName)
+                                    Text(chainDisplayInfo?.quality.displayName ?? node.quality.displayName)
                                 }
                                 .font(.system(size: 12))
                                 .foregroundColor(.secondary)

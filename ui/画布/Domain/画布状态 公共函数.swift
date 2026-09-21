@@ -115,20 +115,20 @@ func fileKind(of url: URL) -> UploadFileKind {
 
 // MARK: - 资产缩略图生成（图片直接加载 / 视频取首帧 / 音频占位图）
 
-/// 同步提取视频指定时刻的帧图（copyCGImage 已弃用，用异步 API + 信号量保持同步语义）
-func syncFrameImage(from generator: AVAssetImageGenerator, at time: CMTime) -> CGImage? {
-    let semaphore = DispatchSemaphore(value: 0)
-    var result: CGImage?
-    generator.generateCGImageAsynchronously(for: time) { cgImage, _, _ in
-        result = cgImage
-        semaphore.signal()
+/// 异步提取视频指定时刻的帧图（generateCGImageAsynchronously + continuation）。
+/// 可在任意线程调用，内部不持有信号量、绝不阻塞调用线程；
+/// 主线程 await 时挂起让出，解码完成由回调恢复，彻底消除主线程等待低 QoS 解码线程的优先级反转。
+/// 替代已删除的 syncFrameImage（旧实现用 DispatchSemaphore.wait() 同步阻塞）。
+func frameImage(from generator: AVAssetImageGenerator, at time: CMTime) async -> CGImage? {
+    await withCheckedContinuation { continuation in
+        generator.generateCGImageAsynchronously(for: time) { cgImage, _, _ in
+            continuation.resume(returning: cgImage)
+        }
     }
-    semaphore.wait()
-    return result
 }
 
-/// 从文件 URL 生成资产缩略图：图片直接加载；视频取首帧；音频生成占位图
-func thumbnailImage(for url: URL) -> NSImage? {
+/// 从文件 URL 生成资产缩略图：图片直接加载；视频异步取首帧；音频生成占位图
+func thumbnailImage(for url: URL) async -> NSImage? {
     switch fileKind(of: url) {
     case .image:
         return NSImage(contentsOf: url)
@@ -138,7 +138,7 @@ func thumbnailImage(for url: URL) -> NSImage? {
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 800, height: 800)
         let time = CMTime(seconds: 0, preferredTimescale: 600)
-        if let cgImage = syncFrameImage(from: generator, at: time) {
+        if let cgImage = await frameImage(from: generator, at: time) {
             return NSImage(cgImage: cgImage, size: .zero)
         }
         return nil
@@ -705,7 +705,7 @@ extension CanvasStore {
     
     /// MiniMax H3 规则（ref2va 多参考条件，对齐 H3Const：9 图 / 3 视频 / 3 音频 / 总数 12）：
     /// - 图片/角色/场景节点 → 图片条件，最多 9 张；
-    /// - 开尾帧的视频节点视作图片（沿用 ltx25Distill 的 tailFrameImagePath 提取末帧）；
+    /// - 开尾帧的视频节点 → 不再作为参考条件（2026-09-20 移除尾帧图机制：画面参考由 latent 窗口续接承担）；
     ///   未开尾帧的视频节点 → 参考视频条件，最多 3 个；
     /// - 音频节点 → 参考音频条件，最多 3 个；
     /// - 三类总数上限 12，超出部分记为无效线；文本等其它类型不判不禁（不参与条件）。
@@ -732,16 +732,10 @@ extension CanvasStore {
                 }
             case .video:
                 if fromNode.tailFrameEnabled {
-                    // 开尾帧视频节点视作图片：提取最后一帧为临时 PNG 作为图片条件
-                    if totalCount < H3Const.maxRefTotal, imageCandidates.count < H3Const.maxRefImages {
-                        if let path = tailFrameImagePath(for: fromNode) {
-                            imageCandidates.append((fromNode.position.y, path))
-                        } else {
-                            result.invalidConnectionIDs.insert(conn.id)
-                        }
-                    } else {
-                        result.invalidConnectionIDs.insert(conn.id)   // 图片/总数超限
-                    }
+                    // 开尾帧视频节点：不再作为 H3 参考条件（2026-09-20 移除尾帧图机制）。
+                    // 画面延续由 latent 窗口续接承担（h3ChainSourceID / .h3cc），此处不收集、
+                    // 不标禁用——保持连线有效语义（连续视频模式发光通道依赖非 invalid 判定）。
+                    continue
                 } else {
                     // 未开尾帧视频节点 → 参考视频条件（H3 最多 3 个）
                     if totalCount < H3Const.maxRefTotal, videoCandidates.count < H3Const.maxRefVideos {
@@ -811,32 +805,85 @@ extension CanvasStore {
         return result
     }
     
-    /// 开尾帧视频节点 → 输出图条件：提取视频最后一帧为 PNG（写系统临时目录，不占用资产库）。
+    /// 开尾帧视频节点 → 输出图条件：读取缓存的开尾帧 PNG（后台解码完成后写入，见 triggerTailFrameLoad）。
     /// 缓存键用资产库文件名（唯一），同名覆盖，避免重复发送累积临时文件。
+    /// 本函数只读缓存、立即返回，绝不在此同步解码：它被 inputValidity(for:) 在 SwiftUI body /
+    /// 渲染热路径调用，同步解码会阻塞主线程等待低 QoS 解码线程（优先级反转）。
     private func tailFrameImagePath(for videoNode: CanvasNode) -> String? {
         guard let fileName = mediaFileName(for: videoNode) else { return nil }
         let srcURL = assetLibraryURL.appendingPathComponent(fileName)
         guard FileManager.default.fileExists(atPath: srcURL.path) else { return nil }
-        let asset = AVURLAsset(url: srcURL)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 2048, height: 2048)
-        // 取最后一帧：末尾回退 1/30s，避免请求越界失败
-        let tailTime = CMTime(seconds: max(0, asset.duration.seconds - 1.0 / 30.0), preferredTimescale: 600)
-        guard let cg = syncFrameImage(from: generator, at: tailTime) else { return nil }
-        let rep = NSBitmapImageRep(cgImage: cg)
-        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        // 缓存 key：资产库文件名（资产 URL 唯一标识）+ 尾帧语义（时刻 = 末帧回退 1/30s，同资产恒定）+ 解码尺寸
+        let key = "\(fileName)|tail|2048"
+        if let cached = tailFrameCache.object(forKey: key as NSString) {
+            return cached as String
+        }
+        // 未命中：仅发起后台解码（in-flight 去重），完成后回主线程补缓存并触发画布刷新重算
+        triggerTailFrameLoad(key: key, fileName: fileName, srcURL: srcURL)
+        return nil
+    }
+
+    /// 后台解码开尾帧并写临时 PNG；完成后回主线程写缓存、失效输入判定缓存并触发视图刷新。
+    /// 幂等：同 key 已在途时直接返回（渲染热路径可能每帧调用本函数）。
+    private func triggerTailFrameLoad(key: String, fileName: String, srcURL: URL) {
+        guard !tailFrameInFlight.contains(key) else { return }
+        tailFrameInFlight.insert(key)
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("无限画布尾帧", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let stem = (fileName as NSString).deletingPathExtension
         let outURL = dir.appendingPathComponent("\(stem)_tail.png")
-        do {
-            try png.write(to: outURL)
-            return outURL.path
-        } catch {
-            return nil
+        // 临时目录残留（进程重启后文件仍在但内存缓存丢失）：直接补缓存并刷新，避免重复解码。
+        // 注意：本函数可能被 inputValidity(for:) 在 SwiftUI body / 渲染热路径同步调用，
+        // 严禁在此同步执行 objectWillChange.send()（会触发 "Publishing changes from within
+        // view updates" / "Modifying state during view update"），必须延迟到视图更新之外。
+        if FileManager.default.fileExists(atPath: outURL.path) {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                tailFrameCache.setObject(outURL.path as NSString, forKey: key as NSString)
+                tailFrameInFlight.remove(key)
+                self.invalidateAndRefreshTailFrame()
+            }
+            return
         }
+        Task.detached(priority: .utility) { [weak self] in
+            // 后台线程：创建 asset、取时长、解码末帧、写 PNG，全程不碰主线程
+            let asset = AVURLAsset(url: srcURL)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 2048, height: 2048)
+            // 取最后一帧：末尾回退 1/30s，避免请求越界失败
+            let tailTime = CMTime(seconds: max(0, asset.duration.seconds - 1.0 / 30.0), preferredTimescale: 600)
+            let cg = await frameImage(from: generator, at: tailTime)
+            var path: String?
+            if let cg {
+                let rep = NSBitmapImageRep(cgImage: cg)
+                if let png = rep.representation(using: .png, properties: [:]) {
+                    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                    try? png.write(to: outURL)
+                    path = outURL.path
+                }
+            }
+            await MainActor.run {
+                if let path {
+                    tailFrameCache.setObject(path as NSString, forKey: key as NSString)
+                }
+                tailFrameInFlight.remove(key)
+                // 与临时残留分支一致：刷新（publish）必须延迟到 SwiftUI 视图更新周期之外。
+                // 虽在 MainActor.run 中执行，但后台任务完成回调可能落在更新事务窗口内，
+                // 统一再派发到主队列下一轮，避免 objectWillChange.send() 触发
+                // "Publishing changes from within view updates" / "Modifying state during view update"。
+                DispatchQueue.main.async { [weak self] in
+                    self?.invalidateAndRefreshTailFrame()
+                }
+            }
+        }
+    }
+
+    /// 开尾帧缓存就绪（或失败）后：失效输入判定缓存并触发画布刷新，
+    /// 让 body 重算时读到新缓存；解码失败则下次渲染再试（幂等，不卡主线程）。
+    private func invalidateAndRefreshTailFrame() {
+        inputValidityCache = nil
+        objectWillChange.send()
     }
 
     /// 来源节点媒体文件绝对路径（nil = 空节点无内容）
@@ -857,6 +904,15 @@ extension CanvasStore {
 // MARK: - H3 尾帧延续前置源（2026-09-20 重装）
 
 extension CanvasStore {
+    /// 尾帧续接链路的展示信息：视频节点处于续接链路时，尺寸档位/比例下拉的显示与禁用依据。
+    /// 生成尺寸强制跟随前置视频实际像素，UI 侧仅展示反推出的档位与比例并禁用，避免用户误改。
+    struct ChainVideoDisplayInfo {
+        let pixelWidth: Int
+        let pixelHeight: Int
+        let quality: VideoQuality
+        let ratio: Ratio
+    }
+
     /// H3 视频节点的尾帧延续前置源：连接顺序第一条入边 from.type == .video && from.tailFrameEnabled
     ///（与发光连线共用 tailFrameEnabled 语义；nil = 无前置，首节点从头生成零回归）。
     func h3ChainSourceID(for videoNodeID: UUID) -> UUID? {
@@ -868,4 +924,50 @@ extension CanvasStore {
         }
         return nil
     }
+
+    /// 视频节点实际生成尺寸：读取资产库中该节点视频文件的视频轨道像素尺寸（含旋转校正）。
+    /// 续接链路尺寸跟随的前置实际尺寸来源——模型无关，且不依赖 .h3cc 是否已被消费侧删除；
+    /// 资产库文件为生成管线落盘后复制（attachGeneratedVideo），其像素尺寸即生成时 videoWidth/videoHeight。
+    /// 节点无媒体内容 / 文件缺失 / 非视频轨道 / 读取失败 → nil（调用方回退按比例计算）。
+    func actualVideoPixelSize(for videoNode: CanvasNode) -> (width: Int, height: Int)? {
+        guard let fileName = mediaFileName(for: videoNode) else { return nil }
+        let url = assetLibraryURL.appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+        let size = track.naturalSize.applying(track.preferredTransform)
+        let w = Int(abs(size.width).rounded())
+        let h = Int(abs(size.height).rounded())
+        guard w > 0, h > 0 else { return nil }
+        return (w, h)
+    }
+
+    /// 尾帧续接链路的展示信息：视频节点处于续接链路（h3ChainSourceID 命中）且前置视频节点有实际
+    /// 像素尺寸时返回非 nil，供 UI 将尺寸档位/比例下拉改为展示前置视频实际档位/比例并禁用；
+    /// 否则 nil（非续接节点保持现有逻辑）。
+    func chainVideoDisplayInfo(for node: CanvasNode) -> ChainVideoDisplayInfo? {
+        guard node.type == .video,
+              let sourceID = h3ChainSourceID(for: node.id),
+              let sourceNode = nodes.first(where: { $0.id == sourceID }),
+              let size = actualVideoPixelSize(for: sourceNode) else { return nil }
+        return ChainVideoDisplayInfo(
+            pixelWidth: size.width,
+            pixelHeight: size.height,
+            quality: videoQuality(for: size.width, height: size.height),
+            ratio: nearestRatio(for: size.width, height: size.height)
+        )
+    }
 }
+
+// ============================================================
+
+// MARK: - 开尾帧缓存（画布状态 公共函数.swift 文件级）
+
+/// 开尾帧 PNG 路径缓存：key = "资产文件名|tail|2048"（资产 URL + 尾帧时刻语义 + 解码尺寸）。
+/// NSCache 线程安全，主线程读写、后台解码完成后由 MainActor.run 写入。
+private let tailFrameCache = NSCache<NSString, NSString>()
+/// 进行中的开尾帧解码 key 集合（防重入：同资产只发起一次后台解码）。
+/// 仅在主线程读写：读发生在 SwiftUI body / 渲染热路径（tailFrameImagePath），
+/// 写在 triggerTailFrameLoad 主线程入口与 MainActor.run 完成回调中。
+private var tailFrameInFlight = Set<String>()
+

@@ -923,8 +923,10 @@ func vaeDecodeTest() -> String? {
         pipelineLog("❌ 内存不足，无法加载解码器（VAE 解码+升频器 约 1.7G），已拦截 VAE 解码")
         return nil
     }
-    // 扩散视频解码器开关（偏好设置 videoUseDiffusionDecoder）：true=扩散解码器替换卷积 VAE
-    let useDiffDecoder = AppSettings.shared.videoUseDiffusionDecoder
+    // 扩散视频解码器开关：偏好设置项已于 2026-09-21 移除（彻底弃用），此处强制 false 固定走卷积 VAE，
+    // 扩散解码分支保留仅便于未来恢复。恢复：改回 AppSettings.shared.videoUseDiffusionDecoder
+    //（并同步恢复 偏好设置.swift 的 @Published 字段、init 读取与设置页 Toggle）即可。
+    let useDiffDecoder = false // 原：AppSettings.shared.videoUseDiffusionDecoder（2026-09-21 强制关闭）
     let vaePath = useDiffDecoder ? CommonPaths.vaeDiffusionDecoder : CommonPaths.vaeDecoder
     let latentPath = outputVideoDirURL.appendingPathComponent("video_latent_final.npy").path
     guard let weights = try? MLX.loadArrays(url: URL(fileURLWithPath: vaePath)) else {

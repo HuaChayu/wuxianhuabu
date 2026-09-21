@@ -412,19 +412,23 @@ struct AssetManagementView: View {
     private func handleAssetImport(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            for url in urls {
-                let didStart = url.startAccessingSecurityScopedResource()
-                defer { if didStart { url.stopAccessingSecurityScopedResource() } }
-                guard let thumb = thumbnailImage(for: url) else { continue }
-                let kind = fileKind(of: url)
-                let isImage = kind == .image
-                importAsset(
-                    image: thumb,
-                    name: url.deletingPathExtension().lastPathComponent,
-                    category: pendingImportCategory,
-                    sourceURL: isImage ? url : nil,
-                    mediaSourceURL: isImage ? nil : url
-                )
+            // 取帧/解码放后台（thumbnailImage 内部 await frameImage），完成后回主线程入库；
+            // fileImporter 回调即主线程，Task @MainActor 保持 importAsset / UI 更新在主线程
+            let category = pendingImportCategory
+            Task { @MainActor in
+                for url in urls {
+                    let didStart = url.startAccessingSecurityScopedResource()
+                    defer { if didStart { url.stopAccessingSecurityScopedResource() } }
+                    guard let thumb = await thumbnailImage(for: url) else { continue }
+                    let isImage = fileKind(of: url) == .image
+                    importAsset(
+                        image: thumb,
+                        name: url.deletingPathExtension().lastPathComponent,
+                        category: category,
+                        sourceURL: isImage ? url : nil,
+                        mediaSourceURL: isImage ? nil : url
+                    )
+                }
             }
         case .failure:
             break

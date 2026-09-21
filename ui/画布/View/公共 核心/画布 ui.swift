@@ -270,9 +270,13 @@ struct CanvasView: View {
                 },
                 onExternalDrop: { urls, viewPos in
                     // Finder 拖入媒体文件：落点是视图坐标，先复用公共函数 viewToCanvas 换算为画布坐标再导入成节点，
-                    // 避免 importAsset 内部 canvasToView→addNode viewToCanvas 两次变换抵消导致节点偏离落点（平移/缩放后更明显）
+                    // 避免 importAsset 内部 canvasToView→addNode viewToCanvas 两次变换抵消导致节点偏离落点（平移/缩放后更明显）；
+                    // 取帧/解码放后台（receiveDroppedMedia 内部 await thumbnailImage），回主线程仅做建节点/更新 UI
                     let canvasPos = viewToCanvas(viewPos, offset: store.offset, zoom: store.zoom)
-                    receiveDroppedMedia(urls: urls, store: store, nodePosition: canvasPos)
+                    let targetStore = store
+                    Task { @MainActor in
+                        await receiveDroppedMedia(urls: urls, store: targetStore, nodePosition: canvasPos)
+                    }
                 },
                 onPlayButtonClick: { nodeID in
                     // 播放按钮点击：切换播放/停止（按钮只在已关联媒体文件的音频/视频节点上显示）
@@ -406,14 +410,18 @@ struct CanvasView: View {
             // 生成队列完成回调：把产物接入对应节点（图片 → attachGeneratedImage，视频 → attachGeneratedVideo）
             GenerationQueue.shared.onTaskResult = { task, outputPath in
                 guard let outputPath else { return }
-                switch task.kind {
-                case .image:
-                    attachGeneratedImage(to: task.nodeID, pngPath: outputPath, prompt: task.prompt)
-                case .video:
-                    attachGeneratedVideo(to: task.nodeID, mp4Path: outputPath, prompt: task.prompt)
-                    // 连续视频模式：视频完成后沿输出连线自动触发下游视频节点（禁用连线跳过，visited 防环）
-                    if store.continuousVideoMode {
-                        propagateContinuousVideo(from: task.nodeID, visited: [])
+                // 视频接入需后台取首帧（attachGeneratedVideo 内部 await frameImage），主线程挂起让出不阻塞；
+                // 完成后继续在主线程更新节点（Task @MainActor），连续视频传播保持在节点更新之后触发
+                Task { @MainActor in
+                    switch task.kind {
+                    case .image:
+                        self.attachGeneratedImage(to: task.nodeID, pngPath: outputPath, prompt: task.prompt)
+                    case .video:
+                        await self.attachGeneratedVideo(to: task.nodeID, mp4Path: outputPath, prompt: task.prompt)
+                        // 连续视频模式：视频完成后沿输出连线自动触发下游视频节点（禁用连线跳过，visited 防环）
+                        if self.store.continuousVideoMode {
+                            self.propagateContinuousVideo(from: task.nodeID, visited: [])
+                        }
                     }
                 }
             }
@@ -773,9 +781,32 @@ struct CanvasView: View {
         }
         // 模型专属阻断：H3 无任何有效条件输入时拒绝发送并给出明确原因
         if let reason = validity.errorMessage {
-            inputValidationErrors[nodeID] = reason
-            debugLog("视频生成：输入不满足模型要求，取消运行（\(reason)）")
-            return
+            // H3 链式放行（图空也放行）：有 .h3cc 走 latent 续接；无 .h3cc / 无上游开尾帧视频
+            // 统一回退为文本生成（文生视频），仅 toast 提示。
+            if let srcID = store.h3ChainSourceID(for: nodeID) {
+                let cacheRoot = "\(AppSettings.shared.canvasRootPath)/cache/h3-continuation"
+                let cachePath = cacheRoot + "/" + srcID.uuidString + ".h3cc"
+                if FileManager.default.fileExists(atPath: cachePath) {
+                    debugLog("视频生成：H3 无图条件但存在有效续接源（.h3cc），按 latent 续接继续")
+                } else {
+                    store.toastMessage = "上一个节点没有latent 且无条件图 本次为文本生成"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        if store.toastMessage == "上一个节点没有latent 且无条件图 本次为文本生成" {
+                            store.toastMessage = nil
+                        }
+                    }
+                    debugLog("视频生成：H3 无图条件，上游 \(srcID) 无 .h3cc 缓存，按文本生成继续")
+                }
+            } else {
+                // 无上游开尾帧视频 + 无条件图：同样放行，管线走纯文本生成（T2V）
+                store.toastMessage = "上一个节点没有latent 且无条件图 本次为文本生成"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if store.toastMessage == "上一个节点没有latent 且无条件图 本次为文本生成" {
+                        store.toastMessage = nil
+                    }
+                }
+                debugLog("视频生成：H3 无图条件且无上游续接源（\(reason)），按文本生成继续")
+            }
         }
         // 误触保护：提示词为空且无任何输入条件（图片/视频/音频）时直接取消，不启动管线
         let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -786,16 +817,30 @@ struct CanvasView: View {
         }
         inputValidationErrors[nodeID] = nil
         debugLog("视频生成：输入收集完成（图片 \(imagePaths.count) 张，视频 \(videoPaths.count) 个，音频 \(audioPaths.count) 个）")
-        // 尺寸（动态表）：有图按图最接近比例 × 档位；无图按节点私有比例（nil 跟随全局）× 档位
+        // 尺寸（动态表）：视频节点不被图片输入比例劫持——有前置视频（尾帧续接链路）时跟随前置实际尺寸
+        // 保证续接指纹 width/height 一致；非续接视频节点按节点私有比例（nil 跟随全局）× 档位。
+        // 非视频节点保持原逻辑：有图按图最接近比例 × 档位；无图按节点比例。
         let node = store.nodes.first(where: { $0.id == nodeID })
         let quality = node?.quality ?? .standard
         let ratio = node?.ratio ?? store.currentRatio
         let duration = node?.duration ?? store.currentDuration
         let size: (width: Int, height: Int)
-        if let first = imagePaths.first, let img = NSImage(contentsOfFile: first) {
-            size = videoSize(imageWidth: Int(img.size.width), imageHeight: Int(img.size.height), quality: quality)
+        if node?.type == .video {
+            // 尾帧续接链路：跟随前置视频实际尺寸（模型无关，读取资产库视频文件像素尺寸）
+            if let prevVideoID = store.h3ChainSourceID(for: nodeID),
+               let prevNode = store.nodes.first(where: { $0.id == prevVideoID }),
+               let prevSize = store.actualVideoPixelSize(for: prevNode) {
+                size = prevSize
+            } else {
+                // 非续接视频节点：按节点自身比例/全局比例，图片输入不参与尺寸计算
+                size = videoSize(ratio: ratio, quality: quality)
+            }
         } else {
-            size = videoSize(ratio: ratio, quality: quality)
+            if let first = imagePaths.first, let img = NSImage(contentsOfFile: first) {
+                size = videoSize(imageWidth: Int(img.size.width), imageHeight: Int(img.size.height), quality: quality)
+            } else {
+                size = videoSize(ratio: ratio, quality: quality)
+            }
         }
         let modelName = node?.model.displayName ?? "?"
         // ★ 模型就绪检查：生成前确认所选模型权重已下载；未下载则自动下载（画布中间显示试管进度条），
@@ -827,9 +872,9 @@ struct CanvasView: View {
         GenerationQueue.shared.enqueue(task)
     }
     
-    /// 把生成的 mp4 接入节点：复制到 资产库/、提取首帧做缩略图、更新节点 imageFileName/mediaFileName
+    /// 把生成的 mp4 接入节点：复制到 资产库/、异步提取首帧做缩略图、更新节点 imageFileName/mediaFileName
     /// （旧内容文件保留在资产库不删除，避免误删资产；节点引用切换后即完成"替换实际内容"）
-    func attachGeneratedVideo(to nodeID: UUID, mp4Path: String, prompt: String) {
+    func attachGeneratedVideo(to nodeID: UUID, mp4Path: String, prompt: String) async {
         guard let idx = store.nodes.firstIndex(where: { $0.id == nodeID }) else {
             debugLog("视频生成：节点已不存在，产物未接入")
             return
@@ -855,11 +900,12 @@ struct CanvasView: View {
             debugLog("视频生成：mp4 复制到资产库失败 \(error.localizedDescription)")
             return
         }
-        // 2) 提取首帧缩略图（视频节点占位区用图片渲染）
+        // 2) 异步提取首帧缩略图（视频节点占位区用图片渲染）：generateCGImageAsynchronously 后台解码，
+        //    主线程 await 挂起让出，不产生同步等待低 QoS 解码线程的优先级反转
         let avAsset = AVURLAsset(url: mp4URL)
         let imgGen = AVAssetImageGenerator(asset: avAsset)
         imgGen.appliesPreferredTrackTransform = true
-        if let cg = syncFrameImage(from: imgGen, at: .zero) {
+        if let cg = await frameImage(from: imgGen, at: .zero) {
             let rep = NSBitmapImageRep(cgImage: cg)
             if let png = rep.representation(using: .png, properties: [:]) {
                 try? png.write(to: thumbURL)
@@ -1237,6 +1283,7 @@ struct CanvasView: View {
                     text: $promptDraft,
                     onExpand: { expandedPromptNodeID = node.id },
                     onSend: { sendPrompt() },
+                    chainDisplayInfo: store.chainVideoDisplayInfo(for: node),
                     onRatioChange: makeNodeFieldUpdater(node.id, keyPath: \.ratio) { "节点输入框：写入节点私有比例 \($0.displayName)" },
                     onModelChange: makeNodeFieldUpdater(node.id, keyPath: \.model) { "节点输入框：写入视频节点模型 \($0.displayName)" },
                     onImageModelChange: { model in
@@ -1281,6 +1328,7 @@ struct CanvasView: View {
                         sendPrompt()
                         expandedPromptNodeID = nil
                     },
+                    chainDisplayInfo: store.chainVideoDisplayInfo(for: node),
                     onRatioChange: makeNodeFieldUpdater(node.id, keyPath: \.ratio) { "展开输入框：写入节点私有比例 \($0.displayName)" },
                     onModelChange: makeNodeFieldUpdater(node.id, keyPath: \.model) { "展开输入框：写入视频节点模型 \($0.displayName)" },
                     onImageModelChange: { model in
@@ -1400,18 +1448,23 @@ struct CanvasView: View {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.begin { response in
-            guard response == .OK, let url = panel.url,
-                  let image = thumbnailImage(for: url) else { return }
-            let isImage = node.type.assetCategory == .image
-            importAsset(
-                image: image,
-                name: url.deletingPathExtension().lastPathComponent,
-                category: node.type.assetCategory,
-                sourceURL: isImage ? url : nil,
-                mediaSourceURL: isImage ? nil : url,
-                targetNodeID: node.id,
-                store: store
-            )
+            guard response == .OK, let url = panel.url else { return }
+            // 取帧/解码放后台（thumbnailImage 内部 await frameImage），回主线程补图到节点
+            let targetStore = store
+            let targetNode = node
+            Task { @MainActor in
+                guard let image = await thumbnailImage(for: url) else { return }
+                let isImage = targetNode.type.assetCategory == .image
+                importAsset(
+                    image: image,
+                    name: url.deletingPathExtension().lastPathComponent,
+                    category: targetNode.type.assetCategory,
+                    sourceURL: isImage ? url : nil,
+                    mediaSourceURL: isImage ? nil : url,
+                    targetNodeID: targetNode.id,
+                    store: targetStore
+                )
+            }
         }
     }
     
@@ -1436,28 +1489,32 @@ struct CanvasView: View {
                 case .image: imageURLs.append(url)
                 }
             }
-            // 右键位置（画布坐标）作为起点，节点依次错开
+            // 右键位置（画布坐标）作为起点，节点依次错开；取帧/解码放后台（await thumbnailImage），
+            // 回主线程建节点/更新 UI（Task @MainActor），避免 NSOpenPanel 回调线程被视频解码阻塞
             let baseCanvas = viewToCanvas(contextMenuPos, offset: store.offset, zoom: store.zoom)
-            var index = 0
-            func place(_ url: URL, category: AssetCategory) {
-                guard let thumb = thumbnailImage(for: url) else { return }
-                let pos = CGPoint(x: baseCanvas.x + Double(index) * 40,
-                                  y: baseCanvas.y + Double(index) * 40)
-                importAsset(
-                    image: thumb,
-                    name: url.deletingPathExtension().lastPathComponent,
-                    category: category,
-                    sourceURL: category == .image ? url : nil,
-                    mediaSourceURL: category == .image ? nil : url,
-                    createNode: true,
-                    nodePosition: pos,
-                    store: store
-                )
-                index += 1
+            let targetStore = store
+            Task { @MainActor in
+                var index = 0
+                func place(_ url: URL, category: AssetCategory) async {
+                    guard let thumb = await thumbnailImage(for: url) else { return }
+                    let pos = CGPoint(x: baseCanvas.x + Double(index) * 40,
+                                      y: baseCanvas.y + Double(index) * 40)
+                    importAsset(
+                        image: thumb,
+                        name: url.deletingPathExtension().lastPathComponent,
+                        category: category,
+                        sourceURL: category == .image ? url : nil,
+                        mediaSourceURL: category == .image ? nil : url,
+                        createNode: true,
+                        nodePosition: pos,
+                        store: targetStore
+                    )
+                    index += 1
+                }
+                for url in imageURLs { await place(url, category: .image) }
+                for url in videoURLs { await place(url, category: .video) }
+                for url in audioURLs { await place(url, category: .audio) }
             }
-            for url in imageURLs { place(url, category: .image) }
-            for url in videoURLs { place(url, category: .video) }
-            for url in audioURLs { place(url, category: .audio) }
         }
     }
     

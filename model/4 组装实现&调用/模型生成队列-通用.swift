@@ -268,9 +268,8 @@ final class GenerationQueue: ObservableObject {
         // 二采 refine 的文本条件统一为完全静态空条件（loadStaticEmptyTextCond：常量读张量 / 缺失全零兜底，
         // 零模型权重调用，不加载 Gemma/connector）；
         // 画面由 stage1 音轨 IC（frozen_a 锁口型）与画面结构/guide/首尾帧参考控制，不重画内容。
-        guard !task.imagePaths.isEmpty else {
-            pipelineLog("H3 视频生成：至少需要 1 张条件图（当前 \(task.imagePaths.count) 张，视频/音频参考编码尚未接入），取消运行")
-            return nil
+        if task.imagePaths.isEmpty {
+            pipelineLog("H3 视频生成：无条件图，本次走文本生成（纯文本条件，无 keyframe/参考图；.h3cc 命中与否由下游闸门决定）")
         }
         // 参考视频/音频：UI 条件层已放开收集，但管线侧编码通路未接入 → 明确提示，不静默忽略
         if !task.videoPaths.isEmpty {
@@ -290,7 +289,8 @@ final class GenerationQueue: ObservableObject {
         if fl2vaAsRefs { setenv("NA_H3_FL2VA_AS_REFS", "1", 1) } else { unsetenv("NA_H3_FL2VA_AS_REFS") }
         let useRef2VA = !task.videoPaths.isEmpty || !task.audioPaths.isEmpty || task.imagePaths.count != 2 || fl2vaAsRefs
         // ref2va 通路下首/尾帧入参被忽略，仅作占位；图片不足 2 张时用首张补位
-        let firstPath = task.imagePaths[0]
+        // ★ 2026-09-20 续接空图安全取值：纯续接链本节点无图条件，空串占位（管线侧按续接空图跳过编码）
+        let firstPath = task.imagePaths.isEmpty ? "" : task.imagePaths[0]
         let lastPath = task.imagePaths.count >= 2 ? task.imagePaths[1] : firstPath
         let alignedFrames = H3Const.alignFrameCount(UInt32(task.duration.numFrames))
         let latentT = H3Const.videoLatentT(frameCount: alignedFrames)
@@ -302,7 +302,12 @@ final class GenerationQueue: ObservableObject {
         //   阶段2 开启时同样直出全清目标尺寸：H3 全清 latent → H3-to-LTX-Latent-Adapter 转域
         //   → LTX 二采（runLTXStage2RefineOnLatent 收到全清网格，不再升频×2、不再跑解耦低清段）。
         //   Apple 超分通道只要 stage1 的内存像素，同样按目标分辨率直出。
-        let stage2On = AppSettings.shared.videoUseStage2
+        // ★ 2026-09-21 关闭 H3→LTX 二采（阶段2 / 像素桥 / adapter 直通）：
+        //   当前主力链路 = H3 单遍直出 + H3 SelfLift（第三分支），不再使用 LTX 二采。
+        //   下方强制 false（无视偏好设置 videoUseStage2），LTX 像素桥 / CQ/IC /
+        //   H3→LTX adapter 直通 / lowOnly 分工随之全部短路；Apple 超分通道与阶段2
+        //   解耦，不受影响。恢复：改回 AppSettings.shared.videoUseStage2 即可。
+        let stage2On = false // 原：AppSettings.shared.videoUseStage2（2026-09-21 强制关闭）
         let appleSROn = appleSRSecondPassEnabled()
         let needMemoryBridge = stage2On || appleSROn   // 两套二采都吃 stage1 内存像素
         let genW = task.videoWidth
@@ -411,6 +416,11 @@ final class GenerationQueue: ObservableObject {
                 } else {
                     pipelineLog("H3 尾帧延续：前置节点 \(srcID.uuidString) 无有效 .h3cc（不存在/指纹不匹配/损坏），本次从头生成")
                 }
+            }
+            // ★ 2026-09-20 空图最终闸门：无图条件时若未命中有效 .h3cc，不取消——
+            // 回退为文本生成（文生视频，纯文本条件，管线走零条件行注入）。
+            if task.imagePaths.isEmpty, continuationSource == nil {
+                pipelineLog("H3 视频生成：图空且 .h3cc 未命中，本次为文本生成（文生视频，无 latent 窗口续接）")
             }
             // 方案 C：只要有二采（阶段2 或 Apple 超分）就建内存直通桥（generateVideo 内部把 stage1
             // 解码像素交给它，不落盘；随后由二采通道按需消费）；stage1 落盘统一 ProRes 422 .mov

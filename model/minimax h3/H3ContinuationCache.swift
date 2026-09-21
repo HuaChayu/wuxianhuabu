@@ -40,6 +40,21 @@ public enum H3ContinuationCache {
         // 下游注入时按自身资源 id 匹配，命中则跳过该段，避免重复注入同一资源。
         public var condIDs: [String] = []
         public var condRowSpans: [Int] = []
+        // ── v3 音频续接（2026-09-21）──
+        // 本节点尾部窗口的音频 latent（fp16 [winAudioT*2, 32]，audio stream 行序）落盘，
+        // 供下游节点作为 refAudio 段（never-denoised 条件行）注入注意力。
+        // nil = 旧版本缓存（无音频），下游音频回退噪声占位路线。
+        public var audioLatentRows: Int?
+
+        // ── v3 条件行网格归属（续接位置编码修复，2026-09-20）──
+        // 每段条件行在源节点布局里的真实网格归属，与 condIDs/condRowSpans 一一对应：
+        //   condRowModes[i] = 0 → cond 段（fl2va keyframe，配目标视频网格，下游走 preCondRows）
+        //   condRowModes[i] = 1 → refImg 段（ref2va 参考图，配参考图自身网格，下游重建 contRefBlocks）
+        //   condRowHs[i]/condRowWs[i] = refImg 段的参考图 latent 尺寸（patch 前）；cond 段为 0。
+        // nil/空 = 旧版缓存（v2），下游按全 cond 段处理并告警。
+        public var condRowModes: [UInt8]?
+        public var condRowHs: [UInt32]?
+        public var condRowWs: [UInt32]?
 
         // ── fingerprint（任一变化即拒绝复用）──
         public var modelKey: String             // 模型目录名（MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit）
@@ -64,7 +79,9 @@ public enum H3ContinuationCache {
                     latH: Int, latW: Int, latC: Int, gridH: Int, gridW: Int,
                     videoPatchDim: Int, createdAt: TimeInterval = Date().timeIntervalSince1970,
                     condRowsRows: Int? = nil, condRowsVPatch: Int? = nil,
-                    condIDs: [String] = [], condRowSpans: [Int] = []) {
+                    condIDs: [String] = [], condRowSpans: [Int] = [],
+                    condRowModes: [UInt8]? = nil, condRowHs: [UInt32]? = nil, condRowWs: [UInt32]? = nil,
+                    audioLatentRows: Int? = nil) {
             self.nodeID = nodeID
             self.branchID = branchID
             self.winSeconds = winSeconds
@@ -90,6 +107,10 @@ public enum H3ContinuationCache {
             self.condRowsVPatch = condRowsVPatch
             self.condIDs = condIDs
             self.condRowSpans = condRowSpans
+            self.condRowModes = condRowModes
+            self.condRowHs = condRowHs
+            self.condRowWs = condRowWs
+            self.audioLatentRows = audioLatentRows
         }
     }
 
@@ -110,6 +131,8 @@ public enum H3ContinuationCache {
         public var recovery: Recovery
         /// v2+：本节点干净 condRows（fp16 [condRowsRows, condRowsVPatch]），nil = 旧版本或无条件行。
         public var condRowsData: Data?
+        /// v3+：本节点尾部窗口音频 latent（fp16 [audioLatentRows, 32]），nil = 旧版本或无音频。
+        public var audioLatentData: Data?
     }
 
     /// 消费侧期望的 fingerprint（由 generateVideo 实时参数构造）。
@@ -188,6 +211,10 @@ public enum H3ContinuationCache {
     ///   condRows 按资源顺序拼接，condIDs[i] 为该资源唯一 id（路径），
     ///   condRowSpans[i] 为对应行段行数；二者长度一致且 spans 之和 == rows。
     ///   无 condRows 时须传空数组。
+    /// - Parameter condRowModes / condRowHs / condRowWs: v3+ 条件行网格归属元数据
+    ///   （与 condIDs 一一对应）：mode=1 表示该段是 refImg 段（参考图），
+    ///   hs/ws 为其 latent 尺寸；mode=0 表示 cond 段（keyframe），hs/ws 传 0。
+    ///   传 nil 时写旧版 v2 缓存（下游按 cond 段处理）。
     @discardableResult
     public static func save(nodeID: UUID, branchID: String?, rootDir: String,
                             tailLatent: MLXArray,
@@ -199,6 +226,10 @@ public enum H3ContinuationCache {
                             condRows: MLXArray? = nil,
                             condIDs: [String] = [],
                             condRowSpans: [Int] = [],
+                            condRowModes: [UInt8]? = nil,
+                            condRowHs: [UInt32]? = nil,
+                            condRowWs: [UInt32]? = nil,
+                            audioLatent: MLXArray? = nil,
                             createdAt: TimeInterval = Date().timeIntervalSince1970) throws -> URL {
         let expectedT = Int(win.latentT)
         guard tailLatent.ndim == 4,
@@ -235,6 +266,22 @@ public enum H3ContinuationCache {
                                   userInfo: [NSLocalizedDescriptionKey:
                                     "save 去重元数据不一致：condIDs=\(condIDs.count) spans=\(condRowSpans) rows=\(condRows.shape[0])"])
                 }
+                // v3 网格归属元数据：提供时须与 ids 等长；refImg 段（mode=1）必须有非零尺寸
+                if condRowModes != nil || condRowHs != nil || condRowWs != nil {
+                    guard let modes = condRowModes, let hs = condRowHs, let ws = condRowWs,
+                          modes.count == condIDs.count, hs.count == condIDs.count, ws.count == condIDs.count else {
+                        throw NSError(domain: "H3ContinuationCache", code: 4,
+                                      userInfo: [NSLocalizedDescriptionKey:
+                                        "save 网格归属元数据不一致：modes=\(condRowModes?.count ?? -1) hs=\(condRowHs?.count ?? -1) ws=\(condRowWs?.count ?? -1) ids=\(condIDs.count)"])
+                    }
+                    for ((m, h), w) in zip(zip(modes, hs), ws) {
+                        if m == 1 && (h == 0 || w == 0) {
+                            throw NSError(domain: "H3ContinuationCache", code: 5,
+                                          userInfo: [NSLocalizedDescriptionKey:
+                                            "save refImg 段尺寸缺失：mode=1 但 h=\(h) w=\(w)"])
+                        }
+                    }
+                }
             }
             let cf16 = condRows.asType(.float16)
             MLX.eval(cf16)
@@ -250,6 +297,23 @@ public enum H3ContinuationCache {
             condVPatch = condRows.shape[1]
         }
 
+        // v3+ 音频 latent fp16 序列化（[rows, 32]，audio stream 行序）
+        var audioData: Data? = nil
+        var audioRowsCount: Int? = nil
+        if let audioLatent, audioLatent.ndim == 2, audioLatent.shape[0] > 0, audioLatent.shape[1] == 32 {
+            let af16 = audioLatent.asType(.float16)
+            MLX.eval(af16)
+            let aRaw = af16.asArray(Float16.self)
+            var ad = Data(count: aRaw.count * 2)
+            ad.withUnsafeMutableBytes { dst in
+                aRaw.withUnsafeBytes { src in
+                    dst.copyMemory(from: src)
+                }
+            }
+            audioData = ad
+            audioRowsCount = audioLatent.shape[0]
+        }
+
         let header = Header(nodeID: nodeID, branchID: branchID,
                             winSeconds: win.seconds, winFrames: win.frames,
                             winLatentT: win.latentT, winLatentRows: win.rows(gridH: gridH, gridW: gridW),
@@ -262,7 +326,9 @@ public enum H3ContinuationCache {
                             gridH: gridH, gridW: gridW, videoPatchDim: videoPatchDim,
                             createdAt: createdAt,
                             condRowsRows: condRowsCount, condRowsVPatch: condVPatch,
-                            condIDs: condIDs, condRowSpans: condRowSpans)
+                            condIDs: condIDs, condRowSpans: condRowSpans,
+                            condRowModes: condRowModes, condRowHs: condRowHs, condRowWs: condRowWs,
+                            audioLatentRows: audioRowsCount)
 
         let jsonData = try JSONEncoder().encode(header)
         var payload = Data()
@@ -272,6 +338,7 @@ public enum H3ContinuationCache {
         payload.append(jsonData)
         payload.append(latentData)
         if let condData { payload.append(condData) }
+        if let audioData { payload.append(audioData) }
 
         let fm = FileManager.default
         let url = cacheURL(nodeID: nodeID, branchID: branchID, rootDir: rootDir)
@@ -312,14 +379,20 @@ public enum H3ContinuationCache {
         let jsonData = payload.subdata(in: headerStart..<(headerStart + headerLen))
         guard let header = try? JSONDecoder().decode(Header.self, from: jsonData),
               header.version == 1 || header.version == 2 else { return nil }
-        // fingerprint
+        // fingerprint（refCount 仅告警、不阻断：条件图像数量可随链上节点变化，
+        // 严格阻断会误杀真实续接（如 4图→2图 链）导致回退从头；防缓存串用
+        // 仍由 modelKey/width/height/steps/latentT/frameCount 与几何 shapeCheck 保证。
+        // 与 H3Pipeline 消费侧 L511-514 注释的宽松/告警语义对齐。）
         guard header.modelKey == expect.modelKey,
               header.width == expect.width,
               header.height == expect.height,
               header.steps == expect.steps,
               header.latentT == expect.latentT,
-              header.frameCount == expect.frameCount,
-              header.refCount == expect.refCount else { return nil }
+              header.frameCount == expect.frameCount else { return nil }
+        if header.refCount != expect.refCount {
+            let delta = Int(header.refCount) - Int(expect.refCount)
+            pipelineLog("H3ContinuationCache.load：refCount 不匹配但放行（header.refCount=\(header.refCount) vs expect.refCount=\(expect.refCount)，差值 \(delta)，条件数量随链变化属预期），仅告警不阻断续接")
+        }
         // 几何
         if let sc = shapeCheck {
             guard header.latH == sc.latH, header.latW == sc.latW, header.latC == sc.latC,
@@ -336,9 +409,19 @@ public enum H3ContinuationCache {
             guard latentData.count >= expectedBytes + condBytes else { return nil }
             condData = latentData.subdata(in: expectedBytes..<(expectedBytes + condBytes))
         }
+        // v3+ 音频 latent 段（位于 cond 段之后）
+        var audioData: Data? = nil
+        if let aRows = header.audioLatentRows, aRows > 0 {
+            let condBytes = (condData != nil) ? (header.condRowsRows ?? 0) * (header.condRowsVPatch ?? 0) * 2 : 0
+            let audioBytes = aRows * 32 * 2
+            let audioStart = expectedBytes + condBytes
+            guard latentData.count >= audioStart + audioBytes else { return nil }
+            audioData = latentData.subdata(in: audioStart..<(audioStart + audioBytes))
+        }
         let latentSlice = latentData.subdata(in: 0..<expectedBytes)
         guard latentSlice.count == expectedBytes else { return nil }
-        return Loaded(header: header, latentData: latentSlice, recovery: recovery, condRowsData: condData)
+        return Loaded(header: header, latentData: latentSlice, recovery: recovery,
+                      condRowsData: condData, audioLatentData: audioData)
     }
 
     // MARK: - 删除（幂等）

@@ -31,10 +31,32 @@ struct HorizontalWheelScroll<Content: View>: NSViewRepresentable {
     func updateNSView(_ scrollView: HorizontalWheelScrollView, context: Context) {
         guard let hosting = scrollView.documentView as? NSHostingView<Content> else { return }
         hosting.rootView = content()
-        let ideal = hosting.fittingSize
-        let height = max(ideal.height, scrollView.contentView.bounds.height)
-        hosting.setFrameSize(NSSize(width: max(ideal.width, 1), height: height))
-        hosting.frame.origin = .zero
+        // 在 updateNSView（SwiftUI 视图更新/layout 周期内）同步调用 fittingSize / setFrameSize
+        // 会强制 NSHostingView 递归布局，触发 "NSHostingView is being laid out reentrantly" /
+        // "It's not legal to call -layoutSubtreeIfNeeded on a view which is already being laid out"。
+        // 修复策略：
+        // 1) 布局尺寸计算与设置延迟到当前视图更新周期之外执行；
+        // 2) 优先读 intrinsicContentSize（内容理想尺寸，不强制递归布局），不可用时才兜底 fittingSize；
+        // 3) 缓存比较，仅在实际尺寸/位置变化时才 setFrameSize，避免无谓强制布局。
+        DispatchQueue.main.async { [weak scrollView] in
+            guard let scrollView,
+                  let hosting = scrollView.documentView as? NSHostingView<Content> else { return }
+            let ideal: NSSize
+            let intrinsic = hosting.intrinsicContentSize
+            if intrinsic.width > 0 && intrinsic.height > 0 {
+                ideal = intrinsic
+            } else {
+                ideal = hosting.fittingSize
+            }
+            let target = NSSize(width: max(ideal.width, 1),
+                                height: max(ideal.height, scrollView.contentView.bounds.height))
+            if hosting.frame.size != target {
+                hosting.setFrameSize(target)
+            }
+            if hosting.frame.origin != .zero {
+                hosting.frame.origin = .zero
+            }
+        }
     }
 }
 

@@ -220,18 +220,9 @@ struct LaunchPreviewView: View {
         }
     }
 
-    /// 加载「开篇」视频：优先 Bundle 资源，回退到项目源码根目录
+    /// 加载「开篇」视频：仅从 Bundle 资源加载，Bundle 内无该资源时静默跳过（不弹窗、不报错）
     private func setupOpeningVideo() {
-        var url = Bundle.main.url(forResource: "开篇", withExtension: "mov")
-        if url == nil {
-            let fallback = URL(fileURLWithPath: settings.canvasRootPath)
-                .deletingLastPathComponent()
-                .appendingPathComponent("开篇.mov")
-            if FileManager.default.fileExists(atPath: fallback.path) {
-                url = fallback
-            }
-        }
-        guard let url else { return }
+        guard let url = Bundle.main.url(forResource: "开篇", withExtension: "mov") else { return }
         let player = AVPlayer(url: url)
         videoPlayer = player
         videoReady = true

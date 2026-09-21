@@ -30,6 +30,12 @@ public enum H3Const {
     public static let fps: UInt32 = 24
     public static let audioLatentFPS: UInt32 = 40
 
+    /// 续接窗口（像素帧）：前置尾段重复延续长度。
+    /// 对齐 ComfyUI-H3-Motion-Context 默认 context_length=22（22 像素帧 ≈ 0.92s，
+    /// 经 videoLatentT 换算 = 7 latent step / 7 个 keyframe 锚点）。
+    /// 全局唯一入口：落盘窗口 / 续接总时长 / 完成后裁切均由它换算，禁止散落硬编码。
+    public static let continuationContextFrames: UInt32 = 22
+
     /// Defaults from `model_index.json` sigma_shift_scales.
     public static let sigmaShiftVideo: Double = 12.0
     public static let sigmaShiftAudio: Double = 3.0
