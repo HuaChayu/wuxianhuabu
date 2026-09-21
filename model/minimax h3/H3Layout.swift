@@ -399,14 +399,18 @@ public final class PackedLayout {
         var cursor = Double(textLen)
 
         // 前置条件段（上游延续节点的干净 condRows，直接拼入）：共享目标网格，
-        // t 与 first keyframe 同起点 cursor，行内 (h,w) 按网格循环填充。
+        // t 按 latent step 递增（第 k 块 = cursor + Σ_{i<k} videoTSpan(i)），与视频时间轴同位。
         if preCondRows > 0 {
             segments.append(Segment(start: row, end: row + preCondRows, kind: .cond))
             var written: UInt32 = 0
+            var stepIdx: Int = 0
+            var stepT: Double = cursor
             while written < preCondRows {
                 let chunk = min(frameRows, preCondRows - written)
-                writeFrameGrid(&positionIds, row: row + written, t: cursor, hAxis: hAxis, wAxis: wAxis)
+                writeFrameGrid(&positionIds, row: row + written, t: stepT, hAxis: hAxis, wAxis: wAxis)
                 written += chunk
+                stepT += videoTSpan(stepIdx)
+                stepIdx += 1
             }
             for _ in 0..<Int(preCondRows) {
                 imgUpdate[imgRow] = false
@@ -478,18 +482,43 @@ public final class PackedLayout {
         }
 
         // ref2va blocks, in request order; each advances the cursor.
+        let startCursor = cursor
+        let nImageRefs = refs.reduce(0) { $0 + (($1.kind == .image) ? 1 : 0) }
+        var refsAdvance: Double = 0
+        for b in refs {
+            switch b.kind {
+            case .image: refsAdvance += 1.0
+            case .audio: refsAdvance += Double(b.audioT)
+            case .video:
+                var spans: Double = 0
+                for k in 0..<Int(b.latentT) { spans += videoTSpan(k) }
+                refsAdvance += max(Double(b.audioT), spans)
+            }
+        }
+        var imageIdx = 0
         for b in refs {
             switch b.kind {
             case .image:
                 let g = refGrid(b)
                 segments.append(Segment(start: row, end: row + g.rows, kind: .refImg))
-                writeFrameGrid(&positionIds, row: row, t: cursor, hAxis: g.hAxis, wAxis: g.wAxis)
+                let refT: Double
+                if nImageRefs == 2 && imageIdx == 1 {
+                    // 首尾帧软参考：尾帧对齐视频时间轴末端（最后 latent step 起点），
+                    // 避免首尾两帧 RoPE 几乎同位导致开头被两帧内容混合污染。
+                    var spans: Double = 0
+                    for k in 0..<Int(latentT) { spans += videoTSpan(k) }
+                    refT = startCursor + refsAdvance + spans - videoTSpan(Int(latentT) - 1)
+                } else {
+                    refT = cursor
+                }
+                writeFrameGrid(&positionIds, row: row, t: refT, hAxis: g.hAxis, wAxis: g.wAxis)
                 for _ in 0..<Int(g.rows) {
                     imgUpdate[imgRow] = false
                     imgRow += 1
                 }
                 row += g.rows
                 cursor += 1.0
+                imageIdx += 1
             case .audio:
                 if b.audioT > 0 {
                     let n = b.audioT * 2

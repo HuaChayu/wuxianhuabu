@@ -380,13 +380,15 @@ public enum H3ContinuationCache {
         guard let header = try? JSONDecoder().decode(Header.self, from: jsonData),
               header.version == 1 || header.version == 2 else { return nil }
         // fingerprint（refCount 仅告警、不阻断：条件图像数量可随链上节点变化，
-        // 严格阻断会误杀真实续接（如 4图→2图 链）导致回退从头；防缓存串用
-        // 仍由 modelKey/width/height/steps/latentT/frameCount 与几何 shapeCheck 保证。
+        // 严格阻断会误杀真实续接（如 4图→2图 链）导致回退从头；steps 不参与校验
+        // （2026-09-21：步数为偏好滑杆动态值，缓存落盘后用户改动会导致误判失效、
+        // 静默回退从头，续接几何/布局不变量已由 latentT/frameCount 与 shapeCheck 保证，
+        // 步数差异不破坏 latent 窗口结构）；防缓存串用仍由
+        // modelKey/width/height/latentT/frameCount 与几何 shapeCheck 保证。
         // 与 H3Pipeline 消费侧 L511-514 注释的宽松/告警语义对齐。）
         guard header.modelKey == expect.modelKey,
               header.width == expect.width,
               header.height == expect.height,
-              header.steps == expect.steps,
               header.latentT == expect.latentT,
               header.frameCount == expect.frameCount else { return nil }
         if header.refCount != expect.refCount {

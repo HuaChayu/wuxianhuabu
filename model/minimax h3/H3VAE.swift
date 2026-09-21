@@ -540,7 +540,11 @@ public final class H3VAEEncoder {
             }
             rows.append(MLX.concatenated(cols, axis: 4))
         }
-        return MLX.concatenated(rows, axis: 3)
+        let out = MLX.concatenated(rows, axis: 3)
+        // 返回前物化：rows/cols 为函数局部数组，返回即释放；保持 lazy 时外部 eval
+        // 提交 GPU 命令可能引用已释放中间 buffer → preCommit UAF。
+        MLX.eval(out)
+        return out
     }
 }
 

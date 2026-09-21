@@ -305,9 +305,11 @@ public enum H3FL2VAPipeline {
                 // 释放 VAE 编码器（解码阶段再加载）
                 vae = nil
                 vaeWeights = nil
-                MLX.Memory.clearCache()
                 h3MemLog("VAE 编码器已释放（autoreleasepool 内）")
             }
+            // clearCache 移到池外：池内物化的 condRows/condRowsClean 出池后仍会被
+            // 续接拼接段 eval，池内清缓存可能连带释放其 buffer → preCommit UAF。
+            MLX.Memory.clearCache()
         } else if firstImagePath.isEmpty && lastImagePath.isEmpty {
         // ★ 2026-09-20 空图分支：本节点无首尾帧图（续接空图 或 纯文生）时，跳过 keyframe 编码，
         //   仅探测目标 latent 几何（与 ref2va 同法）；条件行由前置 .h3cc 注入或直接零行（文本生成）。
@@ -538,11 +540,13 @@ public enum H3FL2VAPipeline {
         var keptPreRefWs: [UInt32] = []
         var contRefBlocks: [RefBlock] = []          // 续接前置参考块（layout 按各自网格重建 .refImg 段）
         if let cont = continuationSource {
+            // fpOK 指纹（2026-09-21）：steps 不参与校验——步数为偏好滑杆动态值，
+            // 缓存落盘后用户改动会导致误判失效、回退从头；与 H3ContinuationCache.load
+            // 的宽松指纹口径一致（modelKey/width/height/latentT/frameCount）。
             let fpOK =
                 cont.header.modelKey == H3ContinuationCache.currentModelKey
                 && cont.header.width == width
                 && cont.header.height == height
-                && cont.header.steps == steps
                 && cont.header.latentT == latentT
                 && cont.header.frameCount == frameCount
                 // v3（2026-09-20）：refCount 不再作严格匹配项——上游多参考、下游仅尾帧图
@@ -707,8 +711,8 @@ public enum H3FL2VAPipeline {
                 pieces.append(pre)
                 piecesInjected.append(pre)
             }
+            if let tail = contKeyRows { pieces.append(tail) }       // 前置尾段 keyframe（无条件：layout keyframes 恒含 contKeyAnchors）
             if !useRef2VA {
-                if let tail = contKeyRows { pieces.append(tail) }   // 前置尾段 keyframe（never-denoised 锚点）
                 pieces.append(clean)                                 // 本节点 keyframe 行
                 piecesInjected.append(clean)
             }
