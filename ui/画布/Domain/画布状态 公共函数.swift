@@ -904,13 +904,15 @@ extension CanvasStore {
 // MARK: - H3 尾帧延续前置源（2026-09-20 重装）
 
 extension CanvasStore {
-    /// 尾帧续接链路的展示信息：视频节点处于续接链路时，尺寸档位/比例下拉的显示与禁用依据。
-    /// 生成尺寸强制跟随前置视频实际像素，UI 侧仅展示反推出的档位与比例并禁用，避免用户误改。
+    /// 尾帧续接链路的展示信息：视频节点处于续接链路时，尺寸档位/比例/时长下拉的显示与禁用依据。
+    /// 整条续接链共用链首（最上游非续接视频节点）当前参数，下游节点禁止自行修改；
+    /// 依据为链首节点当前参数配置而非实际生成文件，保证链首改参数后下游立即跟随显示。
     struct ChainVideoDisplayInfo {
         let pixelWidth: Int
         let pixelHeight: Int
         let quality: VideoQuality
         let ratio: Ratio
+        let duration: VideoDuration?
     }
 
     /// H3 视频节点的尾帧延续前置源：连接顺序第一条入边 from.type == .video && from.tailFrameEnabled
@@ -942,19 +944,29 @@ extension CanvasStore {
         return (w, h)
     }
 
-    /// 尾帧续接链路的展示信息：视频节点处于续接链路（h3ChainSourceID 命中）且前置视频节点有实际
-    /// 像素尺寸时返回非 nil，供 UI 将尺寸档位/比例下拉改为展示前置视频实际档位/比例并禁用；
-    /// 否则 nil（非续接节点保持现有逻辑）。
+    /// 尾帧续接链路的展示信息：视频节点处于续接链路（链上存在上游续接源）时返回非 nil，
+    /// 供 UI 将尺寸档位/比例/时长下拉改为展示链首实际生效参数并禁用；
+    /// 否则 nil（链首/非续接节点保持现有逻辑）。
+    /// 沿链路向上追溯链首（最上游非续接视频节点）：链上任意节点改参数，其所有下游立即跟随显示。
+    /// 链首比例/时长为 nil 时回落全局 currentRatio/currentDuration。
     func chainVideoDisplayInfo(for node: CanvasNode) -> ChainVideoDisplayInfo? {
-        guard node.type == .video,
-              let sourceID = h3ChainSourceID(for: node.id),
-              let sourceNode = nodes.first(where: { $0.id == sourceID }),
-              let size = actualVideoPixelSize(for: sourceNode) else { return nil }
+        guard node.type == .video else { return nil }
+        // 沿链路向上追溯链首（最上游非续接视频节点）
+        var headID = node.id
+        while let sourceID = h3ChainSourceID(for: headID) {
+            headID = sourceID
+        }
+        // 自身就是链首（无上游续接源）→ 可编辑，不返回展示信息
+        guard headID != node.id,
+              let headNode = nodes.first(where: { $0.id == headID }) else { return nil }
+        let ratio = headNode.ratio ?? currentRatio
+        let size = videoResolution(for: ratio, quality: headNode.quality)
         return ChainVideoDisplayInfo(
             pixelWidth: size.width,
             pixelHeight: size.height,
-            quality: videoQuality(for: size.width, height: size.height),
-            ratio: nearestRatio(for: size.width, height: size.height)
+            quality: headNode.quality,
+            ratio: ratio,
+            duration: headNode.duration ?? currentDuration
         )
     }
 }

@@ -15,7 +15,8 @@ import AppKit
 
 enum NodeFactory {
     /// 统一创建节点：默认标题「未命名<类型>」、副标题「出现集数：暂无」、待补充标记
-    static func createNode(type: NodeType, title: String? = nil, subtitle: String? = nil, needsSupplement: Bool = true, position: CGPoint, imageFileName: String? = nil, mediaFileName: String? = nil, prompt: String = "", ratio: CanvasStore.Ratio? = nil) -> CanvasNode {
+    /// 完整参数版本：新增字段全部带默认值，旧调用点不受影响；粘贴侧按「存在性」传入（nil/默认 = 跳过该参数）。
+    static func createNode(type: NodeType, title: String? = nil, subtitle: String? = nil, needsSupplement: Bool = true, position: CGPoint, imageFileName: String? = nil, mediaFileName: String? = nil, prompt: String = "", groupID: UUID? = nil, ratio: CanvasStore.Ratio? = nil, duration: VideoDuration? = nil, tailFrameEnabled: Bool = true, model: VideoModel = .ltx25Distill, quality: VideoQuality = .standard, imageModel: ImageModel = .hidreamO1, imageQuality: ImageQuality = .p720, history: [NodeContentHistory]? = nil) -> CanvasNode {
         CanvasNode(
             type: type,
             title: title ?? "未命名\(type.rawValue)",
@@ -25,7 +26,15 @@ enum NodeFactory {
             imageFileName: imageFileName,
             mediaFileName: mediaFileName,
             prompt: prompt,
-            ratio: ratio
+            groupID: groupID,
+            ratio: ratio,
+            duration: duration,
+            tailFrameEnabled: tailFrameEnabled,
+            model: model,
+            quality: quality,
+            imageModel: imageModel,
+            imageQuality: imageQuality,
+            history: history
         )
     }
 }
@@ -87,10 +96,21 @@ extension CanvasView {
     }
     
     // 创建副本：复制节点（新 id，允许多个同名同类型节点），位置向右下偏移避免完全重叠；
-    // 若原节点有实际内容（imageFileName 资产库引用），副本一并带上，避免复制出空节点
+    // 若原节点有实际内容（imageFileName 资产库引用），副本一并带上，避免复制出空节点。
+    // 只复制用户可见可编辑的参数（提示词、模型、档位、比例、时长、尾帧开关）+ 所属组；
+    // 同组节点复制后映射为新组 id，重建组框，避免与原组混在一起。
     func duplicateNodes(_ nodeIDs: Set<UUID>) {
         store.pushSnapshot()   // 复制节点前记录快照（用于撤销）
         let targets = store.nodes.filter { nodeIDs.contains($0.id) }
+        // 组映射：同组节点（复制集合内同一 groupID ≥2 个）映射为新组 id，重建组框
+        var groupCounts: [UUID: Int] = [:]
+        for node in targets {
+            if let gid = node.groupID { groupCounts[gid, default: 0] += 1 }
+        }
+        var groupIDMap: [UUID: UUID] = [:]
+        for (gid, count) in groupCounts where count >= 2 {
+            groupIDMap[gid] = UUID()
+        }
         for node in targets {
             let copy = NodeFactory.createNode(
                 type: node.type,
@@ -99,8 +119,15 @@ extension CanvasView {
                 needsSupplement: node.needsSupplement,
                 position: CGPoint(x: node.position.x + 30, y: node.position.y + 30),
                 imageFileName: node.imageFileName,
-                mediaFileName: node.mediaFileName,
-                ratio: node.ratio
+                prompt: node.prompt,
+                groupID: node.groupID.flatMap { groupIDMap[$0] },
+                ratio: node.ratio,
+                duration: node.duration,
+                tailFrameEnabled: node.tailFrameEnabled,
+                model: node.model,
+                quality: node.quality,
+                imageModel: node.imageModel,
+                imageQuality: node.imageQuality
             )
             store.nodes.append(copy)
         }

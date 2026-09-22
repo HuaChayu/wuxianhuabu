@@ -432,6 +432,7 @@ func updateConnectDrag(screenPos: CGPoint, fromNodeID: UUID, side: ConnectSide, 
 // 加号连线拖拽结束（公共入口）：命中目标节点加号且方向相反（输出→输入）则建立连线；
 // 目标支持 节点加号 / 组盒加号（组内全部节点批量）/ 节点本体（方向自动取与拖出端相反）。
 // 返回是否完成本次拖拽处理（命中目标或已存在连线）；未命中返回 false，供调用方决定是否弹「引用该节点生成」面板
+@MainActor
 @discardableResult
 func finishConnectDrag(screenPos: CGPoint, fromNodeID: UUID, side: ConnectSide, store: CanvasStore) -> Bool {
     // 无论命中与否，结束统一清理临时连线与组加号吸附态（含多次 return 分支）
@@ -495,6 +496,7 @@ func finishConnectDrag(screenPos: CGPoint, fromNodeID: UUID, side: ConnectSide, 
             store.pushSnapshot()   // 批量建连前记录快照（用于撤销）
             store.connections.append(contentsOf: newConnections)
             store.save()
+            refreshContinuousGlowForNewConnect(store: store)
             debugLog("组连线拖拽结束：批量建立 \(newConnections.count) 条连线")
         } else {
             debugLog("组连线拖拽结束：均已存在连线，跳过")
@@ -503,30 +505,43 @@ func finishConnectDrag(screenPos: CGPoint, fromNodeID: UUID, side: ConnectSide, 
         return true
     }
     // 连线方向固定为 输出 → 输入（fromNodeID 是普通节点；目标可能是组内多个节点）
-    // ★ 视频→视频唯一连线限制：被拖出方是视频节点 && 目标是视频节点时，
-    //   若被拖出方已连过 ≥1 个视频目标则取消整次建连并提示（避免视频节点连多个视频节点）。
-    let fromNodeType = store.nodes.first { $0.id == fromNodeID }?.type
-    if fromNodeType == .video {
-        let hasVideoTarget = targetIDs.contains { tid in
-            store.nodes.first { $0.id == tid }?.type == .video
+    // ★ 视频→视频唯一连线限制（出口+入口双向）：
+    //   被拖出方是视频节点 && 目标是视频节点时，按实际连线方向分别校验
+    //   ① 出口唯一：源视频节点已连过 ≥1 个视频目标 → 取消；
+    //   ② 入口唯一：目标视频节点已有 ≥1 条视频入边 → 取消。
+    //   保证链式串联的每个视频节点最多一个视频上游、一个视频下游，不出现汇聚/分叉。
+    let isVideoNode: (UUID) -> Bool = { id in
+        store.nodes.first { $0.id == id }?.type == .video
+    }
+    let videoLimitViolated = targetIDs.contains { targetID in
+        guard targetID != fromNodeID else { return false }
+        let fromID = side.isOutput ? fromNodeID : targetID
+        let toID = side.isOutput ? targetID : fromNodeID
+        // 已存在同一条连线：跳过（不算违规，后续构建也会忽略）
+        let alreadyConnected = store.connections.contains {
+            ($0.fromID == fromID && $0.toID == toID) ||
+            ($0.fromID == toID && $0.toID == fromID)
         }
-        if hasVideoTarget {
-            let existingVideoCount = store.connections.filter { conn in
-                conn.fromID == fromNodeID
-                    && (store.nodes.first { $0.id == conn.toID }?.type == .video)
-            }.count
-            if existingVideoCount >= 1 {
-                store.toastMessage = "视频只能连到一个视频"
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if store.toastMessage == "视频只能连到一个视频" {
-                        store.toastMessage = nil
-                    }
-                }
-                debugLog("连线拖拽结束：视频节点 \(fromNodeID) 已连 \(existingVideoCount) 个视频目标，取消本次视频连线")
-                store.draggingConnection = nil
-                return true
+        if alreadyConnected { return false }
+        guard isVideoNode(fromID), isVideoNode(toID) else { return false }
+        let fromHasVideoOut = store.connections.contains { conn in
+            conn.fromID == fromID && isVideoNode(conn.toID)
+        }
+        let toHasVideoIn = store.connections.contains { conn in
+            conn.toID == toID && isVideoNode(conn.fromID)
+        }
+        return fromHasVideoOut || toHasVideoIn
+    }
+    if videoLimitViolated {
+        store.toastMessage = "视频只能连到一个视频"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if store.toastMessage == "视频只能连到一个视频" {
+                store.toastMessage = nil
             }
         }
+        debugLog("连线拖拽结束：视频连线违反唯一限制（出口/入口），取消本次视频连线")
+        store.draggingConnection = nil
+        return true
     }
     let newConnections: [NodeConnection] = targetIDs.compactMap { targetID in
         guard targetID != fromNodeID else { return nil }
@@ -551,12 +566,34 @@ func finishConnectDrag(screenPos: CGPoint, fromNodeID: UUID, side: ConnectSide, 
         store.pushSnapshot()   // 建立连线前记录快照（用于撤销）
         store.connections.append(contentsOf: newConnections)
         store.save()
+        refreshContinuousGlowForNewConnect(store: store)
         debugLog("连线拖拽结束：建立 \(newConnections.count) 条连线")
     } else {
         debugLog("连线拖拽结束：已存在连线，跳过")
     }
     store.draggingConnection = nil
     return true
+}
+
+/// 连续视频模式：连线建立后补一次发光判定。
+/// 场景：源视频节点已在生成队列中（排队/运行）时，用户才拖线连出下游视频节点——
+/// startVideoGeneration 入队瞬间只亮当时已存在的连线，新连的线不会被点亮，
+/// 导致下游没有"即将被续接"的呼吸闪烁提示。此函数在建连后立即重新评估：
+/// 源=视频节点且在生成中 && 目标=视频节点且开尾帧 → 点亮该连线（仅发光提示，不重复触发生成）。
+@MainActor
+func refreshContinuousGlowForNewConnect(store: CanvasStore) {
+    guard store.continuousVideoMode else { return }
+    guard let lastConn = store.connections.last else { return }
+    guard let fromNode = store.nodes.first(where: { $0.id == lastConn.fromID }),
+          fromNode.type == .video,
+          fromNode.tailFrameEnabled,   // 源必须开尾帧才能作为续接源（与 h3ChainSourceID 语义一致）
+          GenerationQueue.shared.isGenerating(nodeID: fromNode.id) else { return }
+    guard let target = store.nodes.first(where: { $0.id == lastConn.toID }),
+          target.type == .video,
+          target.tailFrameEnabled else { return }
+    let validity = store.inputValidity(for: target.id)
+    guard !(validity.applies && validity.invalidConnectionIDs.contains(lastConn.id)) else { return }
+    store.glowingConnectionIDs.insert(lastConn.id)
 }
 
 // 命中检测：屏幕坐标是否落在某个节点本体矩形内（拖拽连线松手时，拖到节点上也算连线）

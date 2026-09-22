@@ -230,11 +230,20 @@ extension CanvasView {
         let hideVideoOption: Bool = {
             guard let fromID = generateFromNodeID,
                   store.nodes.first(where: { $0.id == fromID })?.type == .video else { return false }
-            let existingVideoCount = store.connections.filter { conn in
-                conn.fromID == fromID
-                    && (store.nodes.first { $0.id == conn.toID }?.type == .video)
-            }.count
-            return existingVideoCount >= 1
+            let isVideoNode: (UUID) -> Bool = { id in
+                store.nodes.first { $0.id == id }?.type == .video
+            }
+            if generateFromSide?.isOutput == true {
+                // 源是 fromID，目标是新生成的视频节点：校验 fromID 出口唯一（已连视频目标则隐藏）
+                return store.connections.contains { conn in
+                    conn.fromID == fromID && isVideoNode(conn.toID)
+                }
+            } else {
+                // 源是新生成的视频节点，目标是 fromID：校验 fromID 入口唯一（已有视频入边则隐藏）
+                return store.connections.contains { conn in
+                    conn.toID == fromID && isVideoNode(conn.fromID)
+                }
+            }
         }()
         
         return VStack(alignment: .leading, spacing: 0) {

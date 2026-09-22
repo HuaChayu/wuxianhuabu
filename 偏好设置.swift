@@ -176,7 +176,7 @@ final class AppSettings: ObservableObject {
     // true=H3 stage1 出的内存态视频**优先**走 Apple 超分通道（并存的 CQ/IC 二采保留为失败回退）；
     // false=完全不启用本通道（行为与本次接入前一致）。
     // 任何不可用/失败（运行期不支持、模型资产未就绪、源尺寸越界、源像素格式无交集等）都自动回退原 CQ/IC 二采。
-    // 环境变量 LTX_APPLE_SR=1/0 优先级高于本设置项。默认 true（全局目标：H3 出的视频统一走 Apple 超分）。
+    // 环境变量 LTX_APPLE_SR=1/0 优先级高于本设置项。默认 false（第二阶段默认走 SelfLift，Apple 超分为手动可选）。
     @Published var videoUseAppleSR: Bool {
         didSet { defaults.set(videoUseAppleSR, forKey: "videoUseAppleSR") }
     }
@@ -242,9 +242,9 @@ final class AppSettings: ObservableObject {
         let cq = d.object(forKey: "videoUseCQEnhancer") as? Bool ?? true
         videoUseCQEnhancer = cq
         // （2026-09-21：videoUseDiffusionDecoder 设置字段已移除，不再读取）
-        // ★ 第三套二采·Apple 超分：默认开启（运行期不支持/失败会自动回退 CQ/IC 二采，故默认开启不影响可用性）；
+        // ★ 第三套二采·Apple 超分：默认关闭（第二阶段默认走 SelfLift）；运行期不支持/失败会自动回退 CQ/IC 二采，手动开启不影响可用性；
         // 倍率固定 ×4（面板已无倍率选择），质量默认 1=normal，预计算光流默认关（耗时/显存更高）。
-        let appleSR = d.object(forKey: "videoUseAppleSR") as? Bool ?? true
+        let appleSR = d.object(forKey: "videoUseAppleSR") as? Bool ?? false
         videoUseAppleSR = appleSR
         // ★ 后处理方式：优先读已存枚举；不存在时按旧开关组合迁移（与 currentPostProcessMode 同优先级），
         //   迁移结果立即落库，之后以下拉菜单为准。
@@ -355,9 +355,9 @@ final class AppSettings: ObservableObject {
         wheelAccelerationWheel = 30.0
         h3Stage1Steps = 6
         h3SelfLiftDecouple = true
-        // 后处理模式与底层开关联动恢复出厂组合（Apple 超分开 / SelfLift 开 / 阶段2 与 CQ 关），
+        // 后处理模式与底层开关联动恢复出厂组合（第二阶段默认 SelfLift：SelfLift 开 / Apple 超分关 / 阶段2 与 CQ 关），
         // 与 AppSettings.init 无存档时的默认状态一致
-        applyPostProcessMode(.apple)
+        applyPostProcessMode(.selflift)
         appleSRScaleFactor = 4
         appleSRQualityRawValue = 1
         appleSRUsePrecomputedFlow = false

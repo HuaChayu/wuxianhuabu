@@ -293,6 +293,30 @@ struct CanvasView: View {
                     // 尾帧开关点击：切换 on/off（状态存节点模型，数据单一来源；渲染侧按状态显示主题色轨道+手柄在右）
                     if let idx = store.nodes.firstIndex(where: { $0.id == nodeID }) {
                         store.nodes[idx].tailFrameEnabled.toggle()
+                        let isOn = store.nodes[idx].tailFrameEnabled
+                        // 尾帧状态影响续接语义：先熄灭涉及该节点的发光线——
+                        // 源关了尾帧 = 不再续接下游；目标关了尾帧 = 不应被上游续接。
+                        store.glowingConnectionIDs = store.glowingConnectionIDs.filter { connID in
+                            guard let conn = store.connections.first(where: { $0.id == connID }) else { return false }
+                            return conn.fromID != nodeID && conn.toID != nodeID
+                        }
+                        // 重新打开：若该节点仍有活跃生成任务（排队/生成中），立即恢复发光——
+                        // 与 startVideoGeneration 入队时同一判定（第一条输出边→视频→尾帧开→有效），
+                        // 级联传播 propagateContinuousVideo 在源完成时读实时开关，打开后会自动恢复触发下游。
+                        if isOn, store.continuousVideoMode,
+                           GenerationQueue.shared.taskID(for: nodeID) != nil,
+                           store.nodes.first(where: { $0.id == nodeID })?.type == .video,
+                           let nextConn = store.connections.first(where: { conn in
+                               guard conn.fromID == nodeID,
+                                     let target = store.nodes.first(where: { $0.id == conn.toID }),
+                                     target.type == .video,
+                                     target.tailFrameEnabled else { return false }
+                               let validity = store.inputValidity(for: target.id)
+                               return !(validity.applies && validity.invalidConnectionIDs.contains(conn.id))
+                           }) {
+                            store.glowingConnectionIDs.insert(nextConn.id)
+                            debugLog("尾帧开关：节点 \(nodeID) 重新打开，恢复发光线 \(nextConn.id)")
+                        }
                     }
                 },
                 onProgressSeek: { nodeID, ratio in
@@ -498,6 +522,7 @@ struct CanvasView: View {
         showToolbarAddPanel = false
         showOutlinePanel = false
         showHistoryPanelNodeID = nil
+        outlineScrollTarget = nil  // 清理残留聚焦目标，防止下次手动打开时误滚
     }
     
     // MARK: - 浮层面板层：与底层画布隔离的所有悬浮面板
@@ -509,6 +534,33 @@ struct CanvasView: View {
     
     // MARK: - 节点往期内容面板
     
+    /// 历史条目引用的素材文件是否仍存在于资产库目录。
+    /// 条目有任一引用（图片或媒体）仍在磁盘即保留，与面板展示逻辑（优先图片、否则音频占位）一致。
+    func historyEntryReferencesExist(_ entry: NodeContentHistory) -> Bool {
+        let fm = FileManager.default
+        if let imageName = entry.imageFileName,
+           fm.fileExists(atPath: assetLibraryURL.appendingPathComponent(imageName).path) {
+            return true
+        }
+        if let mediaName = entry.mediaFileName,
+           fm.fileExists(atPath: assetLibraryURL.appendingPathComponent(mediaName).path) {
+            return true
+        }
+        return false
+    }
+
+    /// 引用丢失清理：把素材文件已不存在的历史条目从该节点 history 真正移除并写回，
+    /// 再按项目现有持久化方式（CanvasStore.save → saveProject → project.json）落盘。
+    /// 仅改动该节点 history，不动当前内容 / 撤销重做 / 资产删除。
+    func pruneMissingHistoryEntries(for node: CanvasNode) {
+        guard let idx = store.nodes.firstIndex(where: { $0.id == node.id }),
+              var history = store.nodes[idx].history, !history.isEmpty else { return }
+        let kept = history.filter { historyEntryReferencesExist($0) }
+        guard kept.count != history.count else { return }
+        store.nodes[idx].history = kept.isEmpty ? nil : kept
+        store.save()
+    }
+
     /// 打开节点往期内容面板：锚定在节点右侧（节点中心 + 半宽 + 间距，屏幕坐标）
     func openHistoryPanel(for node: CanvasNode) {
         // 若已在展示该节点则直接关闭（切换开关）
@@ -516,6 +568,8 @@ struct CanvasView: View {
             closeAllPanels()
             return
         }
+        // 打开面板前先做引用丢失清理：素材文件已丢失的历史条目从该节点真正移除并持久化
+        pruneMissingHistoryEntries(for: node)
         let zoom = store.zoom
         let offset = store.offset
         let center = CGPoint(
@@ -567,20 +621,23 @@ struct CanvasView: View {
 
             if let node = store.nodes.first(where: { $0.id == nodeID }),
                let history = node.history, !history.isEmpty {
-                // 不用 ScrollView：它会拦截滚轮事件导致画布无法滚动/缩放；改用裁剪的 VStack，滚轮穿透到画布
-                VStack(spacing: 12) {
-                    ForEach(history.reversed()) { entry in
-                        historyImageCell(entry: entry, cellWidth: panelW - 24, imageHeight: panelW * 0.62) {
-                            restoreNodeHistory(to: nodeID, entry: entry)
-                            closeAllPanels()
+                // 滚动查看全部卡片：条目多时在面板内上下滚动；鼠标移出面板区域后滚轮回到画布
+                // 隐藏滚动条（避免滚动条贴面板右缘被圆角/阴影切成"半里半外"），保留滚动能力
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 12) {
+                        ForEach(history.reversed()) { entry in
+                            historyImageCell(entry: entry, cellWidth: panelW - 24, imageHeight: panelW * 0.62) {
+                                restoreNodeHistory(to: nodeID, entry: entry)
+                                closeAllPanels()
+                            }
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 2)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity)
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity)
-                .frame(maxHeight: 480)
-                .clipped()
+                .frame(maxHeight: 360)
                 Text("点击图片可替换当前内容")
                     .font(.caption2)
                     .foregroundColor(.secondary)
@@ -823,7 +880,13 @@ struct CanvasView: View {
         let node = store.nodes.first(where: { $0.id == nodeID })
         let quality = node?.quality ?? .standard
         let ratio = node?.ratio ?? store.currentRatio
-        let duration = node?.duration ?? store.currentDuration
+        let duration: VideoDuration
+        if let curNode = node, curNode.type == .video, let chain = store.chainVideoDisplayInfo(for: curNode) {
+            // 尾帧续接链路：时长延续链首（与比例/档位下拉的跟随显示一致），保证链路各段时长一致
+            duration = chain.duration ?? store.currentDuration
+        } else {
+            duration = node?.duration ?? store.currentDuration
+        }
         let size: (width: Int, height: Int)
         if node?.type == .video {
             // 尾帧续接链路：跟随前置视频实际尺寸（模型无关，读取资产库视频文件像素尺寸）
@@ -941,6 +1004,14 @@ struct CanvasView: View {
     func propagateContinuousVideo(from nodeID: UUID, visited: Set<UUID>) {
         // 发光提示：先熄灭全部旧发光线（本节点完成后，上一跳的连线不再发光）
         store.glowingConnectionIDs.removeAll()
+        // 源节点尾帧状态以"完成回调触发瞬间"的实时值判定：
+        // 用户生成中途关掉尾帧 = 明确中断续接，本节点完成不再触发下游；
+        // （与 h3ChainSourceID / 发光判定共用 tailFrameEnabled 语义，保证关灯与中断一致）
+        guard let source = store.nodes.first(where: { $0.id == nodeID }),
+              source.type == .video, source.tailFrameEnabled else {
+            debugLog("连续视频模式：源节点 \(nodeID) 尾帧已关闭，中断级联传播")
+            return
+        }
         var newVisited = visited
         newVisited.insert(nodeID)
         for conn in store.connections where conn.fromID == nodeID {
@@ -1171,6 +1242,7 @@ struct CanvasView: View {
     /// 组内节点自动展开所在组，并让大纲滚动栏聚焦到该节点行
     func beginOutlineRename(_ node: CanvasNode) {
         showOutlinePanel = true
+        outlinePanelTab = .outline
         outlineRenameNodeID = node.id
         outlineRenameText = node.title
         if let gid = node.groupID {
@@ -1299,6 +1371,7 @@ struct CanvasView: View {
                     onDurationChange: makeNodeFieldUpdater(node.id, keyPath: \.duration) { "节点输入框：写入视频节点时长 \($0.displayName)" },
                     onImageQualityChange: makeNodeFieldUpdater(node.id, keyPath: \.imageQuality) { "节点输入框：写入图像节点档位 \($0.displayName)" },
                     isGenerating: GenerationQueue.shared.isGenerating(nodeID: node.id),
+                    isChainSourceGenerating: store.h3ChainSourceID(for: node.id).map { GenerationQueue.shared.isGenerating(nodeID: $0) } ?? false,
                     validationError: inputValidationErrors[node.id]
                 )
                 // 背景 GeometryReader 只读尺寸不改布局；position 中心 = 底边 + 10 + 卡片高/2，顶部正好贴底边 + 10
@@ -1344,6 +1417,7 @@ struct CanvasView: View {
                     onDurationChange: makeNodeFieldUpdater(node.id, keyPath: \.duration) { "展开输入框：写入视频节点时长 \($0.displayName)" },
                     onImageQualityChange: makeNodeFieldUpdater(node.id, keyPath: \.imageQuality) { "展开输入框：写入图像节点档位 \($0.displayName)" },
                     isGenerating: GenerationQueue.shared.isGenerating(nodeID: node.id),
+                    isChainSourceGenerating: store.h3ChainSourceID(for: node.id).map { GenerationQueue.shared.isGenerating(nodeID: $0) } ?? false,
                     validationError: inputValidationErrors[node.id]
                 )
             }
@@ -1364,11 +1438,13 @@ struct CanvasView: View {
             }
 
             // 大纲视图面板（从左侧工具栏右侧延伸）
-            if showOutlinePanel {
-                outlinePanel
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-                    .offset(x: leftToolbarFrame.width + 12)
-            }
+            // 常驻渲染 + 透明度/命中控制：关闭时 ScrollView 不销毁，
+            // 手动打开能保留上次滚动位置；改名聚焦仍由 onChange(of: outlineScrollTarget) 驱动
+            outlinePanel
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .offset(x: leftToolbarFrame.width + 12)
+                .opacity(showOutlinePanel ? 1 : 0)
+                .allowsHitTesting(showOutlinePanel)
             
             // 添加节点面板（左侧工具栏加号，从工具栏右侧延伸）
             if showToolbarAddPanel {
@@ -1547,7 +1623,16 @@ struct CanvasView: View {
             nodes: nodes.map {
                 ClipboardNode(id: $0.id, type: $0.type, title: $0.title, subtitle: $0.subtitle,
                               needsSupplement: $0.needsSupplement, position: $0.position,
-                              imageFileName: $0.imageFileName)
+                              imageFileName: $0.imageFileName,
+                              groupID: $0.groupID,
+                              prompt: $0.prompt.isEmpty ? nil : $0.prompt,
+                              ratio: $0.ratio,
+                              duration: $0.duration,
+                              tailFrameEnabled: $0.tailFrameEnabled,
+                              model: $0.model,
+                              quality: $0.quality,
+                              imageModel: $0.imageModel,
+                              imageQuality: $0.imageQuality)
             },
             connections: connections.map { ClipboardConnection(fromID: $0.fromID, toID: $0.toID) }
         )
@@ -1575,16 +1660,36 @@ struct CanvasView: View {
                                       offset: store.offset, zoom: store.zoom)
         // 旧 id → 新 id 映射
         var idMap: [UUID: UUID] = [:]
+        // 组映射：同组节点（复制集合内同一 groupID ≥2 个）映射为新组 id，粘贴后重建组框；
+        // 仅 1 个成员的组不保留（避免无意义的单节点组）
+        var groupCounts: [UUID: Int] = [:]
+        for node in data.nodes {
+            if let gid = node.groupID { groupCounts[gid, default: 0] += 1 }
+        }
+        var groupIDMap: [UUID: UUID] = [:]
+        for (gid, count) in groupCounts where count >= 2 {
+            groupIDMap[gid] = UUID()
+        }
         for oldNode in data.nodes {
             let newPos = CGPoint(x: oldNode.position.x - oldCenter.x + viewCenter.x,
                                  y: oldNode.position.y - oldCenter.y + viewCenter.y)
+            // 按「存在性」逐个赋值：剪贴板缺字段时使用默认值/跳过，旧数据与未来参数增删均不报错
             let newNode = NodeFactory.createNode(
                 type: oldNode.type,
                 title: oldNode.title,
                 subtitle: oldNode.subtitle,
                 needsSupplement: oldNode.needsSupplement,
                 position: newPos,
-                imageFileName: oldNode.imageFileName
+                imageFileName: oldNode.imageFileName,
+                prompt: oldNode.prompt ?? "",
+                groupID: oldNode.groupID.flatMap { groupIDMap[$0] },
+                ratio: oldNode.ratio,
+                duration: oldNode.duration,
+                tailFrameEnabled: oldNode.tailFrameEnabled ?? true,
+                model: oldNode.model ?? .ltx25Distill,
+                quality: oldNode.quality ?? .standard,
+                imageModel: oldNode.imageModel ?? .hidreamO1,
+                imageQuality: oldNode.imageQuality ?? .p720
             )
             idMap[oldNode.id] = newNode.id
             store.nodes.append(newNode)
@@ -1622,10 +1727,13 @@ struct DraggableGrid: View {
         let g = gridSize * zoom
         let phaseX = posMod(offset.x, g)
         let phaseY = posMod(offset.y, g)
+        // 网格点随缩放变透明：缩放率 >= 70% 不透明；< 70% 按比例降低；<= 50% 封顶 50% 不再降
+        let dotOpacity: Double = zoom >= 0.7 ? 1.0 : max(zoom, 0.5)
         DotGridLayerView(spacing: g,
                          dotSize: 3,
                          dotColor: NSColor(gridColor).cgColor,
-                         showGrid: showGrid)
+                         showGrid: showGrid,
+                         dotOpacity: dotOpacity)
             .offset(x: phaseX - g, y: phaseY - g)
             .ignoresSafeArea()
     }
@@ -1643,6 +1751,7 @@ struct DotGridLayerView: NSViewRepresentable {
     var dotSize: Double
     var dotColor: CGColor
     var showGrid: Bool
+    var dotOpacity: Double = 1.0
     
     func makeNSView(context: Context) -> DotGridLayerNSView {
         DotGridLayerNSView(dotSize: dotSize)
@@ -1651,7 +1760,8 @@ struct DotGridLayerView: NSViewRepresentable {
     func updateNSView(_ nsView: DotGridLayerNSView, context: Context) {
         nsView.update(spacing: spacing,
                       dotColor: dotColor,
-                      showGrid: showGrid)
+                      showGrid: showGrid,
+                      dotOpacity: dotOpacity)
     }
 }
 
@@ -1667,6 +1777,7 @@ final class DotGridLayerNSView: NSView {
     private var pendingSpacing: CGFloat = 0
     private var pendingColor: CGColor?
     private var pendingShowGrid = true
+    private var pendingOpacity: Double = 1.0
     private let dotSize: CGFloat
     
     init(dotSize: CGFloat) {
@@ -1679,11 +1790,17 @@ final class DotGridLayerNSView: NSView {
     
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     
-    func update(spacing: CGFloat, dotColor: CGColor, showGrid: Bool) {
+    func update(spacing: CGFloat, dotColor: CGColor, showGrid: Bool, dotOpacity: Double) {
         pendingSpacing = spacing
         pendingColor = dotColor
         pendingShowGrid = showGrid
+        pendingOpacity = dotOpacity
         dotLayer.isHidden = !showGrid
+        // 透明度随缩放平滑过渡，与画布统一动画时长一致
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.3)
+        dotLayer.opacity = Float(dotOpacity)
+        CATransaction.commit()
         applyIfReady()
     }
     

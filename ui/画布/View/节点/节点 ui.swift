@@ -135,6 +135,10 @@ struct NodeView: View {
             VStack(alignment: .leading, spacing: 0) {
                 // 顶部占位区（有图片显示资产图片，空节点显示占位图标 + 上传/资产库按钮）
                 ZStack {
+                    // 素材区不透明垫底：贴边盖住素材段描边内侧，避免半透明灰底/图片 fit 留缝透出
+                    // 描边淡色（深紫描边 + 透过白底的淡紫描边叠成双层轮廓）；与标签区压线带同理
+                    UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3, style: .continuous)
+                        .fill(Color.white)
                     // 占位区底色：音频节点用主题色梦幻淡染（对角浅渐变，随全局节点主题色换肤），
                     // 其他类型保持中性浅灰（内容为主，不给颜色）
                     Group {
@@ -377,11 +381,14 @@ struct NodeView: View {
                                         lineWidth: isSelected ? 2 : (isHovered ? 2 : 1))
                         )
                     // 标签区压线带：不透明卡片底色贴边（顶部直角），从信息栏顶（Divider 下缘）盖到卡片底，
-                    // 压住标签段描边内侧 → 与素材区图片压住描边一致，全局镂空细线
+                    // 压住标签段描边内侧 → 与素材区图片压住描边一致，全局镂空细线；
+                    // 左右内缩 0.7pt：描边保留 85% 露出（2pt 描边露 1.7pt），避免被压得过细
                     UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 10, bottomTrailingRadius: 10, topTrailingRadius: 0, style: .continuous)
                         .fill(Color.white)
                         .frame(maxHeight: .infinity)
-                        .padding(.top, placeholderHeight + 1)
+                        .padding(.top, placeholderHeight)
+                        .padding(.horizontal, 0.7)
+                        .padding(.bottom, 0.7)
                 }
             )
             .shadow(color: isHovered ? accentColor.opacity(settings.hoverGlowIntensity) : .clear, radius: settings.hoverGlowRadius)
@@ -712,9 +719,9 @@ struct NodePromptBar: View {
     @Binding var text: String
     var onExpand: () -> Void
     var onSend: () -> Void
-    /// 尾帧续接链路展示信息：非 nil = 本视频节点处于尾帧续接链路（h3ChainSourceID 命中且前置
-    /// 视频节点有实际像素尺寸），生成尺寸强制跟随前置视频；尺寸档位/比例下拉改为展示前置视频
-    /// 实际档位/比例并禁用（延续前置视频，仅告知不可改）
+    /// 尾帧续接链路展示信息：非 nil = 本视频节点处于尾帧续接链路（链上存在上游续接源），
+    /// 生成尺寸/比例/时长强制跟随链首（最上游非续接视频节点）当前参数；尺寸档位/比例/时长
+    /// 下拉改为展示链首即将生效参数并禁用（延续链首参数，仅告知不可改）
     var chainDisplayInfo: CanvasStore.ChainVideoDisplayInfo? = nil
     var onRatioChange: (CanvasStore.Ratio) -> Void
     /// 视频节点模型选择回调
@@ -731,6 +738,9 @@ struct NodePromptBar: View {
     var onImageQualityChange: (ImageQuality) -> Void = { _ in }
     /// 视频生成中：发送按钮转圈禁用（仅视频节点生成期间为 true）
     var isGenerating: Bool = false
+    /// 前置视频（尾帧续接源，已开尾帧）正在生成：本节点发送按钮一并禁用，
+    /// 避免手动点生成与级联传播冲突（闪退恢复后前置空闲时仍可手动生成）
+    var isChainSourceGenerating: Bool = false
     /// 输入校验错误（视频节点发送前检查连线输入，超限时由外部写入；非 nil 显示红色感叹号）
     var validationError: String? = nil
     @State private var showValidationPopover = false
@@ -863,11 +873,12 @@ struct NodePromptBar: View {
                             .foregroundColor(.secondary)
                         }
                         
-                        // 时长下拉：5s / 10s（nil 跟随全局秒数）
+                        // 时长下拉：5s / 10s / 15s（nil 跟随全局秒数；续接链路中禁用并跟随链首时长）
                         compactMenu(
                             items: VideoDuration.allCases,
                             isSelected: { node.duration == $0 },
                             displayName: { $0.displayName },
+                            disabled: chainDisplayInfo != nil,
                             onSelect: { d in
                                 debugLog("节点输入框：选择视频时长 \(d.displayName)")
                                 onDurationChange(d)
@@ -875,7 +886,7 @@ struct NodePromptBar: View {
                         ) {
                             HStack(spacing: 4) {
                                 Image(systemName: "clock")
-                                Text(node.duration?.displayName ?? currentGlobalDuration.displayName)
+                                Text(chainDisplayInfo?.duration?.displayName ?? node.duration?.displayName ?? currentGlobalDuration.displayName)
                             }
                             .font(.system(size: 12))
                             .foregroundColor(.secondary)
@@ -946,7 +957,7 @@ struct NodePromptBar: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(isGenerating)
+                .disabled(isGenerating || isChainSourceGenerating)
             }
         }
         .padding(12)
@@ -1021,9 +1032,9 @@ struct ExpandedNodePromptView: View {
     @Binding var text: String
     var onClose: () -> Void
     var onSend: () -> Void
-    /// 尾帧续接链路展示信息：非 nil = 本视频节点处于尾帧续接链路（h3ChainSourceID 命中且前置
-    /// 视频节点有实际像素尺寸），生成尺寸强制跟随前置视频；尺寸档位/比例下拉改为展示前置视频
-    /// 实际档位/比例并禁用（延续前置视频，仅告知不可改）
+    /// 尾帧续接链路展示信息：非 nil = 本视频节点处于尾帧续接链路（链上存在上游续接源），
+    /// 生成尺寸/比例/时长强制跟随链首（最上游非续接视频节点）当前参数；尺寸档位/比例/时长
+    /// 下拉改为展示链首即将生效参数并禁用（延续链首参数，仅告知不可改）
     var chainDisplayInfo: CanvasStore.ChainVideoDisplayInfo? = nil
     var onRatioChange: (CanvasStore.Ratio) -> Void
     /// 视频节点模型选择回调
@@ -1040,6 +1051,8 @@ struct ExpandedNodePromptView: View {
     var onImageQualityChange: (ImageQuality) -> Void = { _ in }
     /// 视频生成中：发送按钮转圈禁用
     var isGenerating: Bool = false
+    /// 前置视频（尾帧续接源，已开尾帧）正在生成：本节点发送按钮一并禁用
+    var isChainSourceGenerating: Bool = false
     /// 输入校验错误（视频节点发送前检查连线输入，超限时由外部写入；非 nil 显示红色感叹号）
     var validationError: String? = nil
     @State private var showValidationPopover = false
@@ -1152,11 +1165,12 @@ struct ExpandedNodePromptView: View {
                                 .foregroundColor(.secondary)
                             }
                             
-                            // 时长下拉：5s / 10s（nil 跟随全局秒数）
+                            // 时长下拉：5s / 10s / 15s（nil 跟随全局秒数；续接链路中禁用并跟随链首时长）
                             compactMenu(
                                 items: VideoDuration.allCases,
                                 isSelected: { node.duration == $0 },
                                 displayName: { $0.displayName },
+                                disabled: chainDisplayInfo != nil,
                                 onSelect: { d in
                                     debugLog("展开输入框：选择视频时长 \(d.displayName)")
                                     onDurationChange(d)
@@ -1164,7 +1178,7 @@ struct ExpandedNodePromptView: View {
                             ) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "clock")
-                                    Text(node.duration?.displayName ?? currentGlobalDuration.displayName)
+                                    Text(chainDisplayInfo?.duration?.displayName ?? node.duration?.displayName ?? currentGlobalDuration.displayName)
                                 }
                                 .font(.system(size: 12))
                                 .foregroundColor(.secondary)
@@ -1237,7 +1251,7 @@ struct ExpandedNodePromptView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(isGenerating)
+                    .disabled(isGenerating || isChainSourceGenerating)
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 14)

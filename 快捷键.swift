@@ -149,6 +149,10 @@ final class PassthroughView: NSView {
 // MARK: - 剪贴板节点数据（Command+C / Command+V 复制粘贴用）
 
 /// 剪贴板中的节点（id 用 var 以便解码恢复原始 id，用于连线映射）
+/// 携带用户可见可编辑的参数（提示词、模型、档位、比例、时长、尾帧开关），
+/// 以及所属组标记（groupID：粘贴时同组节点重建为新组，组框一并复制）。
+/// 新增字段全部 Optional —— Codable 对 Optional 自动 decodeIfPresent，旧剪贴板数据缺字段时为 nil，
+/// 粘贴侧按「存在性」逐个赋值、缺失跳过，保证旧数据兼容与未来参数增删容错。
 struct ClipboardNode: Codable {
     var id: UUID
     var type: NodeType
@@ -157,6 +161,16 @@ struct ClipboardNode: Codable {
     var needsSupplement: Bool
     var position: CGPoint
     var imageFileName: String?
+    // 以下为新增参数（旧剪贴板数据缺失时均为 nil，粘贴自动跳过）
+    var groupID: UUID? = nil            // 所属组（粘贴时同组节点映射为新组 id，重建组框）
+    var prompt: String? = nil           // 节点自身提示词
+    var ratio: CanvasStore.Ratio? = nil // 视频节点私有比例
+    var duration: VideoDuration? = nil  // 视频节点私有时长
+    var tailFrameEnabled: Bool? = nil   // 视频节点尾帧开关
+    var model: VideoModel? = nil        // 视频生成模型
+    var quality: VideoQuality? = nil    // 视频清晰度档位
+    var imageModel: ImageModel? = nil   // 图像/角色/场景生成模型
+    var imageQuality: ImageQuality? = nil // 图像/角色/场景尺寸档位
 }
 
 /// 剪贴板中的连线（仅记录 from/to，id 粘贴时重建）

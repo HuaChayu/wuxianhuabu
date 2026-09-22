@@ -56,6 +56,8 @@ extension CanvasView {
                 withAnimation {
                     closeAllPanels()
                     showOutlinePanel.toggle()
+                    // 手动打开时不携带上次改名聚焦的残留目标，避免面板挂载后 onAppear 误滚到底部
+                    outlineScrollTarget = nil
                 }
                 debugLog("工具栏：点击大纲视图 \(showOutlinePanel ? "打开" : "关闭")")
             }) {
@@ -441,6 +443,18 @@ extension CanvasView {
                                 }
                             }
                             .frame(maxWidth: .infinity, alignment: .top)
+                        }
+                    }
+                    .onAppear {
+                        // 面板首次挂载兜底：beginOutlineRename 同一帧打开面板并设置
+                        // outlineScrollTarget，onChange 在挂载前不触发，这里补一次滚动
+                        if let target = outlineScrollTarget {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                guard showOutlinePanel, outlineScrollTarget == target else { return }
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    proxy.scrollTo(target, anchor: .center)
+                                }
+                            }
                         }
                     }
                     .onChange(of: outlineScrollTarget) { _, target in
