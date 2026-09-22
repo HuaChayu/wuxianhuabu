@@ -35,6 +35,8 @@
 //      align_corners=False（3D keyframe latent 按 (B,T,C,h,w) 折成批次逐帧插值），
 //      再做逐 (帧, 通道) 的**加性**均值对齐 `resized + (source_mean - resized_mean)`。
 //  直接 latent 提升：官方 H3 路径硬编码 nearest（selflift.py 行 18 默认值 + nodes.py 行 509 实参）。
+//      ★ 2026-09-22 弃用：nearest 升频算法无效，本工程不再走该回退/提升路径，统一用官方
+//        learned upscaler（时间维感知，×2）；learned 不可用时显式报错终止，绝不静默降级。
 //  像素锚点重建：官方 `_pixel_anchor_video_single`（selflift.py 行 87-98）= decode →
 //      `F.interpolate(size=(H·ratio, W·ratio), mode="bicubic", antialias=True)` → encode，
 //      ratio = frames.shape[1] // z0_low.shape[-2]（本工程为 16）。
@@ -48,7 +50,8 @@
 //     `expandedDimensions` / `concatenated`（均已在工程依赖的 mlx-swift 版本中确认存在）。
 //  4. hooks 的两个闭包由 H3Pipeline 侧注入 —— 这样 Runner 不依赖 H3VAE 内部字段。
 //     · decodeToPixels / encodeToLatent 直接包 H3VAEDecoder.decode / H3VAEEncoder.encodeVideo
-//     · 不再需要「latent ×2 上采样」注入：官方 H3 路径固定 nearest，已在文件内实现
+//     · 不再需要「latent ×2 上采样」注入：官方 learned upscaler（2026-09-22 起替代
+//       nearest）已在文件内实现（slLearnedLiftLatent / SelfLiftResample）
 //
 //  ⚠️ 本文件未改动 H3Pipeline.swift；接线方式见文件末尾注释。
 //
@@ -99,30 +102,34 @@ public struct SelfLiftH3Hooks {
     }
 }
 
-// 官方 learned latent upscaler（时间维感知）的按需加载：以 NA_H3_UPSCALER 环境变量当前值为键缓存，
-// 支持进程内 A/B 切换（如 h3管线自检 NA_H3TEST=21 里先 nearest 后 learned 顺序跑）。
-// 默认（不设 / 空）→ H3LatentUpscaler（官方 learned upscaler，已在 1344×768 实测显著消除面部重影）；
-// NA_H3_UPSCALER=nearest → 回退 slNearestLiftLatent（与 h3_53 等历史产物一致）。
-private var h3LearnedUpscalerCache: (key: String, up: H3LatentUpscaler?)? = nil
-private func h3LearnedUpscalerForCurrentEnv() -> H3LatentUpscaler? {
+// 官方 learned latent upscaler（时间维感知）的按需加载：以 NA_H3_UPSCALER 环境变量当前值为键缓存。
+// 2026-09-22 起 nearest 回退分支已移除：learned 权重不可用时直接抛错终止，绝不静默降级。
+// 默认（不设 / 空 / learned）→ H3LatentUpscaler（官方 learned upscaler，已在 1344×768 实测显著消除面部重影）；
+// NA_H3_UPSCALER=nearest 已于 2026-09-22 弃用（该回退算法无效），不再识别。
+private var h3LearnedUpscalerCache: (key: String, up: H3LatentUpscaler)? = nil
+private func h3LearnedUpscalerForCurrentEnv() throws -> H3LatentUpscaler {
     let key = ProcessInfo.processInfo.environment["NA_H3_UPSCALER"] ?? ""
     if let c = h3LearnedUpscalerCache, c.key == key { return c.up }
-    var up: H3LatentUpscaler? = nil
-    if key != "nearest" {
-        let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
-        let modelRootURL = URL(fileURLWithPath: modelDir, isDirectory: true)
-        let wURL = { (name: String) -> URL in
-            let direct = modelRootURL.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: direct.path) { return direct }
-            return FileFinder.first(named: name, under: modelRootURL) ?? direct
-        }
-        let path = ProcessInfo.processInfo.environment["NA_H3_UPSCALER_PATH"]
-            ?? wURL("minimax_h3_latent_upscaler_3d_bf16.safetensors").path
-        if let w = try? H3Weights(url: URL(fileURLWithPath: path)) {
-            up = try? H3LatentUpscaler(weights: w)
-        } else {
-            NSLog("NA_H3_UPSCALER!=nearest 但 learned 权重加载失败：%@", path)
-        }
+    let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
+    let modelRootURL = URL(fileURLWithPath: modelDir, isDirectory: true)
+    let wURL = { (name: String) -> URL in
+        let direct = modelRootURL.appendingPathComponent(name)
+        if FileManager.default.fileExists(atPath: direct.path) { return direct }
+        return FileFinder.first(named: name, under: modelRootURL) ?? direct
+    }
+    let path = ProcessInfo.processInfo.environment["NA_H3_UPSCALER_PATH"]
+        ?? wURL("minimax_h3_latent_upscaler_3d_bf16.safetensors").path
+    guard let w = try? H3Weights(url: URL(fileURLWithPath: path)) else {
+        // 2026-09-22：nearest 回退已移除，learned 不可用即显式报错终止。
+        throw NSError(domain: "H3SelfLift", code: 41, userInfo: [NSLocalizedDescriptionKey:
+            "learned upscaler 不可用（权重加载失败：\(path)）；nearest 回退已于 2026-09-22 移除，SelfLift 终止"])
+    }
+    let up: H3LatentUpscaler
+    do {
+        up = try H3LatentUpscaler(weights: w)
+    } catch {
+        throw NSError(domain: "H3SelfLift", code: 42, userInfo: [NSLocalizedDescriptionKey:
+            "learned upscaler 权重解析失败（\(path)）：\(error.localizedDescription)；nearest 回退已于 2026-09-22 移除，SelfLift 终止"])
     }
     h3LearnedUpscalerCache = (key, up)
     return up
@@ -159,6 +166,7 @@ private func fromNCDHW(_ ncdhw: MLXArray, c: Int) -> MLXArray {
 ///
 /// 官方四处调用里，本工程 H3 一采用到其中三处，逐条照抄、不换自创插值：
 ///   · 直接 latent 提升        `mode="nearest"`                      — selflift.py 行 18 / 54，H3 硬编码
+///     ★ 2026-09-22 弃用：本工程不再走 nearest 提升/回退，统一用 learned upscaler（见 slLearnedLiftLatent）。
 ///   · 像素锚点重建            `mode="bicubic", antialias=True`       — selflift.py 行 95
 ///   · 条件行（keyframe）降采样 `mode="bilinear", align_corners=False` — nodes.py 行 191-198
 ///
@@ -280,18 +288,27 @@ private func slLowResSize(_ target: Int, scale: Double) -> Int {
     max(2, Int((Double(target) * scale / 2).rounded()) * 2)
 }
 
-/// [T,H,W,C] → [T,outH,outW,C]：**最近邻**直接 latent 提升
-/// （官方 H3 路径硬编码 `mode="nearest"`：selflift.py 行 18 / 54、nodes.py 行 509）
-private func slNearestLiftLatent(_ x: MLXArray, outH: Int, outW: Int,
-                                 keepAlive: SelfLiftTensorKeepAlive? = nil) -> MLXArray {
-    let h = SelfLiftResample.resizeAxis(
-        x, axis: 1, table: SelfLiftResample.nearestTable(inSize: x.shape[1], outSize: outH),
-        keepAlive: keepAlive)
-    let out = SelfLiftResample.resizeAxis(
-        h, axis: 2, table: SelfLiftResample.nearestTable(inSize: x.shape[2], outSize: outW),
-        keepAlive: keepAlive)
-    keepAlive?.hold([h, out])
-    return out
+/// [T,H,W,C] → [T,outH,outW,C]：官方 learned upscaler 直接 latent 提升
+/// （时间维感知 ×2，已在 1344×768 实测显著消除面部重影；目标半尺寸为奇数时 ×2 后与
+/// 目标不一致，补一次最近邻 resize 对齐，与官方 old 路径同口径）。
+/// 2026-09-22：nearest 回退分支已移除，learned 权重不可用时直接抛错终止，绝不静默降级。
+private func slLearnedLiftLatent(_ x: MLXArray, outH: Int, outW: Int,
+                                 keepAlive: SelfLiftTensorKeepAlive? = nil) throws -> MLXArray {
+    let us = try h3LearnedUpscalerForCurrentEnv()
+    let zIn = toNCDHW(x, c: x.shape[3])                                     // [1,C,T,h,w]
+    let zUp = us.apply(zIn)                                                 // [1,C,T,H,W]（×2）
+    var up = fromNCDHW(zUp, c: x.shape[3])                                  // [T,H,W,C]
+    if up.shape[1] != outH || up.shape[2] != outW {
+        let h = SelfLiftResample.resizeAxis(
+            up, axis: 1, table: SelfLiftResample.nearestTable(inSize: up.shape[1], outSize: outH),
+            keepAlive: keepAlive)
+        up = SelfLiftResample.resizeAxis(
+            h, axis: 2, table: SelfLiftResample.nearestTable(inSize: up.shape[2], outSize: outW),
+            keepAlive: keepAlive)
+        keepAlive?.hold([h, up])
+    }
+    keepAlive?.hold([up])
+    return up
 }
 
 /// 条件行（keyframe）降采样：官方 `nodes.py` 的 `_resize_keyframes`（行 174-208）——
@@ -537,11 +554,11 @@ public func runH3Stage1WithSelfLift(
             let rows = H3TensorOps.patchifyVideo(low, gridH: gHl, gridW: gWl)
             keepAlive.hold([lat, low, rows])
             condSegs.append(rows)
-            // ★ 高清条件 = 同一份低清 keyframe 直接提升回全分辨率（nearest，与官方 latent
-            //   提升同口径）：背景结构坐标与低清循环固化的一致 → 消除"低清残留 vs 全分辨率
+            // ★ 高清条件 = 同一份低清 keyframe 用 learned upscaler 提升回全分辨率（2026-09-22 起
+            //   不再回退 nearest）：背景结构坐标与低清循环固化的一致 → 消除"低清残留 vs 全分辨率
             //   keyframe 重注入"的双套网格错位（h3_62 背景重影根因，h3_64 ref2va 复盘）。
-            let up = slNearestLiftLatent(low, outH: latH, outW: latW,
-                                         keepAlive: keepAlive)                       // [1,latH,latW,C]
+            let up = try slLearnedLiftLatent(low, outH: latH, outW: latW,
+                                             keepAlive: keepAlive)            // [1,latH,latW,C]
             let rowsHigh = H3TensorOps.patchifyVideo(up, gridH: gridH, gridW: gridW)
             keepAlive.hold([up, rowsHigh])
             condSegsHigh.append(rowsHigh)
@@ -849,28 +866,17 @@ public func runH3Stage1WithSelfLift(
     slDiag("入口屏障后起步")
 
     // ── 4. 过渡块（零 NFE）──────────────────────────────────────────────
-    // 4.1 直接 latent 提升：默认官方 learned upscaler（H3LatentUpscaler，时间维感知，
-    //     实测 1344×768 高分辨率下显著消除帧间双像/面部重影，见 h3_scene_ab 自检结论）；
-    //     NA_H3_UPSCALER=nearest 时可回退官方 old 路径 fixed nearest（selflift.py 行 18 / 54）。
+    // 4.1 直接 latent 提升：官方 learned upscaler（H3LatentUpscaler，时间维感知，
+    //     实测 1344×768 高分辨率下显著消除帧间双像/面部重影，见 h3_scene_ab 自检结论）。
+    //     2026-09-22 起 nearest 回退分支已移除：learned 不可用即显式终止，绝不静默降级。
     let liftLatentRows: (MLXArray) -> MLXArray = { rows in
         let lat = H3TensorOps.unpatchifyVideo(rows, gridH: gHl, gridW: gWl)      // [latT,latHl,latWl,C]
         let up: MLXArray
-        let useNearest = ProcessInfo.processInfo.environment["NA_H3_UPSCALER"] == "nearest"
-        if !useNearest, let us = h3LearnedUpscalerForCurrentEnv() {
-            let zIn = toNCDHW(lat, c: latC)                                     // [1,C,T,h,w]
-            let zUp = us.apply(zIn)                                             // [1,C,T,H,W]（×2）
-            var upLat = fromNCDHW(zUp, c: latC)                                 // [latT,latH,latW,C]
-            // ★ 2026-09-18：learned upscaler 固定 ×2，当目标 latent 半尺寸为奇数时（如 864×480
-            //   → 30×54，低分 16×28 取偶），×2 后 32×56 ≠ 目标 30×54，过渡块 patchify 直接
-            //   reshape 崩溃。×2 与目标不一致时补一次 nearest resize 对齐（与官方 old 路径同口径）。
-            if upLat.shape[1] != latH || upLat.shape[2] != latW {
-                upLat = slNearestLiftLatent(upLat, outH: latH, outW: latW,
-                                            keepAlive: keepAlive)
-            }
-            up = upLat
-        } else {
-            up = slNearestLiftLatent(lat, outH: latH, outW: latW,
-                                     keepAlive: keepAlive)                       // [latT,latH,latW,C]
+        do {
+            up = try slLearnedLiftLatent(lat, outH: latH, outW: latW,
+                                         keepAlive: keepAlive)                   // [latT,latH,latW,C]
+        } catch {
+            preconditionFailure("learned upscaler 不可用，SelfLift 终止（nearest 回退已于 2026-09-22 移除）：\(error.localizedDescription)")
         }
         let rowsOut = H3TensorOps.patchifyVideo(up, gridH: gridH, gridW: gridW)
         keepAlive.hold([lat, up, rowsOut])
@@ -1138,6 +1144,8 @@ public func runH3Stage1WithSelfLift(
 //  · 低分条件行不用平均池化：走官方 `_resize_keyframes`（逐帧 bilinear + 加性均值对齐），
 //    尺寸一致时（lowResScale = 1）原样返回，与官方 `if kf.latent.shape == ...` 的早退一致。
 //  · 过渡块里的三种插值（nearest / bicubic-antialias / bilinear）都在文件内实现，hooks 不再需要注入放大函数。
+//    ★ 2026-09-22：直接 latent 提升不再走 nearest（算法无效，已弃用），统一用 learned upscaler；
+//       nearestTable 仅保留为 learned ×2 与目标尺寸不一致时的对齐 resize 工具。
 //  · 结束后 `dit.adalnTables` 已被重算回高分（原分辨率）的 ts 表，后续 stage2/直出无需额外处理。
 //  · 过渡块会多跑一次 VAE decode+encode（rho>0 时）；如需最省算力可设 rho=0 走纯 latent 提升。
 //  · ts 不写死：Runner 内部按 `cfg.transitionStep`（0 = 自动）解析，N = sigmas.count - 1

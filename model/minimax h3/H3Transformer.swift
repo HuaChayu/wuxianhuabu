@@ -5,7 +5,7 @@
 //  对应源码: /Users/huachayui/Downloads/mlx-serve-main/src/minimax_h3.zig
 //  模块:  Model / AttnW / MlpW / AdalnW / BlockW / RefinerBlockW
 //         timeEmbed / refineText / precomputeAdaln / forward / finalHead
-//  权重:  transformer.safetensors (affine 4-bit group64 量化 + fp32 岛) + turbo_lora.safetensors
+//  权重:  transformer.safetensors (affine 6-bit group64 量化 + fp32 岛) + turbo_lora.safetensors
 //
 //  依赖:  H3Common.swift (H3Weights / MfLinear / H3LoraFile / rmsNormLast / applyRopePub ...)
 //         H3Layout.swift (PackedLayout / buildRope / buildTimestepPlan / ModRun / SparseSpec ...)
@@ -164,7 +164,18 @@ public enum H3TensorOps {
     }
 
     /// x[..., in] @ W[in, out] + b, all in fp32 (dense island). Matches denseLinear.
-    public static func denseLinear(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray?) -> MLXArray {
+    /// allowBF16=true 时提前降宽：x/w 均 cast bf16 后 matmul（MLX bf16 matmul 内部 fp32 累加），
+    /// bias 以 bf16 加，输出 bf16 —— 用于 patch/audio 输入投影，消除 fp32 [S, hidden] 大中间张量。
+    public static func denseLinear(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray?, allowBF16: Bool = false) -> MLXArray {
+        if allowBF16 {
+            let xb = x.asType(.bfloat16)
+            let wb = w.asType(.bfloat16)
+            var out = xb.matmul(wb)
+            if let b {
+                out = out + b.asType(.bfloat16)
+            }
+            return out
+        }
         let xf = x.asType(.float32)
         let wf = w.asType(.float32)
         var out = xf.matmul(wf)
@@ -448,11 +459,18 @@ public final class H3AttnW {
                 continue
             }
             let nw = i == 0 ? qNorm : kNorm
-            let normed = rmsNormLast(v4, weight: nw, eps: cfg.normEps)
-            if let rope {
-                qkvn.append(applyRopePub(normed, cos: rope.cos, sin: rope.sin, rot: rotHalf * 2))
+            if let rope, H3FusedKernels.fuseEnabled {
+                // P0 融合 kernel：rmsNormLast + applyRopePub 一次完成（NA_H3_FUSE=0 回退旧实现）
+                qkvn.append(H3FusedKernels.fusedRmsnormRope(v4, weight: nw,
+                                                            cos: rope.cos, sin: rope.sin,
+                                                            rot: rotHalf * 2, eps: cfg.normEps))
             } else {
-                qkvn.append(normed)
+                let normed = rmsNormLast(v4, weight: nw, eps: cfg.normEps)
+                if let rope {
+                    qkvn.append(applyRopePub(normed, cos: rope.cos, sin: rope.sin, rot: rotHalf * 2))
+                } else {
+                    qkvn.append(normed)
+                }
             }
         }
 
@@ -1083,14 +1101,21 @@ public final class H3DiT {
                 fatalError("H3DiT.forward requires precomputed AdaLN tables; call precomputeAdaln first")
             }
 
-            // Attention branch (PAB cache)
-            var at: MLXArray
+            // Attention + MLP branch (PAB block-level cache: attn out at + mlp out mo)
+            let at: MLXArray
+            let mo: MLXArray
             let cacheable = attnBcast != nil
-            if cacheable, !attnRefresh, attnBcast?.blocks[bi] != nil {
+            if cacheable, !attnRefresh, attnBcast?.blocks[bi] != nil, attnBcast?.mlpBlocks[bi] != nil {
+                // 复用步：at/mo 均取自缓存，跳过 norm1+qkv+rope+attn 与 norm2+fc1+fc2 整段
                 at = attnBcast!.blocks[bi]!
+                mo = attnBcast!.mlpBlocks[bi]!
             } else {
-                let n1 = rmsNormLast(h, weight: b.norm1, eps: cfg.normEps)
-                let m1 = modScaleShift(n1, shift: shiftMSA, scale: scaleMSA, runs: plan.runs)
+                // 刷新步：正常计算 at 与 mo，并同时写入 blocks[bi] 与 mlpBlocks[bi]
+                // m1 通路走 P0 融合 kernel rmsNormLast + modScaleShift
+                // （NA_H3_FUSE=0 回退由封装内部内联实现，等价旧 slice+concat）
+                let m1 = H3FusedKernels.fusedNormModscale(h, weight: b.norm1,
+                                                          shift: shiftMSA, scale: scaleMSA,
+                                                          runs: plan.runs, eps: cfg.normEps)
                 if bi == 0 { h3DumpRowStats("m1_b0", m1, limitRows: 0) }
                 let smode = sparseModeForLayer(bi, nLayers: blocks.count, policy: sparsePolicy)
                 let fDim = UInt32((Int(layout.latentH) / Int(H3Const.patchH)) * (Int(layout.latentW) / Int(H3Const.patchH)))
@@ -1106,13 +1131,21 @@ public final class H3DiT {
                 if cacheable {
                     attnBcast?.blocks[bi] = at
                 }
+                // MLP 段移入缓存分支：先按当步 gateMSA 混合 at（mo 依赖混合后 h，与旧实现一致），
+                // 再计算 norm2+fc1+fc2 并写入 mlpBlocks[bi]；复用步不再重复计算
+                let hAttn = H3FusedKernels.fusedModGate(h, gate: gateMSA, other: at, runs: plan.runs)
+                // m2 通路走同一融合 kernel：norm(hAttn) + modScale（与 m1 一致）
+                let m2 = H3FusedKernels.fusedNormModscale(hAttn, weight: b.norm2,
+                                                          shift: shiftMLP, scale: scaleMLP,
+                                                          runs: plan.runs, eps: cfg.normEps)
+                mo = b.mlp.forward(m2)
+                if cacheable {
+                    attnBcast?.mlpBlocks[bi] = mo
+                }
             }
-            h = modGate(h, gate: gateMSA, other: at, runs: plan.runs)
-
-            let n2 = rmsNormLast(h, weight: b.norm2, eps: cfg.normEps)
-            let m2 = modScaleShift(n2, shift: shiftMLP, scale: scaleMLP, runs: plan.runs)
-            let mo = b.mlp.forward(m2)
-            h = modGate(h, gate: gateMLP, other: mo, runs: plan.runs)
+            // gate 加权：两处均用当步新 gate 照常执行（旧内容 + 新门控，PAB 语义不变）
+            h = H3FusedKernels.fusedModGate(h, gate: gateMSA, other: at, runs: plan.runs)
+            h = H3FusedKernels.fusedModGate(h, gate: gateMLP, other: mo, runs: plan.runs)
             if bi == 0 || bi == 13 || bi == blocks.count - 1 {
                 h3DumpRowStats("h_block\(bi)", h, limitRows: 0)
             }
@@ -1153,10 +1186,11 @@ public final class H3DiT {
                            shift: MLXArray, scale: MLXArray,
                            w: MLXArray, b: MLXArray?) -> MLXArray {
         let part = H3TensorOps.sliceRows(h, Int(seg.start), Int(seg.end))
-        let nn = rmsNormLast(part, weight: finalNorm, eps: cfg.normEps)
         let sc = H3TensorOps.sliceRows(scale, row, row + 1)
         let sh = H3TensorOps.sliceRows(shift, row, row + 1)
-        let m = nn * (sc + MLXArray(1.0)) + sh
+        // norm + 单行 modScaleShift 融合为一次 kernel 调用（映射表全 0，无 [S,hidden] 中间展开）
+        let m = H3FusedKernels.fusedNormModscaleRow(part, weight: finalNorm,
+                                                    shift: sh, scale: sc, eps: cfg.normEps)
         let f = m.asType(.float32)
         return H3TensorOps.denseLinear(f, w, b)
     }
@@ -1164,31 +1198,5 @@ public final class H3DiT {
 
 // MARK: - Attention broadcast cache
 // H3AttnBroadcast 类与 PAB 刷新调度已抽至独立文件 H3AttnBroadcast.swift，此处不再定义。
-
-// MARK: - Modulation helpers (mirror Zig modScaleShift / modGate)
-
-public func modScaleShift(_ x: MLXArray, shift: MLXArray, scale: MLXArray,
-                          runs: [ModRun]) -> MLXArray {
-    var pieces: [MLXArray] = []
-    pieces.reserveCapacity(runs.count)
-    for r in runs {
-        let seg = H3TensorOps.sliceRows(x, Int(r.start), Int(r.end))
-        let sc = H3TensorOps.sliceRows(scale, Int(r.modRow), Int(r.modRow + 1))
-        let sh = H3TensorOps.sliceRows(shift, Int(r.modRow), Int(r.modRow + 1))
-        pieces.append(seg * (sc + MLXArray.scalar(1.0, like: scale)) + sh)
-    }
-    return concatenated(pieces, axis: 0)
-}
-
-public func modGate(_ x: MLXArray, gate: MLXArray, other: MLXArray,
-                    runs: [ModRun]) -> MLXArray {
-    var pieces: [MLXArray] = []
-    pieces.reserveCapacity(runs.count)
-    for r in runs {
-        let xs = H3TensorOps.sliceRows(x, Int(r.start), Int(r.end))
-        let os = H3TensorOps.sliceRows(other, Int(r.start), Int(r.end))
-        let g = H3TensorOps.sliceRows(gate, Int(r.modRow), Int(r.modRow + 1))
-        pieces.append(xs + os * g)
-    }
-    return concatenated(pieces, axis: 0)
-}
+// （旧 public func modScaleShift / modGate 已删除：等价实现内联进 H3FusedKernels
+//   封装的 NA_H3_FUSE=0 回退分支，见 网络算子-融合-RMSNormRoPE-通用.swift）

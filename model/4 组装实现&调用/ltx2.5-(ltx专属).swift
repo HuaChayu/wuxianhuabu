@@ -923,17 +923,14 @@ func vaeDecodeTest() -> String? {
         pipelineLog("❌ 内存不足，无法加载解码器（VAE 解码+升频器 约 1.7G），已拦截 VAE 解码")
         return nil
     }
-    // 扩散视频解码器开关：偏好设置项已于 2026-09-21 移除（彻底弃用），此处强制 false 固定走卷积 VAE，
-    // 扩散解码分支保留仅便于未来恢复。恢复：改回 AppSettings.shared.videoUseDiffusionDecoder
-    //（并同步恢复 偏好设置.swift 的 @Published 字段、init 读取与设置页 Toggle）即可。
-    let useDiffDecoder = false // 原：AppSettings.shared.videoUseDiffusionDecoder（2026-09-21 强制关闭）
-    let vaePath = useDiffDecoder ? CommonPaths.vaeDiffusionDecoder : CommonPaths.vaeDecoder
+    // 扩散视频解码器已弃用（2026-09-21）：固定走卷积 VAE，useDiffDecoder 常量与扩散解码分支已于 2026-09-22 删除。
+    let vaePath = CommonPaths.vaeDecoder
     let latentPath = outputVideoDirURL.appendingPathComponent("video_latent_final.npy").path
     guard let weights = try? MLX.loadArrays(url: URL(fileURLWithPath: vaePath)) else {
-        pipelineLog("❌ \(useDiffDecoder ? "ltx-2.5-video-vae-bf16.safetensors" : "vae_decoder.safetensors") 加载失败"); return nil
+        pipelineLog("❌ vae_decoder.safetensors 加载失败"); return nil
     }
     memProfilePoint("VAE权重加载后")
-    stageEnter(phase: .vae, detail: "✅ \(useDiffDecoder ? "扩散视频解码器" : "卷积 VAE")权重张量数：\(weights.count)")
+    stageEnter(phase: .vae, detail: "✅ 卷积 VAE 权重张量数：\(weights.count)")
     guard let latent = loadNpy(latentPath) else { return nil }
     if videoLatentIsFullRes {
         pipelineLog("latent: \(latent.shape)（NDHWC [1,T,H,W,128]，float32；已是目标分辨率，跳过升频直接解码）")
@@ -943,29 +940,11 @@ func vaeDecodeTest() -> String? {
 
     // 空间升频器：denorm → latent 空间 ×2 → norm → VAE 解码（输出分辨率 ×2）
     // stage2 refine 已完成时 latent 已是全分辨率，跳过升频直接解码
-    // mean/std：官方扩散解码器权重（ltx-2.5-video-vae-bf16.safetensors）自带 latent 统计
-    // （键名 per_channel_statistics.mean-of-means / std-of-means，2×128 标量）；旧 mlx 版
-    // vae_diffusion_decoder 不含统计，曾回退读卷积 VAE 的 vae_decoder.* 键。
-    let meanStd: (mean: MLXArray, std: MLXArray)
-    if useDiffDecoder {
-        guard let stats = readSafetensorsFloatArrays(path: CommonPaths.vaeDiffusionDecoder, keys: [
-            "per_channel_statistics.mean-of-means",
-            "per_channel_statistics.std-of-means"
-        ]),
-        let mean0 = stats["per_channel_statistics.mean-of-means"],
-        let std0 = stats["per_channel_statistics.std-of-means"] else {
-            pipelineLog("❌ 扩散解码器模式需从官方 VAE 读取 mean/std，读取失败"); return nil
-        }
-        meanStd = (
-            mean0.reshaped([1, 1, 1, 1, 128]).asType(PrecisionPolicy.defaultMainDType),
-            std0.reshaped([1, 1, 1, 1, 128]).asType(PrecisionPolicy.defaultMainDType)
-        )
-    } else {
-        meanStd = (
-            weights["vae_decoder.per_channel_statistics.mean"]!.reshaped([1, 1, 1, 1, 128]).asType(PrecisionPolicy.defaultMainDType),
-            weights["vae_decoder.per_channel_statistics.std"]!.reshaped([1, 1, 1, 1, 128]).asType(PrecisionPolicy.defaultMainDType)
-        )
-    }
+    // mean/std：卷积 VAE 权重自带 latent 统计（vae_decoder.per_channel_statistics.*，2×128 标量）
+    let meanStd: (mean: MLXArray, std: MLXArray) = (
+        weights["vae_decoder.per_channel_statistics.mean"]!.reshaped([1, 1, 1, 1, 128]).asType(PrecisionPolicy.defaultMainDType),
+        weights["vae_decoder.per_channel_statistics.std"]!.reshaped([1, 1, 1, 1, 128]).asType(PrecisionPolicy.defaultMainDType)
+    )
     let mean = meanStd.mean, std = meanStd.std
     let latentB = latent.asType(PrecisionPolicy.defaultMainDType)
     let normLatent: MLXArray
@@ -991,28 +970,16 @@ func vaeDecodeTest() -> String? {
     }
 
     let t0 = Date()
-    if useDiffDecoder {
-        pipelineLog("解码中（扩散视频解码器：det 上采样 + 像素空间扩散去噪，官方 1 步 x0，预计 5~15 分钟）...")
-        memPointLog("解码器启动")
-    } else {
-        pipelineLog("解码中（VAE Tiling 分块，1024 通道 3D 卷积，预计几分钟）...")
-    }
+    pipelineLog("解码中（VAE Tiling 分块，1024 通道 3D 卷积，预计几分钟）...")
     // latent f32 → bf16：权重本身 bf16，全链路 bf16 省内存提速；统计等价性由回归验证
     // tiled 解码：默认 tile 对齐官方 TileSizeConfig.default()（时间 tile=10帧/overlap=3，空间 tile=24格/overlap=2），
     // 分块 + 梯形 mask 加权融合，压低 720p 5s 场景 VAE 解码峰值内存（整片曾达 51.45GB）
-    // 扩散解码器模式：latent（与卷积 VAE 同一输入）→ det_stages 上采样构建 context volume →
-    // 扩散去噪（NA 注意力 + context 注入，官方 1 步 x0 / 可配多步），tiling 融合
-    let pixels: MLXArray
-    if useDiffDecoder {
-        pixels = ltx2VideoDiffusionDecode(weights: weights, latentNDHWC: normLatent)
-    } else {
-        pixels = vaeDecodeTiled(weights: weights, latentNDHWC: normLatent)
-    }
+    let pixels = vaeDecodeTiled(weights: weights, latentNDHWC: normLatent)
     memPointLog("eval(pixels) 前")
     eval(pixels)
     memPointLog("eval(pixels) 后")
     memProfilePoint("VAE解码后")
-    stageEnter(phase: .vae, detail: "✅ \(useDiffDecoder ? "扩散" : "卷积")解码完成（\(Int(Date().timeIntervalSince(t0)))s）：\(pixels.shape)，期望 [1,3,113,512,512]")
+    stageEnter(phase: .vae, detail: "✅ 卷积解码完成（\(Int(Date().timeIntervalSince(t0)))s）：\(pixels.shape)，期望 [1,3,113,512,512]")
 
     // NaN 检查
     let parr = pixels.asArray(Float.self)

@@ -445,24 +445,13 @@ public final class PackedLayout {
         let targetWLow = wAxis[0]
         let targetWHigh = wAxis[wAxis.count - 1]
 
-        // 续接前置 refImg 块（v3）：按各自参考图网格重建位置编码（而非目标视频网格），
-        // 解决 ref2va 续接前置条件行网格错位导致画面被参考图特征主导的问题。
-        // t 从 cursor 起依次递增，与下方本节点 refs 共用同一时间游标。
+        // 续接前置音频 refAudio 段（v3）：前置尾段音频 latent 锚进 audio stream 开头，
+        // audioUpdate=false → never-denoised（只被注意力看到，不出现在输出）。
+        // ★ 2026-09-22 保持原位置（keyframes 后、refs 前）：音频时序语义不变——
+        //   前置音频必须锚在新 clip 开头让声音衔接；仅图片块随段序修复移至 refs 段之后。
         for b in contRefs {
             switch b.kind {
-            case .image:
-                let g = refGrid(b)
-                segments.append(Segment(start: row, end: row + g.rows, kind: .refImg))
-                writeFrameGrid(&positionIds, row: row, t: cursor, hAxis: g.hAxis, wAxis: g.wAxis)
-                for _ in 0..<Int(g.rows) {
-                    imgUpdate[imgRow] = false
-                    imgRow += 1
-                }
-                row += g.rows
-                cursor += 1.0
             case .audio:
-                // v3 音频续接（2026-09-21）：前置尾段音频 latent 作 refAudio 段注入 audio stream，
-                // audioUpdate=false → never-denoised（只被注意力看到，不出现在输出）。
                 if b.audioT > 0 {
                     let n = b.audioT * 2
                     segments.append(Segment(start: row, end: row + n, kind: .refAudio))
@@ -475,8 +464,8 @@ public final class PackedLayout {
                     row += n
                 }
                 cursor += Double(b.audioT)
-            case .video:
-                // 续接前置缓存只落参考图 latent 行；视频块不在此路径（防御性跳过）
+            default:
+                // 图片块在 refs 段之后统一布局；视频块不在此路径（防御性跳过）
                 break
             }
         }
@@ -560,6 +549,26 @@ public final class PackedLayout {
                 var spans: Double = 0
                 for k in 0..<Int(b.latentT) { spans += videoTSpan(k) }
                 cursor += max(Double(b.audioT), spans)
+            }
+        }
+
+        // 续接前置 refImg 块（v3）：按各自参考图网格重建位置编码（而非目标视频网格），
+        // 解决 ref2va 续接前置条件行网格错位导致画面被参考图特征主导的问题。
+        // ★ 2026-09-22 段序修复：行序紧接【本节点 refs 之后】（原为 refs 之前），
+        //   保证 refImg 段前 N 槽 = 本节点参考图（与视觉块标签严格对应），
+        //   本节点尾帧参考不再被推到 refImg 段最末尾造成双重强锚。
+        // t 从 refs 段之后的 cursor 起递增（落在视频时间轴开头附近，不超界）。
+        for b in contRefs {
+            if b.kind == .image {
+                let g = refGrid(b)
+                segments.append(Segment(start: row, end: row + g.rows, kind: .refImg))
+                writeFrameGrid(&positionIds, row: row, t: cursor, hAxis: g.hAxis, wAxis: g.wAxis)
+                for _ in 0..<Int(g.rows) {
+                    imgUpdate[imgRow] = false
+                    imgRow += 1
+                }
+                row += g.rows
+                cursor += 1.0
             }
         }
 

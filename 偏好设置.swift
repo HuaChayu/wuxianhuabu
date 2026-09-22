@@ -64,6 +64,14 @@ final class AppSettings: ObservableObject {
     @Published var defaultNodeColorName: String {
         didSet { defaults.set(defaultNodeColorName, forKey: "defaultNodeColorName") }
     }
+    // 悬停荧光范围（节点卡片 hover 外发光模糊半径）
+    @Published var hoverGlowRadius: Double {
+        didSet { defaults.set(hoverGlowRadius, forKey: "hoverGlowRadius") }
+    }
+    // 悬停荧光强度（节点卡片 hover 外发光透明度）
+    @Published var hoverGlowIntensity: Double {
+        didSet { defaults.set(hoverGlowIntensity, forKey: "hoverGlowIntensity") }
+    }
     // 触控板滚轮加速倍率
     @Published var wheelAccelerationPrecise: Double {
         didSet { defaults.set(wheelAccelerationPrecise, forKey: "wheelAccelerationPrecise") }
@@ -161,8 +169,8 @@ final class AppSettings: ObservableObject {
             videoUseAppleSR = true
         }
     }
-    // （2026-09-21：扩散视频解码器设置项已移除，videoUseDiffusionDecoder 字段删除，
-    //  代码侧 ltx2.5-(ltx专属).swift 中 useDiffDecoder 已硬编码 false，固定走卷积 VAE）
+    // （2026-09-21：扩散视频解码器设置项已移除，videoUseDiffusionDecoder 字段删除；
+    //  2026-09-22：ltx2.5-(ltx专属).swift 中 useDiffDecoder 常量与扩散解码分支已删除，固定走卷积 VAE）
 
     // ★ 第三套二采·Apple VideoToolbox 超分（VTSuperResolutionScaler / VTFrameProcessor）总开关：
     // true=H3 stage1 出的内存态视频**优先**走 Apple 超分通道（并存的 CQ/IC 二采保留为失败回退）；
@@ -206,6 +214,8 @@ final class AppSettings: ObservableObject {
     init() {
         let d = UserDefaults.standard
         defaultNodeColorName = d.string(forKey: "defaultNodeColorName") ?? "pink"
+        hoverGlowRadius = d.object(forKey: "hoverGlowRadius") as? Double ?? 10.0
+        hoverGlowIntensity = d.object(forKey: "hoverGlowIntensity") as? Double ?? 0.30
         wheelAccelerationPrecise = d.object(forKey: "wheelAccelerationPrecise") as? Double ?? 2.0
         wheelAccelerationWheel = d.object(forKey: "wheelAccelerationWheel") as? Double ?? 30.0
         let savedPath = d.string(forKey: "canvasRootPath") ?? ""
@@ -339,13 +349,27 @@ final class AppSettings: ObservableObject {
     // 恢复默认参数
     func resetToDefaults() {
         defaultNodeColorName = "pink"
+        hoverGlowRadius = 10.0
+        hoverGlowIntensity = 0.30
         wheelAccelerationPrecise = 2.0
         wheelAccelerationWheel = 30.0
+        h3Stage1Steps = 6
+        h3SelfLiftDecouple = true
+        // 后处理模式与底层开关联动恢复出厂组合（Apple 超分开 / SelfLift 开 / 阶段2 与 CQ 关），
+        // 与 AppSettings.init 无存档时的默认状态一致
+        applyPostProcessMode(.apple)
+        appleSRScaleFactor = 4
+        appleSRQualityRawValue = 1
+        appleSRUsePrecomputedFlow = false
+        videoUseH3LTXAdapter = true
         let oldPath = canvasRootPath
         canvasRootPath = Self.defaultRootPath
         if oldPath != canvasRootPath {
             migrateCanvasRoot(from: oldPath, to: canvasRootPath)
         }
+        // 适配器路径放最后：defaultH3LTXAdapterPath 读 UserDefaults 的 canvasRootPath，
+        // 需在 canvasRootPath 落库后再算，才能拼到重置后的默认根目录
+        h3LTXAdapterPath = Self.defaultH3LTXAdapterPath
     }
 
     /// 变更项目文件地址并迁移旧地址数据（选择新地址时调用）
@@ -529,6 +553,26 @@ struct PreferencesView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                    }
+
+                    // 悬停荧光范围/强度（节点卡片 hover 外发光，范围=模糊半径、强度=透明度）
+                    HStack(spacing: 8) {
+                        Text("悬停荧光范围")
+                            .font(.system(size: 13))
+                        Slider(value: $settings.hoverGlowRadius, in: 0...24, step: 1)
+                            .frame(maxWidth: 160)
+                        Text("\(Int(settings.hoverGlowRadius))")
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(width: 24, alignment: .trailing)
+                    }
+                    HStack(spacing: 8) {
+                        Text("悬停荧光强度")
+                            .font(.system(size: 13))
+                        Slider(value: $settings.hoverGlowIntensity, in: 0...0.8, step: 0.05)
+                            .frame(maxWidth: 160)
+                        Text(String(format: "%.2f", settings.hoverGlowIntensity))
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(width: 36, alignment: .trailing)
                     }
 
                     // 滚轮速度倍率

@@ -57,6 +57,8 @@ struct NodeView: View {
     @ObservedObject private var playerManager = MediaPlayerManager.shared
     /// 生成队列（观察节点生成状态，内容区覆盖"正在生成/排队中"）
     @ObservedObject private var generationQueue = GenerationQueue.shared
+    /// 偏好设置（悬停荧光范围/强度，偏好设置页"节点默认颜色"下方可调）
+    @ObservedObject private var settings = AppSettings.shared
     
     // 加号按钮尺寸（与命中检测共用常量）
     private let portSize = nodePortSize
@@ -137,7 +139,7 @@ struct NodeView: View {
                     // 其他类型保持中性浅灰（内容为主，不给颜色）
                     Group {
                         if node.type == .audio {
-                            RoundedRectangle(cornerRadius: 6)
+                            UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3, style: .continuous)
                                 .fill(
                                     LinearGradient(
                                         colors: [accentColor.opacity(0.12), accentColor.opacity(0.04)],
@@ -146,7 +148,7 @@ struct NodeView: View {
                                     )
                                 )
                         } else {
-                            RoundedRectangle(cornerRadius: 6)
+                            UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3, style: .continuous)
                                 .fill(Color.gray.opacity(0.08))
                         }
                     }
@@ -175,7 +177,7 @@ struct NodeView: View {
                             .resizable()
                             .aspectRatio(contentMode: .fit)
                             .frame(width: nodeWidth, height: placeholderHeight)
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3, style: .continuous))
                     } else {
                         VStack(spacing: emptyPlaceholderSpacing) {
                             Image(systemName: node.type.placeholderIcon)
@@ -199,7 +201,7 @@ struct NodeView: View {
                     if isNodePlaying, node.type == .video, !videoSurfaceHidden, let player = playerManager.videoPlayer {
                         VideoPlayerView(player: player)
                             .frame(width: nodeWidth, height: placeholderHeight)
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3, style: .continuous))
                     }
                     // 播放按钮（音频/视频悬停显示；播放中不常驻，避免遮挡视频画面）
                     // 显示直接由 isHovered 驱动：悬停即现，鼠标离开即隐；播放中再悬停回来显示停止按钮
@@ -358,22 +360,31 @@ struct NodeView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
-                // 悬停命中：下半部分（底部信息栏）变主题色
+                // 悬停命中：下半部分（底部信息栏）变主题色（顶部直角，避免与素材区交界反衬出圆角白边）
                 .background(
-                    RoundedRectangle(cornerRadius: 6)
+                    UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 6, bottomTrailingRadius: 6, topTrailingRadius: 0, style: .continuous)
                         .fill(isHovered ? accentColor.opacity(0.18) : Color.clear)
                 )
             }
             .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.white.opacity(0.9))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                            .stroke(isSelected ? accentColor : (isHovered ? accentColor.opacity(0.8) : Color.gray.opacity(0.25)),
-                                    lineWidth: isSelected ? 2 : (isHovered ? 2 : 1))
-                    )
+                ZStack(alignment: .bottom) {
+                    // 底层：卡片白底 + 整圈描边（描边完整绘制，由上层内容/压线带盖住内侧呈镂空细线）
+                    UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 10, bottomTrailingRadius: 10, topTrailingRadius: 3, style: .continuous)
+                        .fill(Color.white.opacity(0.9))
+                        .overlay(
+                            UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 10, bottomTrailingRadius: 10, topTrailingRadius: 3, style: .continuous)
+                                .stroke(isSelected ? accentColor : (isHovered ? accentColor.opacity(0.8) : Color.gray.opacity(0.25)),
+                                        lineWidth: isSelected ? 2 : (isHovered ? 2 : 1))
+                        )
+                    // 标签区压线带：不透明卡片底色贴边（顶部直角），从信息栏顶（Divider 下缘）盖到卡片底，
+                    // 压住标签段描边内侧 → 与素材区图片压住描边一致，全局镂空细线
+                    UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 10, bottomTrailingRadius: 10, topTrailingRadius: 0, style: .continuous)
+                        .fill(Color.white)
+                        .frame(maxHeight: .infinity)
+                        .padding(.top, placeholderHeight + 1)
+                }
             )
-            .shadow(color: isHovered ? accentColor.opacity(0.25) : .clear, radius: 8)
+            .shadow(color: isHovered ? accentColor.opacity(settings.hoverGlowIntensity) : .clear, radius: settings.hoverGlowRadius)
         }
         .background(
             // 只测量卡片本体实际尺寸（不含加号球等外部元素），用于命中检测与加号定位

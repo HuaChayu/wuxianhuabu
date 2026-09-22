@@ -10,10 +10,13 @@ import Foundation
 // 从 H3Transformer.swift / H3Layout.swift 抽出集中维护的「跨去噪步 attention 缓存」。
 //
 // 语义澄清（勿与 sparse 折叠混淆）：
-// - 这里复用的是**每层 attention 分支的输出张量 at**（计算复用，非画面帧复用）；
+// - 这里复用的是**每层整 block 的输出张量**（attention 分支 at + MLP 分支 mo，计算复用，非画面帧复用）；
 // - 缓存发生在**去噪步之间**（step i → step i+1），不是视频帧之间；
 // - 官方 sparseAttend 折叠稀疏（花屏证伪过）与 PAB 是两件独立的事，两者互不替代：
-//   非刷新步直接复用 at，跳过 norm1+qkv+rope+attn 整段；刷新步仍走当前 sparsePolicy。
+//   非刷新步直接复用 at/mo，跳过 norm1+qkv+rope+attn 与 norm2+fc1+fc2 整段；
+//   刷新步仍走当前 sparsePolicy，并同时写回 blocks[bi] 与 mlpBlocks[bi]。
+// - gate 加权（modGate）不受缓存影响：无论 refresh/reuse，两处 gate 均用当步新 gate 照常执行，
+//   保持既有 PAB 语义（旧内容 + 新门控）。
 //
 // ⚠️ MLX.compile 纯函数约束：本类持有跨步可变状态（blocks 为 Swift 引用），
 // 若把 H3DiT.forward 整体包进 MLX.compile 闭包会破坏纯函数性导致失效/重编译；
@@ -21,18 +24,24 @@ import Foundation
 
 // MARK: - 缓存容器
 
-/// PAB 跨步 attention 缓存：blocks[bi] 持有第 bi 层的 attention 分支输出。
+/// PAB 跨步 block 缓存：blocks[bi] 持有第 bi 层 attention 分支输出 at，
+/// mlpBlocks[bi] 持有同层 MLP 分支输出 mo（整 block 输出缓存）。
 /// 接入方在采样循环外创建（count 取 DiT 层数，如 dit.blocks.count），
 /// 循环内按 attnBroadcastRefresh 决定每步 refresh/reuse 后传入 forward。
 public final class H3AttnBroadcast {
     public var blocks: [MLXArray?]
+    public var mlpBlocks: [MLXArray?]
 
     public init(count: Int) {
         self.blocks = Array(repeating: nil, count: count)
+        self.mlpBlocks = Array(repeating: nil, count: count)
     }
 
     public func reset() {
-        for i in blocks.indices { blocks[i] = nil }
+        for i in blocks.indices {
+            blocks[i] = nil
+            mlpBlocks[i] = nil
+        }
     }
 }
 

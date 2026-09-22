@@ -167,14 +167,18 @@ func videoNodeSize(imageFileName: String?) -> CGSize {
        let img = cachedAssetImage(for: fileName) {
         let w = img.size.width
         let h = img.size.height
-        guard w > 0, h > 0 else { return roundedGridSize(CGSize(width: longSide, height: longSide * 9 / 16)) }
-        if h <= w {   // 横屏：统一 16:9
-            return roundedGridSize(CGSize(width: longSide, height: longSide * 9 / 16))
-        } else {      // 竖屏：统一 9:16
-            return roundedGridSize(CGSize(width: longSide * 9 / 16, height: longSide))
+        guard w > 0, h > 0 else { return CGSize(width: roundedToGrid(longSide), height: roundedToGrid(longSide) * 9 / 16) }
+        // 直接按素材真实比例（不再强制 16:9/9:16）：长边按 40 网格取整，短边精确跟随，fit 恰好铺满
+        if w >= h {   // 横屏/方形
+            let width = roundedToGrid(longSide)
+            return CGSize(width: width, height: width * h / w)
+        } else {      // 竖屏
+            let width = roundedToGrid(longSide * w / h)
+            return CGSize(width: width, height: width * h / w)
         }
     }
-    return roundedGridSize(CGSize(width: longSide, height: longSide * 9 / 16))   // 空视频节点按 16:9
+    let width = roundedToGrid(longSide)
+    return CGSize(width: width, height: width * 9 / 16)   // 空视频节点按 16:9
 }
 
 /// 节点展示尺寸统一入口（视频有图片 = 长边统一算法；其余走原映射表/图片比例逻辑）
@@ -209,7 +213,7 @@ func placeholderHeightForType(_ type: NodeType, imageFileName: String?) -> CGFlo
         let w = img.size.width
         let h = img.size.height
         guard w > 0 else { return emptyPlaceholderHeight(for: type) }
-        return roundedToGrid(nodeWidthForType(type) * h / w)
+        return nodeWidthForType(type) * h / w   // 精确比例，fit 恰好铺满（不再 40 网格取整）
     }
     return emptyPlaceholderHeight(for: type)
 }

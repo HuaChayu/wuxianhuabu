@@ -6,7 +6,7 @@
 //   - Constants & H3Config (transformer geometry)
 //   - H3Weights: lazy safetensors reader (header index + on-demand tensor load)
 //   - MfLinear: dense (pre-transposed [in,out]) OR affine group-quantized
-//     (4-bit g64 U32-packed weight + scales + biases), lazy dequant + matmul
+//     (6-bit g64 U32-packed weight + scales + biases), lazy dequant + matmul
 //   - LoRA slot (turbo_lora / style adapters): base + Σ scale·(x·A)·B
 //   - MLX tensor primitives mirroring minimax_h3.zig's helpers
 

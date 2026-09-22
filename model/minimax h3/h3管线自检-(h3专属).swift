@@ -220,11 +220,11 @@ enum H3PipelineRun {
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "12" {
             return runStage2E2E()
         }
-        // NA_H3TEST=21：SelfLift 第三分支 A/B（nearest vs learned upscaler）端到端对比
+        // NA_H3TEST=21：SelfLift 第三分支 A/B（learned upscaler 与 rho/解耦组合；nearest 对照已于 2026-09-22 移除）端到端对比
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "21" {
             return runSelfLiftABTest()
         }
-        // NA_H3TEST=23：h3_53 真实场景高分辨率 A/B（nearest vs learned，1344×768 / 62 帧）
+        // NA_H3TEST=23：h3_53 真实场景高分辨率（learned；nearest 对照已于 2026-09-22 移除，1344×768 / 62 帧）
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "23" {
             return runH3SceneABTest()
         }
@@ -257,6 +257,10 @@ enum H3PipelineRun {
         // NA_H3TEST=9：ComfyUI sol-attn 移植（H3SolAttn）合成数值自检（不加载模型）
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "9" {
             return H3SolAttn.selfTest()
+        }
+        // NA_H3TEST=99：P0 融合 kernel（rmsNorm+RoPE / norm+modScaleShift）合成数值自检（不加载模型）
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "99" {
+            return H3FusedKernels.selfTest()
         }
         let sem = DispatchSemaphore(value: 0)
         var code: Int32 = 1
@@ -632,8 +636,8 @@ enum H3PipelineRun {
     }
 
     /// NA_H3TEST=21：SelfLift 第三分支 A/B 端到端 —— 同一 seed/首尾帧/分辨率，
-    /// 分别用 nearest 直接 latent 提升（默认，对照 h3_53 配置）与官方 learned upscaler
-    /// （NA_H3_UPSCALER=learned，时间维感知）各生成一段短视频，抽中帧 PNG 供重影比对。
+    /// 用官方 learned upscaler（时间维感知）与 rho/解耦等组合各生成一段短视频，
+    /// 抽中帧 PNG 供重影比对。2026-09-22：nearest 对照 A 组已随回退分支一并移除。
     /// 参数：H3_AB_FRAMES（默认 33）、H3_AB_W/H3_AB_H（默认 448×256）。
     static func runSelfLiftABTest() -> Int32 {
         let sem = DispatchSemaphore(value: 0)
@@ -655,7 +659,6 @@ enum H3PipelineRun {
             + "She starts raising a glowing sword high, then smoothly turns and lunges into a low bow stance thrusting the sword sideways. "
             + "Continuous fluid motion, stable identity, clear sharp face throughout, no ghosting, no double contours, no extra fingers, stable background."
         )
-        let outNearest = "\(outDir)/h3_sl_ab_nearest.mp4"
         let outLearned = "\(outDir)/h3_sl_ab_learned.mp4"
         let outOfficial = "\(outDir)/h3_sl_ab_official.mp4"
         let outRho06 = "\(outDir)/h3_sl_ab_rho06.mp4"
@@ -664,7 +667,6 @@ enum H3PipelineRun {
         let outDecoupleShallow = "\(outDir)/h3_sl_ab_decouple_shallow.mp4"
         let outDecoupleLowK03 = "\(outDir)/h3_sl_ab_decouple_lowk03.mp4"
         let outDecoupleHigh3 = "\(outDir)/h3_sl_ab_decouple_high3.mp4"
-        let probeNearest = "\(outDir)/h3_sl_ab_nearest_probe.png"
         let probeLearned = "\(outDir)/h3_sl_ab_learned_probe.png"
         let probeOfficial = "\(outDir)/h3_sl_ab_official_probe.png"
         let probeRho06 = "\(outDir)/h3_sl_ab_rho06_probe.png"
@@ -676,32 +678,9 @@ enum H3PipelineRun {
 
         func log(_ s: String) { print("[H3SLAB] \(s)"); fflush(stdout) }
 
-        log("SelfLift A/B/C/D/E/F：\(width)×\(height) / \(aligned) 帧 / seed=42；A-D 组 turbo 6 步（nearest → learned → official(rho0+learned) → rho06），E/F 组 12 步公平对照（official12 → 解耦 σ_k=0.7+高清6步）")
+        log("SelfLift A/B/C/D/E/F：\(width)×\(height) / \(aligned) 帧 / seed=42；A-D 组 turbo 6 步（learned → official(rho0+learned) → rho06(learned)），E/F 组 12 步公平对照（official12 → 解耦 σ_k=0.7+高清6步）")
         Task {
             do {
-                if groups.contains("A") {
-                // A 组：nearest（显式回退，对照 h3_53 历史配置）
-                setenv("NA_H3_UPSCALER", "nearest", 1)
-                let p1 = try await H3FL2VAPipeline.generateVideo(
-                    prompt: prompt,
-                    firstImagePath: firstImage,
-                    lastImagePath: lastImage,
-                    outPath: outNearest,
-                    width: width,
-                    height: height,
-                    steps: 6,
-                    latentT: latentT,
-                    seed: 42,
-                    sparsePolicy: .mix,
-                    scheduleStyle: .official,
-                    selfLiftEnabled: true,
-                    log: { log("[A-nearest] \($0)") }
-                )
-                log("✅ A 组 nearest 完成：\(p1)")
-                probeMp4MiddleFrame(mp4Path: p1, pngPath: probeNearest, log: log)
-                MLX.Memory.clearCache()
-                }
-
                 if groups.contains("B") {
                 // B 组：learned upscaler（时间维感知）
                 setenv("NA_H3_UPSCALER", "learned", 1)
@@ -750,8 +729,8 @@ enum H3PipelineRun {
                 }
 
                 if groups.contains("D") {
-                // D 组：官方建议起点 rho=0.6 + nearest 提升（像素锚点修正比例最高）
-                setenv("NA_H3_UPSCALER", "nearest", 1)
+                // D 组：官方建议起点 rho=0.6 + learned 提升（2026-09-22 起 nearest 已移除；像素锚点修正比例最高）
+                setenv("NA_H3_UPSCALER", "learned", 1)
                 setenv("NA_H3_SELFLIFT_RHO", "0.6", 1)
                 let p4 = try await H3FL2VAPipeline.generateVideo(
                     prompt: prompt,
@@ -1220,9 +1199,9 @@ enum H3PipelineRun {
         return code
     }
 
-    /// NA_H3TEST=23：h3_53 真实场景高分辨率 A/B —— 用资产库 h3_53 首/尾帧 + 原始 prompt，
-    /// 1344×768 / 62 帧，A=nearest（默认）、B=learned（NA_H3_UPSCALER=learned），
-    /// 抽多个探针帧供面部重影复核。
+    /// NA_H3TEST=23：h3_53 真实场景高分辨率 —— 用资产库 h3_53 首/尾帧 + 原始 prompt，
+    /// 1344×768 / 62 帧，B=learned（NA_H3_UPSCALER=learned），抽多个探针帧供面部重影复核。
+    /// 2026-09-22：A=nearest 对照组已随回退分支一并移除。
     static func runH3SceneABTest() -> Int32 {
         let sem = DispatchSemaphore(value: 0)
         var code: Int32 = 1
@@ -1243,40 +1222,16 @@ enum H3PipelineRun {
             + "江作人 (S2) 给他讲述了自己睁开眼看到的一切。赵阳 (S1) 道：<d>[Chinese] 原来是这样吗。</d>"
             + "赵阳顶着大光头，双手抱头，眼神空洞，久久不语。"
         )
-        let outNearest = "\(outDir)/h3_scene_ab_nearest.mp4"
         let outLearned = "\(outDir)/h3_scene_ab_learned.mp4"
         let outDecoupleV2 = "\(outDir)/h3_scene_ab_decouple_v2.mp4"
-        let probeNearest = "\(outDir)/h3_scene_ab_nearest_probe.png"
         let probeLearned = "\(outDir)/h3_scene_ab_learned_probe.png"
         let probeDecoupleV2 = "\(outDir)/h3_scene_ab_decouple_v2_probe.png"
 
         func log(_ s: String) { print("[H3SCENEAB] \(s)"); fflush(stdout) }
 
-        log("h3_53 场景 A/B：\(width)×\(height) / \(aligned) 帧 / turbo 6 步 / seed=42，nearest → learned")
+        log("h3_53 场景 A/B：\(width)×\(height) / \(aligned) 帧 / turbo 6 步 / seed=42，learned → decouple-v2（2026-09-22 起无 nearest 对照）")
         Task {
             do {
-                // A 组：nearest（显式回退，h3_53 历史配置）
-                setenv("NA_H3_UPSCALER", "nearest", 1)
-                setenv("NA_H3_SELFLIFT_RHO", "", 1)
-                let p1 = try await H3FL2VAPipeline.generateVideo(
-                    prompt: prompt,
-                    firstImagePath: firstImage,
-                    lastImagePath: lastImage,
-                    outPath: outNearest,
-                    width: width,
-                    height: height,
-                    steps: 6,
-                    latentT: latentT,
-                    seed: 42,
-                    sparsePolicy: .mix,
-                    scheduleStyle: .official,
-                    selfLiftEnabled: true,
-                    log: { log("[A-nearest] \($0)") }
-                )
-                log("✅ A 组 nearest 完成：\(p1)")
-                probeMp4MiddleFrame(mp4Path: p1, pngPath: probeNearest, log: log)
-                MLX.Memory.clearCache()
-
                 // B 组：learned upscaler
                 setenv("NA_H3_UPSCALER", "learned", 1)
                 let p2 = try await H3FL2VAPipeline.generateVideo(

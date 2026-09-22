@@ -110,7 +110,8 @@ public enum H3FL2VAPipeline {
         sparsePolicy: SparsePolicy = .mix,
         scheduleStyle: H3SigmaScheduleStyle = .official,
         // 分阶段门控已取消：默认 nil，stage1 去噪全程按 sparsePolicy 走 SOL 稀疏注意力，
-        // 不再在首尾段整步回退稠密（SDPA）。保留该参数仅供显式对照实验：
+        // 不再在首尾段整步回退稠密（SDPA）。【已取消实验参数】全工程无调用点，恒不生效，
+        // 保留该参数仅供显式对照实验：
         // 传 (start, end) 时 progress = step/total ∈ (start, end) 才稀疏，两端全 dense
         //（对齐 kijai Sol-Attn 的 percent_to_sigma：start=0.2 / end=0.9）；
         // 环境变量 NA_H3_SPARSE_GATE=0 仍可强制关闭门控做对照。
@@ -590,6 +591,18 @@ public enum H3FL2VAPipeline {
                 }
                 contKeyRows = tailRows
                 log("续接 keyframe 锚点：前置尾段 \(winT) 个 latent step → \(contKeyAnchors.count) 锚点（t=0 → \(String(format: "%.3f", acc))），行 \(tailRows.shape)")
+                // ★ 2026-09-22 ref2va 多参考续接（137 钉条件图根因修复）：
+                //   去末锚点：前置尾段 latent 仍逐帧锚 t=0 → … → 倒数第 2 帧，
+                //   但不再叠加最后一个锚点——末尾让给本节点尾帧参考图（<Last frame> 语义），
+                //   避免上游尾帧画面被强钉在新 clip 末尾（137 钉条件图观感的直接来源）。
+                //   空图/纯 fl2va 续接保持全锚（画面自然延续，136 正常即此路径）。
+                if !referenceImagePaths.isEmpty, winT > 1 {
+                    let fr = Int(tailRows.shape[0]) / winT
+                    contKeyAnchors = Array(contKeyAnchors.dropLast())
+                    contKeyRows = tailRows[0 ..< (winT - 1) * fr]
+                    MLX.eval(contKeyRows)
+                    log("ref2va 续接去末锚点：\(winT) → \(winT - 1) 个（末尾不再钉前置尾帧，交给本节点尾帧参考图）")
+                }
                 // ★ 2026-09-21 音频续接：缓存携带音频 latent 时重建 [winAudioT*2, 32] 行，
                 //   作为 refAudio 段（never-denoised）注入 audio stream；缺失则回退噪声占位。
                 continuationAudioRows = nil
@@ -701,10 +714,10 @@ public enum H3FL2VAPipeline {
         var injectedCondHs = ownCondHs
         var injectedCondWs = ownCondWs
         if continuationActive, let clean = condRowsClean {
-            // 段序必须与 layout 一致：text → preCond(.cond) → keyframes(.cond) → contRefs(.refImg) → refs(.refImg)
-            // 即 [前置cond段] + [前置尾段keyframe(续接锚点)] + [本节点keyframe(fl2va)] + [前置refImg段] + [本节点refImg(ref2va)]
-            // piecesInjected = 落盘条件行（不含前置尾段 keyframe——尾段走 latentData 供下游重建锚点，
-            // 避免下游把上游尾段画面当普通条件行双重注入）。
+            // 段序必须与 layout 一致：text → preCond(.cond) → keyframes(.cond) → refs(.refImg 本节点) → contRefs(.refImg 前置)
+            // 即 [前置cond段] + [前置尾段keyframe(续接锚点)] + [本节点keyframe(fl2va)] + [本节点refImg(ref2va)] + [前置refImg段]
+            // ★ 2026-09-22 段序修复：本节点 refs 前置、contRefs 后置，与 layout 交换同步，
+            //   保证 refImg 段前 N 槽 = 本节点参考图（与视觉块标签严格对应）。
             var pieces: [MLXArray] = []
             var piecesInjected: [MLXArray] = []
             if let pre = continuationCondRows {
@@ -716,13 +729,13 @@ public enum H3FL2VAPipeline {
                 pieces.append(clean)                                 // 本节点 keyframe 行
                 piecesInjected.append(clean)
             }
+            if useRef2VA {
+                pieces.append(clean)                                 // 本节点 refImg 行
+                piecesInjected.append(clean)
+            }
             if let preRef = continuationRefRows {
                 pieces.append(preRef)
                 piecesInjected.append(preRef)
-            }
-            if useRef2VA {
-                pieces.append(clean)
-                piecesInjected.append(clean)
             }
             let merged = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
             let mergedInjected = piecesInjected.count == 1 ? piecesInjected[0] : concatenated(piecesInjected, axis: 0)
@@ -732,23 +745,23 @@ public enum H3FL2VAPipeline {
             let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), merged)
             condRows = merged * augA + augNoise * augB
             MLX.eval(condRows)
-            log("★ 条件直接注入：preCond \(continuationCondRows?.shape ?? []) + contTailKey \(contKeyRows?.shape ?? []) + ownKeyframe \(useRef2VA ? "∅" : String(describing: clean.shape)) + preRef \(continuationRefRows?.shape ?? []) + ownRef \(useRef2VA ? String(describing: clean.shape) : "∅") = \(merged.shape)（统一 aug noise；落盘条件行不含 contTail = \(mergedInjected.shape)）")
+            log("★ 条件直接注入：preCond \(continuationCondRows?.shape ?? []) + contTailKey \(contKeyRows?.shape ?? []) + ownKeyframe \(useRef2VA ? "∅" : String(describing: clean.shape)) + ownRef \(useRef2VA ? String(describing: clean.shape) : "∅") + preRef \(continuationRefRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 contTail = \(mergedInjected.shape)）")
             injectedCondRowsClean = mergedInjected
-            // 透传段序与注入行严格一致：前置cond + 本节点keyframe + 前置ref + 本节点ref
-            injectedCondIDs = keptPreCondIDs + (useRef2VA ? [] : ownCondIDs) + keptPreRefIDs + (useRef2VA ? ownCondIDs : [])
-            injectedCondSpans = keptPreCondSpans + (useRef2VA ? [] : ownCondSpans) + keptPreRefSpans + (useRef2VA ? ownCondSpans : [])
+            // 透传段序与注入行严格一致：前置cond + 本节点keyframe + 本节点ref + 前置ref
+            injectedCondIDs = keptPreCondIDs + (useRef2VA ? [] : ownCondIDs) + (useRef2VA ? ownCondIDs : []) + keptPreRefIDs
+            injectedCondSpans = keptPreCondSpans + (useRef2VA ? [] : ownCondSpans) + (useRef2VA ? ownCondSpans : []) + keptPreRefSpans
             injectedCondModes = [UInt8](repeating: 0, count: keptPreCondIDs.count)
                 + (useRef2VA ? [] : ownCondModes)
-                + [UInt8](repeating: 1, count: keptPreRefIDs.count)
                 + (useRef2VA ? ownCondModes : [])
+                + [UInt8](repeating: 1, count: keptPreRefIDs.count)
             injectedCondHs = [UInt32](repeating: 0, count: keptPreCondIDs.count)
                 + (useRef2VA ? [] : ownCondHs)
-                + keptPreRefHs
                 + (useRef2VA ? ownCondHs : [])
+                + keptPreRefHs
             injectedCondWs = [UInt32](repeating: 0, count: keptPreCondIDs.count)
                 + (useRef2VA ? [] : ownCondWs)
-                + keptPreRefWs
                 + (useRef2VA ? ownCondWs : [])
+                + keptPreRefWs
         } else if continuationActive {
             // ★ 2026-09-20 续接空图：本节点无干净条件行（纯续接链），仅注入前置 .h3cc 去重保留的条件段
             var pieces: [MLXArray] = []
@@ -892,33 +905,12 @@ public enum H3FL2VAPipeline {
         let nAudioRows = Int(effAudioT * 2)
         var videoX: MLXArray
         var audioX: MLXArray
-        // ★ 2026-09-21 废弃旧初值路线（if false 关闭，保留存档）：warmStart 初值加噪会把前置
-        //   尾段行加噪到 σ0=1.0 致画面归零，且与 keyframe 锚点路线（continuationLatent=nil）冲突；
-        //   新路线新段纯噪声起步，前置画面由 contKeyAnchors 条件行约束。
-        if false, continuationActive, let cacheRows = continuationCacheRows {
-            // ★ 续接初值：前置尾段 clean 行（续接解析阶段已 patchify）+ 本节点新段噪声，
-            //   整体 flow 加噪到 warmStart（σ0），保证与续接调度起点对齐——
-            //   前置画面内容真正进入采样（这是上次失败的关键修复点，绝非空转）。
-            let newRows = MLXRandom.normal([nVideoRows, vpatch], key: MLXRandom.key(seed))
-            videoX = concatenated([cacheRows, newRows], axis: 0)     // [winRows + nVideoRows, vpatch]
-            let s0 = sigmas[0]                                       // = warmStart
-            let svC = cfg.sigmaShiftVideo
-            let saC = cfg.sigmaShiftAudio
-            let epsV = MLXRandom.normal(videoX.shape, key: MLXRandom.key(seed &+ 2)).asType(videoX.dtype)
-            videoX = videoX * H3TensorOps.scalarLike(Float(1.0 - s0), videoX)
-                + epsV * H3TensorOps.scalarLike(Float(s0), videoX)
-            audioX = MLXRandom.normal([nAudioRows, 32], key: MLXRandom.key(seed &+ 1))
-            let sa0 = timeShiftSigma(s0, fromShift: svC, toShift: saC)
-            let epsA = MLXRandom.normal(audioX.shape, key: MLXRandom.key(seed &+ 3)).asType(audioX.dtype)
-            audioX = audioX * H3TensorOps.scalarLike(Float(1.0 - sa0), audioX)
-                + epsA * H3TensorOps.scalarLike(Float(sa0), audioX)
-            MLX.eval(videoX, audioX)
-            log("★ 续接初值：前置尾段 \(continuationWinRows) 行 + 新段 \(nVideoRows) 行 = \(videoX.shape)，整体加噪 σ0=\(String(format: "%.4f", s0))（audio σ0=\(String(format: "%.4f", sa0))）")
-        } else {
-            videoX = MLXRandom.normal([nVideoRows, vpatch], key: MLXRandom.key(seed))
-            audioX = MLXRandom.normal([nAudioRows, 32], key: MLXRandom.key(seed &+ 1))
-            MLX.eval(videoX, audioX)
-        }
+        // ★ 2026-09-22 旧 warmStart 初值路线已删除（曾 if false 关闭存档）：warmStart 加噪会把前置
+        //   尾段行加噪到 σ0=1.0 致画面归零，且与 keyframe 锚点路线冲突；现统一新段纯噪声起步，
+        //   前置画面由 contKeyAnchors 条件行约束（续接解析见 L523-576 continuationCacheRows 路线）。
+        videoX = MLXRandom.normal([nVideoRows, vpatch], key: MLXRandom.key(seed))
+        audioX = MLXRandom.normal([nAudioRows, 32], key: MLXRandom.key(seed &+ 1))
+        MLX.eval(videoX, audioX)
         log("初始 latent：video \(videoX.shape)，audio \(audioX.shape)")
         // ★ 2026-09-20 零行保护：文本生成/纯续接空图的 condRows 可能为 0 行，mean/std 跳过防崩
         let cMean: Float = condRows.shape[0] > 0 ? condRows.mean().item() : 0
@@ -1079,15 +1071,15 @@ public enum H3FL2VAPipeline {
         } else {
             if !selfLiftEnabled {
                 log("SelfLift 第三分支：关闭，走原单条 stage1 循环（单遍直出）")
-            } else if continuationActive {
-                log("SelfLift 第三分支：续接激活且 N=\(stage1SegmentCount)<2（理论不可达，守卫已放行续接）")
             } else {
+                // 续接激活但 N<2，或未续接 N<2：均无法切分低分/高分两段，走原单条 stage1 循环
                 log("SelfLift 第三分支：N=\(stage1SegmentCount) < 2，无法切分低分/高分两段，走原单条 stage1 循环")
             }
         for i in 0..<stage1SegmentCount {
             let stepT = Date()
             // 分阶段门控（默认已取消）：sparseGatePercent 为 nil 时走 else 分支 —— 全程
-            // sparsePolicy，不做任何整步 dense 回退；仅当调用方显式传入 (start, end) 时才启用
+            // sparsePolicy，不做任何整步 dense 回退；【已取消实验参数】全工程无调用点，
+            // 恒不生效，此处 gateOn 恒 false；仅当调用方显式传入 (start, end) 时才启用
             // ComfyUI 式 sigma 门控（progress = i/steps 与 percent_to_sigma 阈值同构，
             // 0~start% 与 end~100% 整步回退全 dense SDPA，中间段才走稀疏 tau 路由）。
             var gateMode = "sol"
@@ -1107,7 +1099,7 @@ public enum H3FL2VAPipeline {
                                                aug: CondNoiseAug(), globalTs: dit!.adalnTables!.ts)
             let videoIn = concatenated([condRows, videoX], axis: 0)
             let attnRefresh = pab1 == nil ? false : attnBroadcastRefresh(i, steps: UInt32(stage1SegmentCount), k: pabK)
-            let pabMark = pab1 == nil ? "" : (attnRefresh ? " bcastRefresh" : " bcastReuse")
+            let pabMark = pab1 == nil ? "" : (attnRefresh ? " bcastRefresh[blk]" : " bcastReuse[blk]")
             let out = dit!.forward(layout: layout, plan: plan, textStates: refined,
                                    videoRows: videoIn, audioRows: audioX, rope: rope,
                                    sigmaV: sigma, shiftV: sv, shiftA: sa,
@@ -1285,7 +1277,7 @@ public enum H3FL2VAPipeline {
                                                    aug: CondNoiseAug(), globalTs: ts2)
                 let videoIn = concatenated([condRows2, vx2], axis: 0)
                 let attnRefresh2 = pab2 == nil ? false : attnBroadcastRefresh(i, steps: UInt32(sigmas2.count - 1), k: pabK)
-                let pabMark2 = pab2 == nil ? "" : (attnRefresh2 ? " bcastRefresh" : " bcastReuse")
+                let pabMark2 = pab2 == nil ? "" : (attnRefresh2 ? " bcastRefresh[blk]" : " bcastReuse[blk]")
                 let out = dit!.forward(layout: layout2, plan: plan, textStates: refined,
                                        videoRows: videoIn, audioRows: ax2, rope: rope2,
                                        sigmaV: sigma, shiftV: sv, shiftA: sa,
@@ -1523,8 +1515,8 @@ public enum H3FL2VAPipeline {
 
         // ★ 生成成功后删除被消费的前置缓存（幂等）：按精确 source 节点 ID 删除，
         //   绝不误删自身刚落的盘（自身 ID = continuationNodeID，与 source 不同）。
-        //   2026-09-21 已关闭（if false）：保留前驱 .h3cc 缓存，避免链式续接需要
-        //   回溯/复用上游时缓存已被删、只能从源视频重建；如需恢复删除，改回 if 即可。
+        //   【已停用 2026-09-21 存档】保留前驱 .h3cc 缓存避免链式续接回溯上游时缓存被删，
+        //   如需恢复改回 if continuationActive。
         if false,
            continuationActive,
            let cacheRoot = continuationCacheRoot,
