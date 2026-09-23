@@ -447,15 +447,21 @@ public final class PackedLayout {
 
         // 续接前置音频 refAudio 段（v3）：前置尾段音频 latent 锚进 audio stream 开头，
         // audioUpdate=false → never-denoised（只被注意力看到，不出现在输出）。
-        // ★ 2026-09-22 保持原位置（keyframes 后、refs 前）：音频时序语义不变——
-        //   前置音频必须锚在新 clip 开头让声音衔接；仅图片块随段序修复移至 refs 段之后。
+        // ★ 2026-09-23 负锚修复（对齐 ComfyUI-H3-Motion-Context AUDIO_MODE=timeline）：
+        //   前置音频窗口 END 对齐目标时间轴起点（cursor = origin），向后延伸 audioT 步
+        //   （cursor - audioT .. cursor，通常为负）——模型读作"本片段的过去"（延续，
+        //   实测相关 0.95+），而非"独立参考片段"（模仿重现，相关 ~0.45/0.94）。
+        //   cursor 不再 += audioT：目标 audio/video 起点保持 origin，与视频锚点
+        //   head 起点同位，修复 refAudio 推后导致的目标视频与前置锚点错位
+        //   （09-23 音频接上后画面延续消失的直接来源）。
         for b in contRefs {
             switch b.kind {
             case .audio:
                 if b.audioT > 0 {
                     let n = b.audioT * 2
                     segments.append(Segment(start: row, end: row + n, kind: .refAudio))
-                    writeAudioGrid(&positionIds, row: row, cursor: cursor, audioT: b.audioT,
+                    writeAudioGrid(&positionIds, row: row,
+                                   cursor: cursor - Double(b.audioT), audioT: b.audioT,
                                    wLow: targetWLow, wHigh: targetWHigh)
                     for _ in 0..<Int(n) {
                         audioUpdate[audioRow] = false
@@ -463,7 +469,6 @@ public final class PackedLayout {
                     }
                     row += n
                 }
-                cursor += Double(b.audioT)
             default:
                 // 图片块在 refs 段之后统一布局；视频块不在此路径（防御性跳过）
                 break

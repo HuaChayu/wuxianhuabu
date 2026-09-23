@@ -91,8 +91,12 @@ func h3DepthwiseTimeConv(_ x: MLXArray, _ w: MLXArray, _ b: MLXArray, padT: Int 
     let shp = x.shape
     let B = shp[0], T = shp[1], H = shp[2], W = shp[3], C = shp[4]
     let K = w.shape[1]
-    let zL = MLXArray.zeros([B, padT, H, W, C])
-    let zR = MLXArray.zeros([B, padT, H, W, C])
+    // replicate 边界填充（对齐官方 h3_upscaler.py: F.pad(mode='replicate')）：
+    // 时间维前后各补 padT 帧边界复制，卷积窗口永远有真实邻居，不再混入零帧稀释边界结构。
+    let head = x[0 ..< B, 0 ..< 1, 0 ..< H, 0 ..< W, 0 ..< C]
+    let tail = x[0 ..< B, (T - 1) ..< T, 0 ..< H, 0 ..< W, 0 ..< C]
+    let zL = concatenated(Array(repeating: head, count: padT), axis: 1)
+    let zR = concatenated(Array(repeating: tail, count: padT), axis: 1)
     let xp = concatenated([zL, x, zR], axis: 1)          // [B,T+2p,H,W,C]
     var out = x * 0
     for k in 0 ..< K {
