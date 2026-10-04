@@ -22,7 +22,7 @@ public enum H3ContinuationCache {
 
     /// .h3cc 文件头（JSON 段），含完整 fingerprint。
     public struct Header: Codable, Equatable {
-        public var version: Int = 2
+        public var version: Int = 4
         public var nodeID: UUID
         public var branchID: String?
         public var winSeconds: Double           // 窗口秒数（2~4 区间）
@@ -56,6 +56,16 @@ public enum H3ContinuationCache {
         public var condRowHs: [UInt32]?
         public var condRowWs: [UInt32]?
 
+        // ── v4 末帧像素（boundary .first 硬锚，2026-10-03）──
+        // 本节点末帧「像素图」fp16 raw 落盘（解码像素最后一帧，[-1,1]，[1,3,1,H,W] 域），
+        // 供下游续接消费侧 encodeImage 重编码成单帧 keyframe latent 作 .first 硬锚。
+        // 语义：索引0 的首锚必须是末 latent 解码出的最后一个像素图重编码，绝对清晰、
+        // 绝对遵从前置；严禁用低清 latent 升频结果或 latent 末行冒充。
+        // nil/false = 旧版本缓存（无像素段，下游关锚仅 history 延续）。
+        public var tailFrameRGB: Bool?
+        public var tailFrameH: Int?
+        public var tailFrameW: Int?
+
         // ── fingerprint（任一变化即拒绝复用）──
         public var modelKey: String             // 模型目录名（MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit）
         public var width: Int
@@ -81,7 +91,8 @@ public enum H3ContinuationCache {
                     condRowsRows: Int? = nil, condRowsVPatch: Int? = nil,
                     condIDs: [String] = [], condRowSpans: [Int] = [],
                     condRowModes: [UInt8]? = nil, condRowHs: [UInt32]? = nil, condRowWs: [UInt32]? = nil,
-                    audioLatentRows: Int? = nil) {
+                    audioLatentRows: Int? = nil,
+                    tailFrameRGB: Bool? = nil, tailFrameH: Int? = nil, tailFrameW: Int? = nil) {
             self.nodeID = nodeID
             self.branchID = branchID
             self.winSeconds = winSeconds
@@ -111,6 +122,9 @@ public enum H3ContinuationCache {
             self.condRowHs = condRowHs
             self.condRowWs = condRowWs
             self.audioLatentRows = audioLatentRows
+            self.tailFrameRGB = tailFrameRGB
+            self.tailFrameH = tailFrameH
+            self.tailFrameW = tailFrameW
         }
     }
 
@@ -133,6 +147,9 @@ public enum H3ContinuationCache {
         public var condRowsData: Data?
         /// v3+：本节点尾部窗口音频 latent（fp16 [audioLatentRows, 32]），nil = 旧版本或无音频。
         public var audioLatentData: Data?
+        /// v4+：本节点末帧像素图（fp16 [1,3,1,H,W] 域连续，[-1,1]），nil = 旧版本无像素段。
+        /// 消费侧用 encodeImage 重编码成单帧 keyframe latent 作 .first 硬锚。
+        public var tailFramePixelsData: Data?
     }
 
     /// 消费侧期望的 fingerprint（由 generateVideo 实时参数构造）。
@@ -215,6 +232,9 @@ public enum H3ContinuationCache {
     ///   （与 condIDs 一一对应）：mode=1 表示该段是 refImg 段（参考图），
     ///   hs/ws 为其 latent 尺寸；mode=0 表示 cond 段（keyframe），hs/ws 传 0。
     ///   传 nil 时写旧版 v2 缓存（下游按 cond 段处理）。
+    /// - Parameter tailFramePixels: v4+ 本节点末帧像素图 [1,3,1,H,W]（[-1,1] 解码像素最后一帧，
+    ///   任意 dtype），fp16 raw 落盘末尾供下游 encodeImage 重编码成单帧 keyframe latent 硬锚；
+    ///   nil = 不落盘像素段（旧版行为，下游关锚仅 history 延续）。
     @discardableResult
     public static func save(nodeID: UUID, branchID: String?, rootDir: String,
                             tailLatent: MLXArray,
@@ -230,6 +250,7 @@ public enum H3ContinuationCache {
                             condRowHs: [UInt32]? = nil,
                             condRowWs: [UInt32]? = nil,
                             audioLatent: MLXArray? = nil,
+                            tailFramePixels: MLXArray? = nil,
                             createdAt: TimeInterval = Date().timeIntervalSince1970) throws -> URL {
         let expectedT = Int(win.latentT)
         guard tailLatent.ndim == 4,
@@ -314,6 +335,31 @@ public enum H3ContinuationCache {
             audioRowsCount = audioLatent.shape[0]
         }
 
+        // v4+ 末帧像素 fp16 序列化（[1,3,1,H,W] 域连续，[-1,1] 解码像素最后一帧）
+        var tailFrameData: Data? = nil
+        var tailH: Int? = nil
+        var tailW: Int? = nil
+        if let tfp = tailFramePixels {
+            guard tfp.ndim == 5, tfp.shape[0] == 1, tfp.shape[1] == 3, tfp.shape[2] == 1,
+                  tfp.shape[3] > 0, tfp.shape[4] > 0 else {
+                throw NSError(domain: "H3ContinuationCache", code: 6,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "save 末帧像素形状不匹配：期望 [1,3,1,H,W]（H/W>0），实际 \(tfp.shape)"])
+            }
+            let tf16 = tfp.asType(.float16)
+            MLX.eval(tf16)
+            let tfRaw = tf16.asArray(Float16.self)
+            var td = Data(count: tfRaw.count * 2)
+            td.withUnsafeMutableBytes { dst in
+                tfRaw.withUnsafeBytes { src in
+                    dst.copyMemory(from: src)
+                }
+            }
+            tailFrameData = td
+            tailH = tfp.shape[3]
+            tailW = tfp.shape[4]
+        }
+
         let header = Header(nodeID: nodeID, branchID: branchID,
                             winSeconds: win.seconds, winFrames: win.frames,
                             winLatentT: win.latentT, winLatentRows: win.rows(gridH: gridH, gridW: gridW),
@@ -328,7 +374,8 @@ public enum H3ContinuationCache {
                             condRowsRows: condRowsCount, condRowsVPatch: condVPatch,
                             condIDs: condIDs, condRowSpans: condRowSpans,
                             condRowModes: condRowModes, condRowHs: condRowHs, condRowWs: condRowWs,
-                            audioLatentRows: audioRowsCount)
+                            audioLatentRows: audioRowsCount,
+                            tailFrameRGB: tailFrameData != nil, tailFrameH: tailH, tailFrameW: tailW)
 
         let jsonData = try JSONEncoder().encode(header)
         var payload = Data()
@@ -339,6 +386,7 @@ public enum H3ContinuationCache {
         payload.append(latentData)
         if let condData { payload.append(condData) }
         if let audioData { payload.append(audioData) }
+        if let tailFrameData { payload.append(tailFrameData) }
 
         let fm = FileManager.default
         let url = cacheURL(nodeID: nodeID, branchID: branchID, rootDir: rootDir)
@@ -378,7 +426,7 @@ public enum H3ContinuationCache {
         // header
         let jsonData = payload.subdata(in: headerStart..<(headerStart + headerLen))
         guard let header = try? JSONDecoder().decode(Header.self, from: jsonData),
-              header.version == 1 || header.version == 2 else { return nil }
+              header.version >= 1, header.version <= 4 else { return nil }
         // fingerprint（refCount 仅告警、不阻断：条件图像数量可随链上节点变化，
         // 严格阻断会误杀真实续接（如 4图→2图 链）导致回退从头；steps 不参与校验
         // （2026-09-21：步数为偏好滑杆动态值，缓存落盘后用户改动会导致误判失效、
@@ -420,10 +468,22 @@ public enum H3ContinuationCache {
             guard latentData.count >= audioStart + audioBytes else { return nil }
             audioData = latentData.subdata(in: audioStart..<(audioStart + audioBytes))
         }
+        // v4+ 末帧像素段（位于 audio 段之后；fp16 [1,3,1,H,W] 域连续，[-1,1]）
+        var tailFramePixelsData: Data? = nil
+        if header.version >= 4, let th = header.tailFrameH, let tw = header.tailFrameW,
+           th > 0, tw > 0, header.tailFrameRGB == true {
+            let condBytes = (condData != nil) ? (header.condRowsRows ?? 0) * (header.condRowsVPatch ?? 0) * 2 : 0
+            let audioBytes = (audioData != nil) ? (header.audioLatentRows ?? 0) * 32 * 2 : 0
+            let tailBytes = 3 * th * tw * 2
+            let tailStart = expectedBytes + condBytes + audioBytes
+            guard latentData.count >= tailStart + tailBytes else { return nil }
+            tailFramePixelsData = latentData.subdata(in: tailStart..<(tailStart + tailBytes))
+        }
         let latentSlice = latentData.subdata(in: 0..<expectedBytes)
         guard latentSlice.count == expectedBytes else { return nil }
         return Loaded(header: header, latentData: latentSlice, recovery: recovery,
-                      condRowsData: condData, audioLatentData: audioData)
+                      condRowsData: condData, audioLatentData: audioData,
+                      tailFramePixelsData: tailFramePixelsData)
     }
 
     // MARK: - 删除（幂等）

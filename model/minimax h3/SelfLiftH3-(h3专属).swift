@@ -408,13 +408,10 @@ public func runH3Stage1WithSelfLift(
     //   差异都会平移 video/audio 行的时间坐标（PackedLayout cursor 从 textLen 起算），
     //   CFG 两路将不在同一坐标系，合成会失真。
     textStatesNeg: MLXArray? = nil,
-    // ★ 续接初值（保留接口兼容）：2026-09-21 起 H3Pipeline 传 nil——前置尾段不再作采样
-    //   初值加噪重画（warmStart 路线已废），改走 contKeyAnchors 条件行锚点。
-    //   continuationWinLatentT=0 表示非续接，保持原纯噪声初值行为。
-    continuationLatent: MLXArray? = nil,
+    // ★ 续接激活标志：continuationWinLatentT=0 表示非续接，保持原纯噪声初值行为。
+    //   2026-10-03 起续接初值路线已删（前置尾段走 contKeyAnchors 条件行锚/参考块，
+    //   videoX 恒为本节点新段纯噪声起步）。
     continuationWinLatentT: UInt32 = 0,
-    // warmStart：2026-09-21 起不再消费（续接走 keyframe 锚点、纯噪声起步）；保留接口兼容。
-    continuationStartSigma: Double? = nil,
     // ★ 续接 keyframe 锚点（2026-09-21 ComfyUI 路线）：前置尾段 latent 作为 never-denoised
     //   条件行锚进新时间轴开头。fl2va 时低清/高清布局按锚点数注入 keyframe 段（切分随
     //   fRows 自动包含，每锚点一段）；ref2va 时为空（参考图约束）。空数组 = 无前置锚点。
@@ -442,8 +439,7 @@ public func runH3Stage1WithSelfLift(
     //   （总 NFE 5 < 官方 N=6，不浪费算力）。
 
     let split: SelfLiftScheduleSplit
-    // ★ 续接激活（2026-09-20）：前置窗口 > 0 即续接段；低清曲线从 warmStart 等距起步，
-    //   与单次生成同构（「续接 = 无数个单次」）。
+    // ★ 续接激活（2026-09-20）：前置窗口 > 0 即续接段；与单次生成同构（「续接 = 无数个单次」）。
     let continuationActive = continuationWinLatentT > 0
     // 续接激活时强制独立曲线（官方 75% 规则会被外层压缩后的 N=2 调度吃掉）
     let decoupleK = cfg.decoupleSigmaK ?? (continuationActive ? 0.9 : nil)
@@ -469,12 +465,6 @@ public func runH3Stage1WithSelfLift(
         // 丢弃）仍需把 audioX 推到 σ_next 水平（与高清起点一致），不能推到 0。
         var lowSigmas = Array(lowBase[0..<L])
         lowSigmas.append(sigmaNext)
-        // ★ 续接：低清曲线从 warmStart 等距 L 步到 σ_next（与单次同构，前置尾段不被深噪声淹没）
-        if continuationActive, let ws = continuationStartSigma {
-            let span = sigmaNext - ws
-            lowSigmas = (0...L).map { ws + span * Double($0) / Double(L) }
-            log("SelfLift 续接调度：低清从 warmStart \(String(format: "%.4f", ws)) 等距 \(L) 步 → σ_next \(String(format: "%.4f", sigmaNext))")
-        }
         // 高清独立曲线：在 [0, σ_next] 区间等距离散化（修复 2026-09-17）
         // 旧实现 = 标准 M 步曲线整体缩放 ×σ_next，shift=12 下 σ 被压扁在 [0.6, σ_next]
         // 区间（M=3 → [0.706, 0.678, 0.605, 0]）：浅区完全无采样，最后一步 0.605→0
@@ -521,12 +511,9 @@ public func runH3Stage1WithSelfLift(
     let latHl = slLowResSize(latH, scale: cfg.lowResScale)
     let latWl = slLowResSize(latW, scale: cfg.lowResScale)
     let gHl = latHl / 2, gWl = latWl / 2
-    // ★ 续接：总 latentT = 前置窗口 + 本节点（布局/注意力全段对齐）；非续接退化为本节点
-    let totalLatT = Int(latT) + Int(continuationWinLatentT)
-    // ★ 2026-09-21 keyframe 锚点路线：H3Pipeline 已传 continuationLatent=nil，前置尾段改走
-    //   contKeyAnchors/preRefBlocks 条件行锚点、不进采样状态，视频段只含新段 latT；
-    //   仅旧初值路线（continuationLatent != nil）才把前置窗口拼进采样初值（totalLatT）。
-    let layoutLatT = (continuationActive && continuationLatent != nil) ? UInt32(totalLatT) : UInt32(latT)
+    // ★ 2026-10-03 fresh-noise 路线：续接初值恒 nil（前置尾段只走 contKeyAnchors 条件行锚/
+    //   参考块，不拼进采样初值），videoX 恒为本节点新段纯噪声起步（latT 行）。
+    let layoutLatT = UInt32(latT)
     log("SelfLift：σ 切分 ts=\(split.transitionStep)（低分 NFE=\(split.lowNFE) / 高分 NFE=\(split.highNFE)），"
         + "σ_k=\(String(format: "%.4f", split.sigmaK)) → σ_next=\(String(format: "%.4f", split.sigmaNext))，"
         + "latent \(latH)×\(latW) → 低分 \(latHl)×\(latWl)")
@@ -537,12 +524,20 @@ public func runH3Stage1WithSelfLift(
     //     低分尺寸按 cfg.lowResScale 经 slLowResSize 同口径缩放；layout 侧传同序同尺寸的 refs。
     //   · fl2va（refBlocks 为空）：每段 = 一个目标帧（fRows 行）；layout 侧仍用 keyframes [.first,.last]。
     let fRows = gridH * gridW
-    // ★ 续接：ref2va 时前置参考块并入块列表（段序 [前置refImg][本节点refImg]，与 condRows 一致）；
-    //   condOffset = 前置 cond 段行数（fl2va/ref2va 切行都要跳过该段）
-    let allRefBlocks = preRefBlocks + refBlocks
+    // ★ 2026-10-02 段序修正（与 H3Pipeline 注入 pieces 严格一致）：注入行序 =
+    //   [preCond][boundary][本节点 refImg][前置 refImg][history]，故 allRefBlocks =
+    //   refBlocks + preRefBlocks（history video 块经 preRefBlocks 传递、位于最末）；
+    //   此前 preRef 先切 → 与注入行序错位（参考块 latent 内容读错行区，ref2va 续接
+    //   画面污染的潜在来源，本次一并修复）。
+    let allRefBlocks = refBlocks + preRefBlocks
     let condOffset = Int(preCondRows)
     var condSegs: [MLXArray] = []
-    var condSegsHigh: [MLXArray] = []   // fl2va：低清 keyframe 提升回全分辨率（替代全分辨率 keyframe 注入）
+    // ★ 2026-10-02 回退后语义：高分段条件行 = 原生 full-res 行直通。
+    //   fl2va（无参考块）例外：keyframe 来自 encodeImage 像素（官方设计低清→提升），
+    //   故其高分段保留「低清重采样 → learned upscaler 提升回全分辨率」版（2026-09-22 起）；
+    //   ref2va 的 boundary/history 均为去噪完成的干净 full-res latent，高分段原生直通、
+    //   不降画面再提升（低分段内部自行重采样处理，互不干扰）。
+    var condSegsHigh: [MLXArray] = []
     var lowRefBlocks: [RefBlock] = []
     if allRefBlocks.isEmpty {
         let nCond = (condRowsFull.shape[0] - condOffset) / fRows
@@ -581,34 +576,77 @@ public func runH3Stage1WithSelfLift(
             let rows = H3TensorOps.patchifyVideo(low, gridH: gHl, gridW: gWl)
             keepAlive.hold([lat, low, rows])
             condSegs.append(rows)
+            // ★ 2026-10-02 回退（用户确认）：前置尾段 latent 是去噪完成的高清 full-res 结果，
+            //   高分段直接原生行直通（与低分内部处理解耦）——不再低清重采样→learned upscaler
+            //   提升（多此一举且降画面，还引入 2×2 提升网格）。
+            condSegsHigh.append(seg)
         }
         for b in allRefBlocks {
-            // 本工程 ref2va 只产出 image 参考块（H3Pipeline.swift:234）；其它类型没有条件行构造口径，
-            // 直接报错而不是悄悄错位。
-            guard b.kind == .image else {
+            // 本工程 ref2va 支持 image + video（history）参考块；audio 块无视觉行，走到这里报错。
+            switch b.kind {
+            case .audio:
                 throw NSError(domain: "H3SelfLift", code: 3, userInfo: [NSLocalizedDescriptionKey:
-                    "SelfLift ref2va 目前只支持 image 参考块，收到 \(b.kind)"])
+                    "SelfLift ref2va 收到 audio 参考块（视觉行切分路径不应出现）"])
+            case .image:
+                let gh = Int(b.latentH) / Int(H3Const.patchH)
+                let gw = Int(b.latentW) / Int(H3Const.patchW)
+                let n = gh * gw                                   // = H3Layout.refFrameRows(b)
+                guard offset + n <= condRowsFull.shape[0] else {
+                    throw NSError(domain: "H3SelfLift", code: 4, userInfo: [NSLocalizedDescriptionKey:
+                        "参考块行数超出 condRowsFull：\(offset + n) > \(condRowsFull.shape[0])"])
+                }
+                let seg = condRowsFull[offset..<(offset + n)]
+                offset += n
+                let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gh, gridW: gw)         // [1,latH,latW,C]
+                let lh = slLowResSize(Int(b.latentH), scale: cfg.lowResScale)
+                let lw = slLowResSize(Int(b.latentW), scale: cfg.lowResScale)
+                let low = slResizeKeyframeLatent(lat, outH: lh, outW: lw,
+                                                 keepAlive: keepAlive)                   // [1,lh,lw,C]
+                let rows = H3TensorOps.patchifyVideo(low, gridH: lh / Int(H3Const.patchH),
+                                                     gridW: lw / Int(H3Const.patchW))
+                keepAlive.hold([lat, low, rows])
+                condSegs.append(rows)
+                // ★ 参考图行（含前置 refImg）为 VAE 编码的干净 latent，无低清 patch 网格残留，
+                //   保持原生全分辨率注入高清 forward（非端点锚定，低清/高清两套对静态参考无碍）。
+                condSegsHigh.append(seg)
+                lowRefBlocks.append(RefBlock(kind: .image, latentH: UInt32(lh), latentW: UInt32(lw),
+                                             latentT: b.latentT, audioT: b.audioT))
+            case .video:
+                // ★ 2026-10-02 history 视频参考块（mere-run encodeContinuation 语义）：
+                //   整段 latentT 帧逐帧重采样进低清（每帧独立 bilinear，不跨帧混叠），
+                //   行序拼接为一段（与布局 refs .video 段一致）；低清块 latentT 保持。
+                let gh = Int(b.latentH) / Int(H3Const.patchH)
+                let gw = Int(b.latentW) / Int(H3Const.patchW)
+                let n = Int(b.latentT) * gh * gw
+                guard offset + n <= condRowsFull.shape[0] else {
+                    throw NSError(domain: "H3SelfLift", code: 4, userInfo: [NSLocalizedDescriptionKey:
+                        "video 参考块行数超出 condRowsFull：\(offset + n) > \(condRowsFull.shape[0])"])
+                }
+                let lh = slLowResSize(Int(b.latentH), scale: cfg.lowResScale)
+                let lw = slLowResSize(Int(b.latentW), scale: cfg.lowResScale)
+                var segs: [MLXArray] = []
+                var segsHigh: [MLXArray] = []   // ★ 2026-10-02 回退：history 高分段 = 原生 full-res 行直通
+                for f in 0..<Int(b.latentT) {
+                    let seg = condRowsFull[(offset + f * gh * gw)..<(offset + (f + 1) * gh * gw)]
+                    let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gh, gridW: gw)     // [1,latH,latW,C]
+                    let low = slResizeKeyframeLatent(lat, outH: lh, outW: lw,
+                                                     keepAlive: keepAlive)               // [1,lh,lw,C]
+                    let rows = H3TensorOps.patchifyVideo(low, gridH: lh / Int(H3Const.patchH),
+                                                         gridW: lw / Int(H3Const.patchW))
+                    keepAlive.hold([lat, low, rows])
+                    segs.append(rows)
+                    // ★ 2026-10-02 回退（用户确认）：history 整段为干净 full-res latent，
+                    //   高分段原生直通，不逐帧低清重采样→提升（与 boundary 语义一致）。
+                    segsHigh.append(seg)
+                }
+                let rowsConcat = segs.count == 1 ? segs[0] : concatenated(segs, axis: 0)
+                condSegs.append(rowsConcat)
+                let rowsHighConcat = segsHigh.count == 1 ? segsHigh[0] : concatenated(segsHigh, axis: 0)
+                condSegsHigh.append(rowsHighConcat)
+                lowRefBlocks.append(RefBlock(kind: .video, latentH: UInt32(lh), latentW: UInt32(lw),
+                                             latentT: b.latentT, audioT: b.audioT))
+                offset += n
             }
-            let gh = Int(b.latentH) / Int(H3Const.patchH)
-            let gw = Int(b.latentW) / Int(H3Const.patchW)
-            let n = gh * gw                                   // = H3Layout.refFrameRows(b)
-            guard offset + n <= condRowsFull.shape[0] else {
-                throw NSError(domain: "H3SelfLift", code: 4, userInfo: [NSLocalizedDescriptionKey:
-                    "参考块行数超出 condRowsFull：\(offset + n) > \(condRowsFull.shape[0])"])
-            }
-            let seg = condRowsFull[offset..<(offset + n)]
-            offset += n
-            let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gh, gridW: gw)         // [1,latH,latW,C]
-            let lh = slLowResSize(Int(b.latentH), scale: cfg.lowResScale)
-            let lw = slLowResSize(Int(b.latentW), scale: cfg.lowResScale)
-            let low = slResizeKeyframeLatent(lat, outH: lh, outW: lw,
-                                             keepAlive: keepAlive)                   // [1,lh,lw,C]
-            let rows = H3TensorOps.patchifyVideo(low, gridH: lh / Int(H3Const.patchH),
-                                                 gridW: lw / Int(H3Const.patchW))
-            keepAlive.hold([lat, low, rows])
-            condSegs.append(rows)
-            lowRefBlocks.append(RefBlock(kind: .image, latentH: UInt32(lh), latentW: UInt32(lw),
-                                         latentT: b.latentT, audioT: b.audioT))
         }
         guard offset == condRowsFull.shape[0] else {
             throw NSError(domain: "H3SelfLift", code: 5, userInfo: [NSLocalizedDescriptionKey:
@@ -616,22 +654,27 @@ public func runH3Stage1WithSelfLift(
         }
     }
     let condRowsLow = condSegs.count == 1 ? condSegs[0] : concatenated(condSegs, axis: 0)
-    // ★ fl2va 高清条件行 = 低清 keyframe 提升回全分辨率（与低分注入同一份结构，避免双套网格错位）；
-    //   ref2va 保持原行为（refs 非端点锚定，无错位问题，直接用原生全分辨率参考块）。
+    // ★ 2026-10-02 回退后语义：原始 full-res 条件行同时供低分/高分两路消费。
+    //   高分段（condRowsHigh）= 原生 full-res 行直通（fl2va 无参考块用低清→提升版除外，
+    //   那是官方 keyframe encodeImage 语义；ref2va 的 boundary/history 均为去噪完成的
+    //   干净 full-res latent，原生直通不降画面再提升）；低分段内部自行重采样处理。
+    //   （2026-09-22 起 learned 不可用即显式终止，绝不静默回退 nearest。）
     let condRowsHigh: MLXArray
-    if allRefBlocks.isEmpty {
-        condRowsHigh = condSegsHigh.count == 1 ? condSegsHigh[0] : concatenated(condSegsHigh, axis: 0)
-        keepAlive.hold([condRowsHigh])
-        MLX.eval(condRowsHigh)
-    } else {
-        // ★ 续接：高分段截掉前置 cond 段（ref2va 注入段序 [contKey][preRef][ownRef]，contKey 走原生高清行）
-        condRowsHigh = condOffset > 0 ? condRowsFull[condOffset..<condRowsFull.shape[0]] : condRowsFull
+    if condSegsHigh.isEmpty {
+        preconditionFailure("SelfLift: 高清条件行缺失（condSegsHigh 为空，低清/高清同构注入未构建）")
     }
+    condRowsHigh = condSegsHigh.count == 1 ? condSegsHigh[0] : concatenated(condSegsHigh, axis: 0)
+    keepAlive.hold([condRowsHigh])
+    MLX.eval(condRowsHigh)
 
     // 修复不变量：layout 侧 cond 行预算必须**严格等于**实际传入的条件行数，
     // 否则多余行会被 H3Transformer 按 layout.segments 静默丢弃、视频段起点整体前移。
-    let budgetLow = allRefBlocks.isEmpty ? (2 + contKeyAnchors.count) * gHl * gWl : contKeyAnchors.count * gHl * gWl + lowRefBlocks.reduce(0) { $0 + Int(refFrameRows($1)) }
-    let budgetHigh = allRefBlocks.isEmpty ? (2 + contKeyAnchors.count) * fRows : contKeyAnchors.count * fRows + allRefBlocks.reduce(0) { $0 + Int(refFrameRows($1)) }
+    // ★ 2026-10-02：video（history）参考块行数 = latentT × refFrameRows（每帧一行网格）。
+    let lowBlockRows: (RefBlock) -> Int = { b in
+        b.kind == .video ? Int(b.latentT) * Int(refFrameRows(b)) : Int(refFrameRows(b))
+    }
+    let budgetLow = allRefBlocks.isEmpty ? (2 + contKeyAnchors.count) * gHl * gWl : contKeyAnchors.count * gHl * gWl + lowRefBlocks.reduce(0) { $0 + lowBlockRows($1) }
+    let budgetHigh = allRefBlocks.isEmpty ? (2 + contKeyAnchors.count) * fRows : contKeyAnchors.count * fRows + allRefBlocks.reduce(0) { $0 + lowBlockRows($1) }
     guard budgetLow == condRowsLow.shape[0], budgetHigh == condRowsHigh.shape[0] else {
         throw NSError(domain: "H3SelfLift", code: 6, userInfo: [NSLocalizedDescriptionKey:
             "layout cond 预算与实际条件行不一致：低分 \(budgetLow) vs \(condRowsLow.shape[0])，"
@@ -683,25 +726,9 @@ public func runH3Stage1WithSelfLift(
     dit.precomputeAdaln(ts: tsLow)
     let ropeLow = buildRope(layout: layoutLow, invFreq: dit.invFreq)
 
-    // ★ 续接初值（2026-09-20）：前置尾段 clean latent [winT,latH,latW,latC] 整段降采样到
-    //   低清网格 → patchify 成低清段前缀行（与低清段同网格同构），新段仍从噪声起步，
-    //   最后整体加噪到 warmStart（保留前置结构，后续由低清曲线等距收敛）。
-    var videoX: MLXArray
-    if continuationActive, let contLat = continuationLatent {
-        let contLow = slResizeKeyframeLatent(contLat, outH: latHl, outW: latWl,
-                                             keepAlive: keepAlive)   // [winT,latHl,latWl,C]
-        let contRows = H3TensorOps.patchifyVideo(contLow, gridH: gHl, gridW: gWl)
-        let newRows = MLXRandom.normal([Int(latT) * gHl * gWl, vpatch], key: MLXRandom.key(seed))
-        videoX = concatenated([contRows, newRows], axis: 0)
-        let s0 = continuationStartSigma ?? split.lowSigmas[0]
-        let epsV = MLXRandom.normal(videoX.shape, key: MLXRandom.key(seed &+ 2)).asType(videoX.dtype)
-        videoX = videoX * H3TensorOps.scalarLike(Float(1.0 - s0), videoX)
-            + epsV * H3TensorOps.scalarLike(Float(s0), videoX)
-        keepAlive.hold([contLow, contRows, epsV])
-        log("SelfLift 续接初值：前置尾段 \(contLat.shape[0]) 帧降采样 → \(contRows.shape) + 新段 \(newRows.shape)，整体加噪 σ0=\(String(format: "%.4f", s0))")
-    } else {
-        videoX = MLXRandom.normal([Int(latT) * gHl * gWl, vpatch], key: MLXRandom.key(seed))
-    }
+    // ★ 2026-10-03 fresh-noise 路线：续接初值恒 nil（前置尾段只走 contKeyAnchors 条件行锚/
+    //   参考块，不拼进采样初值），videoX 恒为本节点新段纯噪声起步（latT 行）。
+    var videoX = MLXRandom.normal([Int(latT) * gHl * gWl, vpatch], key: MLXRandom.key(seed))
     var audioX: MLXArray
     if contAudioRows > 0, let preAudio = audioContinuationRows {
         // ★ 音频续接：audioX = [前置真实尾段 | 本节点噪声]，前置行经 refAudio 段注入注意力，
@@ -954,10 +981,8 @@ public func runH3Stage1WithSelfLift(
         return rowsOut
     }
 
-    // ★ 修复（2026-09-20）：过渡噪声行数必须与提升后 latent 行数一致 —— 旧初值续接场景下
-    //   latent 含前置窗口（totalLatT = latT + continuationWinLatentT），旧代码用 latT 导致
-    //   Eq.10 重加噪时 noise 与 z0High broadcast 崩溃（(59472,96) vs (37296,96)）。
-    //   ★ 2026-09-21：keyframe 锚点路线（continuationLatent=nil）下视频段只含新段 latT，
+    // ★ 过渡噪声行数与提升后 latent 行数一致（2026-09-20 修复）：
+    //   2026-10-03 起 fresh-noise 路线 layoutLatT=latT（视频段只含本节点新段），
     //   过渡噪声按 layoutLatT 走（与布局/rope/videoX 同一口径）。
     let transitionNoise = MLXRandom.normal([Int(layoutLatT) * gridH * gridW, vpatch],
                                            key: MLXRandom.key(seed &+ 7))

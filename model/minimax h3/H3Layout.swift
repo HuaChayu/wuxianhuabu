@@ -420,17 +420,44 @@ public final class PackedLayout {
         }
 
         // keyframe condition rows (fl2va + 续接前置尾段锚点), sharing the target spatial grid.
+        // ★ 2026-10-02 boundary 坐标修复（mere-run encodeContinuation 语义）：
+        //   续接 boundary .first 锚（前置末帧）必须钉在 target 首帧坐标——即 refs 段与
+        //   contRefs（preRef image + history video）全部推进后的 cursor。旧实现钉在
+        //   textLen+preCond 处，与 target 首帧相隔整个 history 段跨度，模型只能自行猜测
+        //   "末帧→新段开头"过渡 → 延续段闪烁 + patch 网格方块感（新段无此注入故只糊不闪）。
+        //   fl2va 首尾帧锚同理对齐 target 首尾帧。
+        var keyframeTargetAdvance: Double = 0
+        for b in refs {
+            switch b.kind {
+            case .image: keyframeTargetAdvance += 1.0
+            case .audio: keyframeTargetAdvance += Double(b.audioT)
+            case .video:
+                var spans: Double = 0
+                for k in 0..<Int(b.latentT) { spans += videoTSpan(k) }
+                keyframeTargetAdvance += max(Double(b.audioT), spans)
+            }
+        }
+        for b in contRefs {
+            switch b.kind {
+            case .image: keyframeTargetAdvance += 1.0
+            case .video:
+                var spans: Double = 0
+                for k in 0..<Int(b.latentT) { spans += videoTSpan(k) }
+                keyframeTargetAdvance += max(Double(b.audioT), spans)
+            case .audio: break // 负锚 END 对齐，不推进 cursor
+            }
+        }
         for anchor in keyframes {
             let condT: Double
             switch anchor {
             case .first:
-                condT = cursor
+                condT = cursor + keyframeTargetAdvance
             case .last:
                 var spans: Double = 0
                 for k in 0..<Int(latentT) { spans += videoTSpan(k) }
-                condT = cursor + spans - H3Const.frameRescale
+                condT = cursor + keyframeTargetAdvance + spans - H3Const.frameRescale
             case .at(let t):
-                condT = cursor + t
+                condT = cursor + keyframeTargetAdvance + t
             }
             segments.append(Segment(start: row, end: row + frameRows, kind: .cond))
             writeFrameGrid(&positionIds, row: row, t: condT, hAxis: hAxis, wAxis: wAxis)
@@ -564,7 +591,8 @@ public final class PackedLayout {
         //   本节点尾帧参考不再被推到 refImg 段最末尾造成双重强锚。
         // t 从 refs 段之后的 cursor 起递增（落在视频时间轴开头附近，不超界）。
         for b in contRefs {
-            if b.kind == .image {
+            switch b.kind {
+            case .image:
                 let g = refGrid(b)
                 segments.append(Segment(start: row, end: row + g.rows, kind: .refImg))
                 writeFrameGrid(&positionIds, row: row, t: cursor, hAxis: g.hAxis, wAxis: g.wAxis)
@@ -574,6 +602,29 @@ public final class PackedLayout {
                 }
                 row += g.rows
                 cursor += 1.0
+            case .video:
+                // ★ 2026-10-02 history 参考块（mere-run encodeContinuation 语义）：
+                //   前置尾段去末帧整段 latent 作 video 参考，正轴顺延（origin=cursor，
+                //   非逐帧 keyframe 锚、非负轴 before），行序紧接 preRef image 之后，
+                //   与 H3Pipeline 注入 pieces 的 preRef → history 严格一致。
+                let g = refGrid(b)
+                let nRows = b.latentT * g.rows
+                segments.append(Segment(start: row, end: row + nRows, kind: .refImg))
+                let rtGrid = videoTGrid(b.latentT, origin: cursor)
+                for (f, tv) in rtGrid.enumerated() {
+                    writeFrameGrid(&positionIds, row: row + UInt32(f) * g.rows, t: tv, hAxis: g.hAxis, wAxis: g.wAxis)
+                }
+                for _ in 0..<Int(nRows) {
+                    imgUpdate[imgRow] = false
+                    imgRow += 1
+                }
+                row += nRows
+                var spans: Double = 0
+                for k in 0..<Int(b.latentT) { spans += videoTSpan(k) }
+                cursor += max(Double(b.audioT), spans)
+            case .audio:
+                // 前置音频段已在 contRefs 首个循环（负锚 END 对齐）处理
+                break
             }
         }
 

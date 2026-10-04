@@ -162,9 +162,16 @@ public enum H3FL2VAPipeline {
         /// 本节点 ID（落盘文件名用）
         continuationNodeID: UUID? = nil,
         /// 分支 ID（多分支输出时区分，可选）
-        continuationBranchID: String? = nil
+        continuationBranchID: String? = nil,
+        /// ★ 续接亮度渐隐（2026-10-04）：解码像素域对前 seamFadeFrames 帧做亮度向锚对齐，
+        ///   0 = 关闭。锚亮度优先取前置末帧像素均值（v4 缓存 tailFramePixelsData）；
+        ///   无锚时退回「帧0 自锚」只修 1..N-1（341 方案）。>0 时帧0 也会被拉向锚亮度。
+        seamFadeFrames: Int = 16
     ) async throws -> String {
         let t0 = Date()
+        // ★ 2026-10-04 锚亮度（seam-fade 用）：续接解析段从 v4 缓存前置末帧像素提取灰度均值，
+        //   供解码段把前 N 帧亮度拉到锚亮度再衰减（342 基线无强锚定，首帧为模型生成帧偏暗）。
+        var anchorLuminance: Float? = nil
         let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
         // ★ 2026-09-19 嵌套目录兼容：下载落位历史上可能产生「根目录/同名子目录」嵌套
         //   （远端 listFiles 的 Path 自带与模型目录同名的顶层前缀）。生成侧一律按真实
@@ -224,6 +231,10 @@ public enum H3FL2VAPipeline {
         var ownCondModes: [UInt8] = []
         var ownCondHs: [UInt32] = []
         var ownCondWs: [UInt32] = []
+        // ★ 2026-10-03 v4 末帧像素（boundary .first 硬锚）：解码段从像素数组截最后 1 帧
+        //   [1,3,1,H,W]（[-1,1]），随 .h3cc 落盘；续接消费侧 encodeImage 重编码成单帧
+        //   keyframe latent 锚索引0。严禁用低清 latent 升频结果或 latent 末行冒充。
+        var tailFramePixels: MLXArray? = nil
         var latC = 0, latT = 0, latH = 0, latW = 0, gridH = 0, gridW = 0
         // ref2va 布局块与文本侧视觉块（顺序严格对应）
         var refBlocks: [RefBlock] = []
@@ -410,7 +421,24 @@ public enum H3FL2VAPipeline {
             throw NSError(domain: "H3FL2VA", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "tokenizer 加载失败"])
         }
-        let promptIds = tokenizer.encode(text: prompt, addSpecialTokens: false).map { Int32($0) }
+        var promptIds = tokenizer.encode(text: prompt, addSpecialTokens: false).map { Int32($0) }
+        // ★ 续接标记命令（2026-10-03）：本次为 .h3cc 尾帧链式续接（continuationSource 非 nil）时，
+        //   在命令拼接序列（prompt 文本条件）最前面额外拼接续接标记命令，让模型知道这是
+        //   「把上一段接下去」而非新生成；风格与现有命令（如 "no subtitles"）一致：简短英文标记，
+        //   经 tokenizer 编码为独立文本条件 token，不破坏既有拼接逻辑与续接语义（从头生成时零变化）。
+        if continuationSource != nil {
+            // ★ 通用续接提示词前缀（2026-10-03 修订 v3）：续接 = 同一镜头内的因果连续，不是
+            //   「先播一段前置、再另起内容」。前置画面是场景起点，prompt 描述的事件（新主体入场、
+            //   动作、交互）从第一帧起就在同一画面中自然发生；不写死时长/镜头/相机，只有 prompt
+            //   明确写了切换/新镜头/换场景才切。<Video 1> 动态指向续接源，用户原始 prompt 原样
+            //   嵌入其后不做改写，画面继承靠机制层。
+            let contPrefix = """
+            [video continuation] Continue <Video 1> as one continuous shot. Keep its scene and subjects, and let everything described in the prompt happen immediately within that same scene from the first frames: new subjects enter, motions and interactions unfold as part of the continuation. Do not replay the previous segment first, and do not cut to a new scene unless the prompt explicitly says so.
+            """
+            let contMarkIds = tokenizer.encode(text: contPrefix, addSpecialTokens: false).map { Int32($0) }
+            promptIds = contMarkIds + promptIds
+            log("通用续接前缀：命中 .h3cc 尾帧链式续接，前置续接语义壳（\(contMarkIds.count) tokens，同一镜头因果连续、prompt 事件从首帧融合发生、仅显式切换才切，无硬编码时长/镜头）+ 原 prompt（\(promptIds.count - contMarkIds.count) tokens，原样保留未改写）")
+        }
         var presentItems: [H3PresentItem] = []
         var textTagsForLayout: [UInt8] = []
         // 无字幕抑制条件：简短标准写法，避免长句误伤画面内容（如广告牌/文字元素）。
@@ -522,19 +550,20 @@ public enum H3FL2VAPipeline {
         var continuationWinAudioT = UInt32(0)
         var continuationWinRows = 0
         var continuationCacheRows: MLXArray? = nil
-        var continuationCacheNCDHW: MLXArray? = nil   // 前置尾段 clean latent [winT,latH,latW,latC]（诊断/回退用）
-        var continuationStartSigma: Double? = nil     // 保留字段（2026-09-21 起不再消费：续接走 keyframe 锚点，纯噪声起步）
         // ★ 续接 keyframe 锚点（2026-09-21）：前置尾段 latent 按 latent step 切段，作为
         //   never-denoised 条件行锚进新 clip 时间轴开头；行数据 = continuationCacheRows。
         var contKeyAnchors: [KeyframeAnchor] = []
         var contKeyRows: MLXArray? = nil
+        // ★ 2026-10-02 history+boundary 语义（mere-run encodeContinuation / ComfyUI MotionContext）：
+        //   前置尾段去末帧整段 latent 行 → history video 参考块（contRefs 正轴顺延，never-denoised）；
+        //   末帧作 boundary .first 锚。2026-10-03 起 .first 锚改为「末帧像素 encodeImage 重编码
+        //   单帧 keyframe latent」（v4 缓存 tailFrameRGB），hard-boundary latent 末行直通已撤回。
+        var continuationHistoryRows: MLXArray? = nil   // 前置 history latent 行 [（winT-1)*fRows, vpatch]
         var continuationCondRows: MLXArray? = nil   // 前置干净条件行（去重后，不加 aug noise）→ .cond 段
         var continuationRefRows: MLXArray? = nil    // 前置 refImg 段干净条件行 → 重建参考图网格（v3）
         var continuationAudioRows: MLXArray? = nil  // ★ 2026-09-21 音频续接：前置尾段音频 latent 行 [winAudioT*2, 32]
                                                     //   （clean）→ refAudio 段（never-denoised），nil = 旧缓存无音频
         // 去重后保留的前置段元数据（供落盘透传，段序与注入行严格一致）
-        var keptPreCondIDs: [String] = []           // cond 段（keyframe）
-        var keptPreCondSpans: [Int] = []
         var keptPreRefIDs: [String] = []            // refImg 段（参考图）
         var keptPreRefSpans: [Int] = []
         var keptPreRefHs: [UInt32] = []
@@ -575,33 +604,80 @@ public enum H3FL2VAPipeline {
                 continuationWinAudioT = UInt32(cont.header.winAudioT)
                 continuationWinRows = cont.header.winLatentRows
                 continuationCacheRows = cacheRows
-                continuationCacheNCDHW = cacheArr   // 保留 NCDHW（不 patchify）供诊断/回退使用
-                continuationStartSigma = cont.recovery.warmStart
-                // ★ 2026-09-21 续接改 keyframe 锚点（ComfyUI 路线）：前置尾段 latent 不再作采样
-                //   初值加噪重画，而是作为 never-denoised 条件行锚进新 clip 时间轴开头——
-                //   每 latent step 一个锚点，t 从 0 按 videoTSpan 递增（低清/高清布局共用）。
-                contKeyAnchors = []
-                contKeyRows = nil
-                let tailRows = cacheRows   // 非 Optional（上层已 patchify 并 eval）
+                // ★ 2026-10-02 改 history+boundary 语义（mere-run encodeContinuation /
+                //   ComfyUI MiniMaxH3MotionContext 双实现源码核对结论）：前置尾段不再逐帧作
+                //   keyframe 锚（逐帧强条件 → 割裂/格子感来源，见 h3 复盘），而是：
+                //     · history：前置尾段去末帧整段 latent 作 video 参考块（布局 contRefs 段
+                //       正轴顺延，never-denoised，整段参考而非逐帧替换 t）；
+                //     · boundary：末帧作 .first 锚（钉新 clip 首帧，t=cursor）。
+                //   target 保持纯噪声起步（2026-10-03 起续接初值恒 nil，非 warm-start）。
+                // ★ 2026-10-02 恢复首帧锚（对照关锚复测）：
+                //   关锚（h3_325→h3_326）复测暴露：无首锚时新段开头自由演化——
+                //   ① 开头接不上（缺末帧画面，播放几帧才撞上延续方向）；
+                //   ② 前 1s+ 频繁虚化闪烁（模型在「参考画面」与「自身漂移」间摇摆）。
+                //   boundary .first 锚为模型提供「首帧=末帧」的强锚点（接续+稳定）。
+                //   2026-10-03 起锚数据源 = 末帧像素 encodeImage 重编码（v4 tailFrameRGB），
+                //   撤回「采样后首帧行直通末帧 latent」的 latent 末行冒充方案（见下）。
                 let winT = Int(continuationWinLatentT)
-                var acc: Double = 0
-                for k in 0..<winT {
-                    contKeyAnchors.append(.at(acc))
-                    acc += videoTSpan(k)
+                let tailRows = cacheRows
+                let fr = Int(tailRows.shape[0]) / winT
+                if winT > 1 {
+                    // history 行 = 去末帧整段（video 参考块，正轴顺延 never-denoised）
+                    continuationHistoryRows = tailRows[0 ..< (winT - 1) * fr]
+                } else {
+                    // 单帧缓存退化：无 history，仅 boundary .first 锚 + 缓存音频/前置条件延续
+                    continuationHistoryRows = nil
                 }
-                contKeyRows = tailRows
-                log("续接 keyframe 锚点：前置尾段 \(winT) 个 latent step → \(contKeyAnchors.count) 锚点（t=0 → \(String(format: "%.3f", acc))），行 \(tailRows.shape)")
-                // ★ 2026-09-22 ref2va 多参考续接（137 钉条件图根因修复）：
-                //   去末锚点：前置尾段 latent 仍逐帧锚 t=0 → … → 倒数第 2 帧，
-                //   但不再叠加最后一个锚点——末尾让给本节点尾帧参考图（<Last frame> 语义），
-                //   避免上游尾帧画面被强钉在新 clip 末尾（137 钉条件图观感的直接来源）。
-                //   空图/纯 fl2va 续接保持全锚（画面自然延续，136 正常即此路径）。
-                if !referenceImagePaths.isEmpty, winT > 1 {
-                    let fr = Int(tailRows.shape[0]) / winT
-                    contKeyAnchors = Array(contKeyAnchors.dropLast())
-                    contKeyRows = tailRows[0 ..< (winT - 1) * fr]
-                    MLX.eval(contKeyRows)
-                    log("ref2va 续接去末锚点：\(winT) → \(winT - 1) 个（末尾不再钉前置尾帧，交给本节点尾帧参考图）")
+                if let hr = continuationHistoryRows { MLX.eval(hr) }
+                // ★ 2026-10-03 boundary .first 锚 = 末帧像素重编码（用户否决 latent 末行直通）：
+                //   索引0 的首锚必须是「末 latent 解码出的最后一个像素图 encodeImage 重编码的
+                //   单帧 keyframe latent」，绝对清晰、绝对遵从前置；严禁低清 latent 升频结果
+                //   或 latent 末行冒充。v4 缓存携带 tailFrameRGB → 末帧像素 → encodeImage；
+                //   旧缓存无像素段 → 关锚（仅 history 延续），避免 latent 末行冒充。
+                if let pxData = cont.tailFramePixelsData,
+                   let th = cont.header.tailFrameH, let tw = cont.header.tailFrameW,
+                   th > 0, tw > 0,
+                   let pxArr = H3ContinuationCache.mlxArray(fromData: pxData, shape: [1, 3, 1, th, tw]) {
+                    let pxF32 = pxArr.asType(.float32)
+                    MLX.eval(pxF32)
+                    // ★ 2026-10-04 seam-fade 锚亮度：前置末帧像素灰度均值（[-1,1] 域，三通道平均）
+                    do {
+                        let aLArr = pxF32.mean(axes: [3, 4], keepDims: true).mean(axes: [1], keepDims: true).reshaped([1])
+                        MLX.eval(aLArr)
+                        anchorLuminance = aLArr.item(Float.self)
+                        log("seam-fade 锚亮度：前置末帧像素灰度均值 = \(String(format: "%.4f", anchorLuminance ?? -1))")
+                    } catch {
+                        log("⚠️ seam-fade 锚亮度计算失败（\(error.localizedDescription)），退回帧0 自锚")
+                    }
+                    var anchorRows: MLXArray? = nil
+                    do {
+                        try autoreleasepool {
+                            var vaeWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
+                            vaeWeights?.cacheEnabled = false
+                            var vae: H3VAE? = try H3VAE.load(vaeWeights!)
+                            let lat = vae!.encodeImage(pxF32)      // [1,24,1,lh,lw]
+                            let lh = lat.shape[3], lw = lat.shape[4], lc = lat.shape[1]
+                            let nhwc = lat.transposed(0, 2, 3, 4, 1).reshaped([1, lh, lw, lc])
+                            anchorRows = H3TensorOps.patchifyVideo(nhwc, gridH: lh / 2, gridW: lw / 2)
+                            MLX.eval(anchorRows)
+                            vae = nil
+                            vaeWeights = nil
+                        }
+                    } catch {
+                        log("⚠️ 末帧像素 encodeImage 失败（\(error.localizedDescription)），关闭 .first 锚（仅 history 延续）")
+                    }
+                    if let ar = anchorRows {
+                        contKeyAnchors = [.first]
+                        contKeyRows = ar
+                        MLX.eval(ar)
+                        log("续接（像素 .first 硬锚）：history 整段 \(winT - 1) latentT video 参考块（行 \(continuationHistoryRows?.shape ?? [])）；末帧像素 \(th)×\(tw) → encodeImage 单帧 keyframe 锚（行 \(ar.shape)，索引0）")
+                    } else {
+                        contKeyAnchors = []
+                        log("⚠️ 末帧像素 encodeImage 无输出，关闭 .first 锚（仅 history 延续）")
+                    }
+                } else {
+                    contKeyAnchors = []
+                    log("⚠️ 续接缓存无末帧像素段（旧版 .h3cc），关闭 .first 首锚（严禁 latent 末行冒充）；仅 history 参考块延续")
                 }
                 // ★ 2026-09-21 音频续接：缓存携带音频 latent 时重建 [winAudioT*2, 32] 行，
                 //   作为 refAudio 段（never-denoised）注入 audio stream；缺失则回退噪声占位。
@@ -668,8 +744,6 @@ public enum H3FL2VAPipeline {
                                                               latentT: 1, audioT: 0))
                             } else {
                                 kept.append(seg)
-                                keptPreCondIDs.append(rid)
-                                keptPreCondSpans.append(span)
                             }
                             cursor += span
                         }
@@ -700,6 +774,15 @@ public enum H3FL2VAPipeline {
                 } else {
                     log("⚠️ 前置条件行缺失/不匹配（vpatch 需 =\(cfg.videoPatchDim)），仅注入尾段 latent")
                 }
+                // ★ 2026-10-02 history video 参考块：前置尾段去末帧整段 latent（winT-1 帧）作
+                //   video 参考块追加到 contRefBlocks 末尾（段序 [audio][preRef image][history video]，
+                //   与注入 pieces 的 preRef → history 行序严格一致）。布局 contRefs .video 分支
+                //   按正轴顺延坐标重建 refImg 段；SelfLift 侧 allRefBlocks 同序切行。
+                if let hr = continuationHistoryRows, hr.shape[0] > 0 {
+                    contRefBlocks.append(RefBlock(kind: .video, latentH: UInt32(latH), latentW: UInt32(latW),
+                                                  latentT: UInt32(winT - 1), audioT: 0))
+                    log("续接 history 参考块：前置尾段去末帧 \(winT - 1) latentT 整段作 video 参考（正轴顺延，never-denoised）")
+                }
                 log("★ 续接激活：前置尾段 \(continuationWinLatentT) latentT（\(continuationWinRows) 行）注入采样（winFrames=\(cont.header.winFrames)，warmStart=\(cont.recovery.warmStart)）")
             } else {
                 log("⚠️ 续接校验未通过（fpOK=\(fpOK) geoOK=\(geoOK)），回退从头生成")
@@ -707,10 +790,6 @@ public enum H3FL2VAPipeline {
         }
         // 续接总帧布局：总 latentT/audioT/帧数 = 前置窗口 + 本节点（非续接时逐字退化为原值）
         let effLatentT = continuationActive ? latentT + continuationWinLatentT : latentT
-        // ★ 2026-09-23 音频不再用 effAudioT：audioX 状态/layout 恒为本节点 audioT（解码守卫 audioRowsToLatent
-        //   期望 [audioT*2, 32]），前置音频行只经 audioIn 输入侧/refAudio 段注入；effAudioT 仅保留作
-        //   audioIn 总行数（refAudio + 本节点 = effAudioT*2）的口径参考，不再进布局与状态。
-        let effAudioT = continuationActive ? audioT + continuationWinAudioT : audioT
         let effFrameCount = continuationActive ? UInt32(h3PlanTemporal(Int(effLatentT)).outputFrames) : frameCount
         // ★ 条件注入：不判断缺图——有前置条件行就把「视频1去重后条件」与「本节点干净条件」直接合并，
         //   再统一走 aug noise（与官方 keyframe 同规则）。后续由用户在注入层自行演进。
@@ -729,10 +808,8 @@ public enum H3FL2VAPipeline {
             //   保证 refImg 段前 N 槽 = 本节点参考图（与视觉块标签严格对应）。
             var pieces: [MLXArray] = []
             var piecesInjected: [MLXArray] = []
-            if let pre = continuationCondRows {
-                pieces.append(pre)
-                piecesInjected.append(pre)
-            }
+            // ★ 2026-10-03 前置不再进入条件区（.cond/preCondRows），仅保留时间轴注入
+            //   （history 行）与末帧锚（contKeyRows）+ 提示词命令；不再拼入 condRows。
             if let tail = contKeyRows { pieces.append(tail) }       // 前置尾段 keyframe（无条件：layout keyframes 恒含 contKeyAnchors）
             if !useRef2VA {
                 pieces.append(clean)                                 // 本节点 keyframe 行
@@ -746,6 +823,11 @@ public enum H3FL2VAPipeline {
                 pieces.append(preRef)
                 piecesInjected.append(preRef)
             }
+            // ★ 2026-10-02 history 行（前置尾段去末帧整段 latent）：布局 contRefs .video 段在
+            //   preRef 之后，行序严格对齐；不入 piecesInjected（由缓存 latent 派生，不落盘为条件行）。
+            if let hr = continuationHistoryRows, hr.shape[0] > 0 {
+                pieces.append(hr)
+            }
             let merged = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
             let mergedInjected = piecesInjected.count == 1 ? piecesInjected[0] : concatenated(piecesInjected, axis: 0)
             MLX.eval(merged, mergedInjected)
@@ -754,39 +836,36 @@ public enum H3FL2VAPipeline {
             let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), merged)
             condRows = merged * augA + augNoise * augB
             MLX.eval(condRows)
-            log("★ 条件直接注入：preCond \(continuationCondRows?.shape ?? []) + contTailKey \(contKeyRows?.shape ?? []) + ownKeyframe \(useRef2VA ? "∅" : String(describing: clean.shape)) + ownRef \(useRef2VA ? String(describing: clean.shape) : "∅") + preRef \(continuationRefRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 contTail = \(mergedInjected.shape)）")
+            log("★ 条件直接注入：boundary \(contKeyRows?.shape ?? []) + ownKeyframe \(useRef2VA ? "∅" : String(describing: clean.shape)) + ownRef \(useRef2VA ? String(describing: clean.shape) : "∅") + preRef \(continuationRefRows?.shape ?? []) + history \(continuationHistoryRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 boundary/history = \(mergedInjected.shape)；前置条件行已不注入条件区）")
             injectedCondRowsClean = mergedInjected
-            // 透传段序与注入行严格一致：前置cond + 本节点keyframe + 本节点ref + 前置ref
-            injectedCondIDs = keptPreCondIDs + (useRef2VA ? [] : ownCondIDs) + (useRef2VA ? ownCondIDs : []) + keptPreRefIDs
-            injectedCondSpans = keptPreCondSpans + (useRef2VA ? [] : ownCondSpans) + (useRef2VA ? ownCondSpans : []) + keptPreRefSpans
-            injectedCondModes = [UInt8](repeating: 0, count: keptPreCondIDs.count)
-                + (useRef2VA ? [] : ownCondModes)
+            // 透传段序与注入行严格一致：本节点keyframe + 本节点ref + 前置ref（前置条件行已不注入）
+            injectedCondIDs = (useRef2VA ? [] : ownCondIDs) + (useRef2VA ? ownCondIDs : []) + keptPreRefIDs
+            injectedCondSpans = (useRef2VA ? [] : ownCondSpans) + (useRef2VA ? ownCondSpans : []) + keptPreRefSpans
+            injectedCondModes = (useRef2VA ? [] : ownCondModes)
                 + (useRef2VA ? ownCondModes : [])
                 + [UInt8](repeating: 1, count: keptPreRefIDs.count)
-            injectedCondHs = [UInt32](repeating: 0, count: keptPreCondIDs.count)
-                + (useRef2VA ? [] : ownCondHs)
+            injectedCondHs = (useRef2VA ? [] : ownCondHs)
                 + (useRef2VA ? ownCondHs : [])
                 + keptPreRefHs
-            injectedCondWs = [UInt32](repeating: 0, count: keptPreCondIDs.count)
-                + (useRef2VA ? [] : ownCondWs)
+            injectedCondWs = (useRef2VA ? [] : ownCondWs)
                 + (useRef2VA ? ownCondWs : [])
                 + keptPreRefWs
         } else if continuationActive {
             // ★ 2026-09-20 续接空图：本节点无干净条件行（纯续接链），仅注入前置 .h3cc 去重保留的条件段
             var pieces: [MLXArray] = []
             var piecesInjected: [MLXArray] = []
-            if let pre = continuationCondRows {
-                pieces.append(pre)
-                piecesInjected.append(pre)
-            }
-            // ★ 2026-09-21 修复：空图续接同样补前置尾段 keyframe 锚点（layout 已含 contKeyAnchors 段）
+            // ★ 2026-10-03 前置不再进入条件区（同分支1口径），保留末帧锚 + history 时间轴注入
+            if let tail = contKeyRows { pieces.append(tail) }
             //   ★ 2026-09-23 修复：采样条件行含 contKeyRows（布局 keyframes 段恒含锚点），但落盘透传
             //   的 clean 条件行只记「preCond + preRef」（与分支1同口径，spans 对齐），否则 save 校验
             //   spans.reduce(+) == rows 失败 → .h3cc 不落盘 → 下游无缓存可续接。
-            if let tail = contKeyRows { pieces.append(tail) }
             if let preRef = continuationRefRows {
                 pieces.append(preRef)
                 piecesInjected.append(preRef)
+            }
+            // ★ 2026-10-02 history 行（同分支1：不入落盘透传段）
+            if let hr = continuationHistoryRows, hr.shape[0] > 0 {
+                pieces.append(hr)
             }
             if pieces.isEmpty {
                 // 理论上不应发生（上游有图必有条件行）；兜底零行，走纯 latent 窗口续接
@@ -801,20 +880,32 @@ public enum H3FL2VAPipeline {
                 log("续接空图：无任何条件行可注入，纯 latent 窗口续接（零行占位）")
             } else {
                 let merged = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
-                let mergedInjected = piecesInjected.count == 1 ? piecesInjected[0] : concatenated(piecesInjected, axis: 0)
-                MLX.eval(merged, mergedInjected)
+                MLX.eval(merged)
                 let augNoise = MLXRandom.normal(merged.shape, key: MLXRandom.key(seed))
                 let augA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), merged)
                 let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), merged)
                 condRows = merged * augA + augNoise * augB
                 MLX.eval(condRows)
-                injectedCondRowsClean = mergedInjected
-                injectedCondIDs = keptPreCondIDs + keptPreRefIDs
-                injectedCondSpans = keptPreCondSpans + keptPreRefSpans
-                injectedCondModes = [UInt8](repeating: 0, count: keptPreCondIDs.count) + [UInt8](repeating: 1, count: keptPreRefIDs.count)
-                injectedCondHs = [UInt32](repeating: 0, count: keptPreCondIDs.count) + keptPreRefHs
-                injectedCondWs = [UInt32](repeating: 0, count: keptPreCondIDs.count) + keptPreRefWs
-                log("续接空图条件注入：preCond \(continuationCondRows?.shape ?? []) + preRef \(continuationRefRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 contTail = \(mergedInjected.shape)）")
+                if piecesInjected.isEmpty {
+                    // ★ 2026-10-03 前置已不注入条件区，且无参考块可落盘 → 透传置 nil（纯 latent 窗口续接）
+                    injectedCondRowsClean = nil
+                    injectedCondIDs = []
+                    injectedCondSpans = []
+                    injectedCondModes = []
+                    injectedCondHs = []
+                    injectedCondWs = []
+                    log("续接空图：无参考块可落盘，条件行仅采样注入（落盘透传置 nil）")
+                } else {
+                    let mergedInjected = piecesInjected.count == 1 ? piecesInjected[0] : concatenated(piecesInjected, axis: 0)
+                    MLX.eval(mergedInjected)
+                    injectedCondRowsClean = mergedInjected
+                    injectedCondIDs = keptPreRefIDs
+                    injectedCondSpans = keptPreRefSpans
+                    injectedCondModes = [UInt8](repeating: 1, count: keptPreRefIDs.count)
+                    injectedCondHs = keptPreRefHs
+                    injectedCondWs = keptPreRefWs
+                    log("续接空图条件注入：preRef \(continuationRefRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 contTail = \(mergedInjected.shape)）")
+                }
             }
         } else if condRowsClean == nil {
             // ★ 2026-09-20 文本生成（文生视频）：无图、无续接（.h3cc 未命中），零条件行占位，
@@ -839,7 +930,7 @@ public enum H3FL2VAPipeline {
                                   frameCount: effFrameCount,
                                   refs: refBlocks,
                                   contRefs: contRefBlocks,
-                                  preCondRows: UInt32(continuationCondRows?.shape[0] ?? 0))
+                                  preCondRows: 0)   // ★ 2026-10-03 前置不再进入条件区，preCondRows 恒 0
         // ★ 行数对齐断言：注入的 condRows 行数必须 == 布局 cond/refImg 段总行数。
         // 续接位置编码错位的回归防线（此前 ref2va 前置行被塞 .cond 段导致行序错乱）。
         if continuationActive {
@@ -869,9 +960,9 @@ public enum H3FL2VAPipeline {
                                          startAtSigma: 0.7,
                                          spacing: .cosine)
         }
-        // ★ 续接调度（2026-09-21 改）：前置尾段改走 keyframe 锚点（never-denoised 条件行），
-        //   不再作为采样初值加噪对齐，因此续接不再从 warmStart 截断——新段纯噪声起步，
-        //   按正常调度跑满 totalLatT（前置窗口帧由 keyframe 条件强约束，采样后统一裁掉）。
+        // ★ 续接调度（2026-09-21 改，2026-10-03 定稿）：前置尾段改走 keyframe 锚点
+        //   （never-denoised 条件行）+ 参考块，不再作为采样初值加噪对齐——新段纯噪声起步，
+        //   按正常调度跑满本节点 latT（续接初值恒 nil，videoX 只含新段，无需裁剪）。
         var stage1SegmentCount = sigmas.count - 1
         let tsList = collectScheduleTs(layout: layout, sigmas: sigmas,
                                        shiftV: cfg.sigmaShiftVideo, shiftA: cfg.sigmaShiftAudio,
@@ -925,9 +1016,8 @@ public enum H3FL2VAPipeline {
         let nAudioRows = Int(audioT * 2)
         var videoX: MLXArray
         var audioX: MLXArray
-        // ★ 2026-09-22 旧 warmStart 初值路线已删除（曾 if false 关闭存档）：warmStart 加噪会把前置
-        //   尾段行加噪到 σ0=1.0 致画面归零，且与 keyframe 锚点路线冲突；现统一新段纯噪声起步，
-        //   前置画面由 contKeyAnchors 条件行约束（续接解析见 L523-576 continuationCacheRows 路线）。
+        // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线）：新段纯噪声起步，前置画面由
+        //   contKeyAnchors 条件行锚 + contRefBlocks/continuationHistoryRows 参考块约束。
         videoX = MLXRandom.normal([nVideoRows, vpatch], key: MLXRandom.key(seed))
         audioX = MLXRandom.normal([nAudioRows, 32], key: MLXRandom.key(seed &+ 1))
         MLX.eval(videoX, audioX)
@@ -963,8 +1053,9 @@ public enum H3FL2VAPipeline {
         // ★ 续接 × SelfLift 正交（2026-09-20）：续接不再禁用 SelfLift——Runner 接收前置尾段
         //   NCDHW latent，降采样拼为低清段前缀初值，整段（前置窗口 + 新段）统一走
         //   「低分×0.5 → 过渡 → 高分」，与单次生成完全同构（「续接 = 无数个单次」）。
-        //   续接激活时低清曲线强制独立（warmStart 等距 → σ_next），避免官方 75% 规则吃掉
-        //   被压缩成 N=2 的调度。
+        //   续接激活时低清曲线强制独立，避免官方 75% 规则吃掉被压缩成 N=2 的调度。
+        // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线）：前置尾段不拼进采样初值，只走
+        //   条件行锚/参考块，videoX 只含本节点新段行，无需裁前置窗口行。
         if selfLiftEnabled, continuationActive || stage1SegmentCount >= 2 {
             // 显式覆盖仅 transitionStep = 0（自动）；lowResScale/rho/wMin/wMax 取 SelfLiftConfig 默认＝官方 H3 建议起点；
             // NA_H3_SELFLIFT_RHO / NA_H3_SELFLIFT_WMIN / NA_H3_SELFLIFT_WMAX 可覆盖。
@@ -1074,16 +1165,15 @@ public enum H3FL2VAPipeline {
                 log: log,
                 lowOnly: selfLiftLowOnly,
                 textStatesNeg: refinedNeg,
-                continuationLatent: nil,                      // ★ 2026-09-21 砍初值：前置尾段改走 keyframe 锚点（ComfyUI 路线）
+                // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线），不再显式传参。
                 continuationWinLatentT: continuationWinLatentT,
-                continuationStartSigma: nil,                  // ★ 2026-09-21 砍 warmStart：纯噪声起步，正常调度
                 contKeyAnchors: contKeyAnchors,
-                preCondRows: UInt32(continuationCondRows?.shape[0] ?? 0),
+                preCondRows: 0,                          // ★ 2026-10-03 前置不再进入条件区
                 preRefBlocks: contRefBlocks.filter { $0.kind != .audio },
                 audioContinuationRows: continuationAudioRows)   // ★ 2026-09-21 音频续接：refAudio 锚点（nil=旧缓存回退噪声）
                 // 注：contRefBlocks 中新增的 .audio 块仅供主高清布局（contRefs）生成 refAudio 段；
                 //   SelfLift 的音频参考由 audioContinuationRows 参数独立注入（contAudioRef），
-                //   且其 allRefBlocks 只支持 image 块（SelfLiftH3 L579-584 对非 image 直接 throw），
+                //   且其 allRefBlocks 支持 image + video（history）块（SelfLiftH3 切行分支），
                 //   故此处过滤 .audio 避免回归。
             videoX = slOut.videoX
             audioX = slOut.audioX
@@ -1152,22 +1242,12 @@ public enum H3FL2VAPipeline {
         }
         }   // ← 原单条 stage1 循环结束（SelfLift 第三分支的开/else 收口）
 
-        // ★ 续接裁切：采样完成（σ=0）后裁掉前置窗口行，只保留本节点新段
-        //   （输出时长 = 本节点时长；audio 同步裁后段）。
+        // ★ 续接裁切：采样完成（σ=0）后只保留本节点新段（输出时长 = 本节点时长）。
         if continuationActive {
-            let totalRows = videoX.shape[0]
-            // ★ 2026-09-21 keyframe 锚点路线（continuationLatent=nil，ComfyUI 式）：
-            //   Runner 内 layoutLatT = (continuationActive && continuationLatent != nil)
-            //   ? totalLatT : latT —— 前置尾段只走 contKeyAnchors 条件行锚点、不拼进采样
-            //   初值，故 videoX 只含本节点新段行。此处若仍按旧路线裁 continuationWinRows，
-            //   会把新段前几帧真帧裁掉（如 37→30 帧），4.5 段 rows→zlat reshape 崩溃
-            //   （Cannot reshape 30240 行 vs latentT=37）。
-            //   仅旧初值路线（continuationLatent != nil，窗口拼进采样初值）才需裁 video 窗口行。
-            let videoWinRows = (!contKeyAnchors.isEmpty) ? 0 : continuationWinRows
-            let keepRows = totalRows - videoWinRows
-            if videoWinRows > 0 {
-                videoX = videoX[videoWinRows..<totalRows, 0..<vpatch]
-            }
+            // ★ 2026-10-03 fresh-noise 路线（续接初值恒 nil）：videoX 只含本节点新段行，
+            //   无需裁 video 窗口行（旧 warmStart 初值路线已删除）。
+            // （2026-10-03 已移除 hard-boundary latent 末行直通：首锚现由末帧像素 encodeImage
+            //   重编码的单帧 keyframe latent 承担，见续接解析段 contKeyAnchors/.first。）
             let aTotal = audioX.shape[0]
             // ★ 2026-09-21 音频续接：有真实前置音频（refAudio 锚点路线）时 Runner 内已裁掉
             //   前置行，audioX 只含本节点行，此处不再裁（与 video keyframe 锚点路线对称）；
@@ -1178,7 +1258,7 @@ public enum H3FL2VAPipeline {
                 audioX = audioX[aWinRows..<aTotal, 0..<32]
             }
             MLX.eval(videoX, audioX)
-            log("★ 续接裁切：video 保留后 \(videoX.shape[0]) 行（本节点 \(keepRows)），audio 保留 \(aKeep) 行（总 \(aTotal)）")
+            log("★ 续接裁切：video 保留后 \(videoX.shape[0]) 行（本节点，无 video 窗口裁切），audio 保留 \(aKeep) 行（总 \(aTotal)）")
         }
 
         let pvMean: Float = videoX.mean().item()
@@ -1253,20 +1333,15 @@ public enum H3FL2VAPipeline {
                     let l2 = zc.reshaped([latC, 1, H2, W2]).transposed(1, 2, 3, 0)         // [1,H2,W2,C]
                     return H3TensorOps.patchifyVideo(l2, gridH: gH2, gridW: gW2)
                 }
-                // ★ 续接兼容：前置条件行在 condRows 最前，本节点 keyframe 需按偏移切取；
-                //   前置行也各自放大到新网格，保持「前置 + 本节点」拼接顺序。
-                let preRows = Int(continuationCondRows?.shape[0] ?? 0)
+                // ★ 2026-10-03 续接兼容：前置已不进入条件区，condRows 最前即本节点 keyframe
                 var condChunks2: [MLXArray] = []
-                if preRows > 0, let pre = continuationCondRows {
-                    condChunks2.append(upCondRows(pre))
-                }
-                let condA = condRows[preRows ..< (preRows + fRows), 0 ..< vpatch]
-                let condB = condRows[(preRows + fRows) ..< (preRows + 2 * fRows), 0 ..< vpatch]
+                let condA = condRows[0 ..< fRows, 0 ..< vpatch]
+                let condB = condRows[fRows ..< (2 * fRows), 0 ..< vpatch]
                 condChunks2.append(upCondRows(condA))
                 condChunks2.append(upCondRows(condB))
                 condRows2 = concatenated(condChunks2, axis: 0)
                 MLX.eval(condRows2)
-                log("Stage2 cond rows 放大完成：\(condRows2.shape)（行数×\(sc * sc)，含前置条件 \(preRows) 行）")
+                log("Stage2 cond rows 放大完成：\(condRows2.shape)（行数×\(sc * sc)）")
             }
 
             // ③ 重建 layout / rope / AdaLN 表（音频 T 不变，仅空间网格变化）
@@ -1275,7 +1350,7 @@ public enum H3FL2VAPipeline {
                                        audioT: audioT,
                                        keyframes: [.first, .last],
                                        frameCount: frameCount,
-                                       preCondRows: UInt32(continuationCondRows?.shape[0] ?? 0))
+                                       preCondRows: 0)   // ★ 2026-10-03 前置不再进入条件区
             let sigmas2 = s2cfg.refineSigmas
             guard sigmas2.count >= 2, sigmas2.last! == 0.0 else {
                 throw NSError(domain: "H3FL2VA", code: 13,
@@ -1398,12 +1473,67 @@ public enum H3FL2VAPipeline {
         var decWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
         var decoder: H3VAE? = try H3VAE.load(decWeights!)
         try autoreleasepool {
-            let pixels = decoder!.decode(zForDecode)
+            var pixels = decoder!.decode(zForDecode)
             MLX.eval(pixels)
             log("VAE 解码完成：\(pixels.shape)")
             fCount = pixels.shape[2]
             h = pixels.shape[3]
             w = pixels.shape[4]
+            // ★ 2026-10-03 v4 末帧像素（boundary .first 硬锚数据源）：截解码像素最后一帧
+            //   [1,3,1,H,W]（[-1,1]），随 .h3cc 落盘供下游 encodeImage 重编码成单帧 keyframe
+            //   latent 锚索引0。绝对清晰、绝对遵从前置；严禁低清 latent 升频结果或 latent 末行冒充。
+            if tailFrameEnabled {
+                let t = pixels.shape[2] - 1
+                let tf = pixels[0 ..< 1, 0 ..< 3, t ..< (t + 1), 0 ..< h, 0 ..< w].contiguous()
+                MLX.eval(tf)
+                tailFramePixels = tf
+            }
+            // ★ 2026-10-04 续接亮度渐隐（seam-fade）：解码像素域对前 seamFadeFrames 帧做亮度向锚对齐。
+            //   342 基线无强锚定（方案A 已回滚），首帧是模型生成帧本身，容易整体偏暗——此时帧0 也要拉：
+            //   锚亮度 = 前置末帧像素灰度均值（续接解析段已算 anchorLuminance），帧0 w=1 完全对齐后随
+            //   j 线性衰减到 0；无锚亮度时退回「帧0 自锚」旧行为（l0=帧0，只修 1..N-1，341 已验证）。
+            //   仅常数偏移 + clamp[-1,1]，不动内容结构；N 帧后完全放手。
+            if seamFadeFrames > 0 && fCount > 1 {
+                let N = min(seamFadeFrames, fCount)
+                // 逐帧灰度均值 [1,3,T,H,W] → mean(H,W) → mean(C) → [T]
+                let lumArr = pixels.mean(axes: [3, 4], keepDims: true).mean(axes: [1], keepDims: true).reshaped([fCount])
+                MLX.eval(lumArr)
+                var corr = [Float](repeating: 0, count: fCount)
+                if let aL = anchorLuminance {
+                    for j in 0..<N {
+                        let lumJ = lumArr[j].item(Float.self)
+                        corr[j] = (aL - lumJ) * (1.0 - Float(j) / Float(N))
+                    }
+                    log("seam-fade（锚亮度 \(String(format: "%.4f", aL))）：帧0 校正 \(String(format: "%.4f", corr[0]))，帧1..\(N - 1) 向锚衰减对齐，\(N) 帧后放手")
+                } else {
+                    let l0 = lumArr[0].item(Float.self)
+                    for j in 1..<N {
+                        let lumJ = lumArr[j].item(Float.self)
+                        corr[j] = (l0 - lumJ) * (1.0 - Float(j) / Float(N))
+                    }
+                    log("seam-fade（帧0 自锚 \(String(format: "%.4f", l0))，无锚亮度回退）：只修 1..\(N - 1)")
+                }
+                if corr.contains(where: { abs($0) > 1e-5 }) {
+                    var frames: [MLXArray] = []
+                    frames.reserveCapacity(fCount)
+                    for j in 0..<fCount {
+                        let slice = pixels[0 ..< 1, 0 ..< 3, j ..< (j + 1), 0 ..< h, 0 ..< w]
+                        let c = corr[j]
+                        if abs(c) > 1e-5 {
+                            frames.append(slice + MLXArray.scalar(c, like: slice))
+                        } else {
+                            frames.append(slice)
+                        }
+                    }
+                    let corrected = MLX.concatenated(frames, axis: 2)
+                    pixels = MLX.minimum(MLX.maximum(corrected, MLXArray.scalar(-1.0, like: corrected)), MLXArray.scalar(1.0, like: corrected))
+                    MLX.eval(pixels)
+                    let corrLog = corr.prefix(min(N, 8)).map { String(format: "%.4f", $0) }.joined(separator: " ")
+                    log("seam-fade 生效：前 \(N) 帧亮度已向锚对齐（校正量示例：\(corrLog)…），clamp[-1,1]")
+                } else {
+                    log("seam-fade 无校正量（各帧亮度已对齐）")
+                }
+            }
             // 内存直通（方案 C）：stage1 像素帧不落盘，由 bridge 持有供像素桥直接 VAE 编码；
             // 落盘为 ProRes 422 .mov（proResOutput=true，10bit v210；无二采时即最终产物，
             // 有二采时作高质量预览/音轨源）。
@@ -1544,7 +1674,8 @@ public enum H3FL2VAPipeline {
                                                        condRowModes: injectedCondModes,
                                                        condRowHs: injectedCondHs,
                                                        condRowWs: injectedCondWs,
-                                                       audioLatent: audioTail)
+                                                       audioLatent: audioTail,
+                                                       tailFramePixels: tailFramePixels)
                 log("★ 尾帧延续已落盘：\(url.path)（窗口 \(win.seconds)s / \(win.frames) 帧 / \(win.latentT) latentT，条件行 \(injectedCondRowsClean?.shape ?? [])，实际注入 ids \(injectedCondIDs) spans \(injectedCondSpans)，音频 latent \(audioTail?.shape[0] ?? 0) 行）")
             } catch {
                 log("⚠️ 尾帧延续落盘失败（\(error.localizedDescription)），不影响本次生成")
