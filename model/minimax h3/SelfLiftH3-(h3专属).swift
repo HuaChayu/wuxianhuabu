@@ -427,7 +427,14 @@ public func runH3Stage1WithSelfLift(
     //   → never-denoised）锚进 audio stream 开头，模型注意力能看到真实前置音频；
     //   采样更新只作用于本节点行（out.audio 只切目标 audioSegment），前置行不被加噪/改写。
     //   nil = 旧缓存或无音频，audioX 回退纯噪声占位（原路线）。
-    audioContinuationRows: MLXArray? = nil
+    audioContinuationRows: MLXArray? = nil,
+    // ★ 2026-10-05 fl 锚几何显式同口径（方案A2 几何对齐）：fl 场景调用方（H3Pipeline）把
+    //   高分锚几何（keyframeSpans=每锚 fRows、keyframeGrids=目标网格坐标）显式传下；
+    //   SelfLift 高分 layout 直接用，低分 layout 按目标网格折算低清等价（span=gHl*gWl/锚、
+    //   grid=低清网格=目标网格 0.5 降采样），两阶段「同一个注入」走同一套几何参数机制。
+    //   ref+续接（contKeyAnchors=[.first]）不传 → 两布局均 nil 默认，行为完全不变。
+    keyframeSpansHigh: [UInt32]? = nil,
+    keyframeGridsHigh: [(h: [Double], w: [Double])?]? = nil
 ) throws -> (videoX: MLXArray, audioX: MLXArray) {
 
     // 解耦模式（本工程调试扩展，A/B 用；默认关闭，不触碰任何默认值）：
@@ -522,7 +529,7 @@ public func runH3Stage1WithSelfLift(
     // 分段方式与 layout 的 cond 行预算**逐块**对齐（这是本分支的关键不变量）：
     //   · ref2va（refBlocks 非空）：每段 = 一个参考块，用**该块自己的 latent 网格**还原，
     //     低分尺寸按 cfg.lowResScale 经 slLowResSize 同口径缩放；layout 侧传同序同尺寸的 refs。
-    //   · fl2va（refBlocks 为空）：每段 = 一个目标帧（fRows 行）；layout 侧仍用 keyframes [.first,.last]。
+    //   · fl2va（2026-10-04 重构后已删除）：fl 首尾帧由调用方转为软参考 refBlocks，不再有目标帧独立段。
     let fRows = gridH * gridW
     // ★ 2026-10-02 段序修正（与 H3Pipeline 注入 pieces 严格一致）：注入行序 =
     //   [preCond][boundary][本节点 refImg][前置 refImg][history]，故 allRefBlocks =
@@ -532,38 +539,22 @@ public func runH3Stage1WithSelfLift(
     let allRefBlocks = refBlocks + preRefBlocks
     let condOffset = Int(preCondRows)
     var condSegs: [MLXArray] = []
-    // ★ 2026-10-02 回退后语义：高分段条件行 = 原生 full-res 行直通。
-    //   fl2va（无参考块）例外：keyframe 来自 encodeImage 像素（官方设计低清→提升），
-    //   故其高分段保留「低清重采样 → learned upscaler 提升回全分辨率」版（2026-09-22 起）；
-    //   ref2va 的 boundary/history 均为去噪完成的干净 full-res latent，高分段原生直通、
-    //   不降画面再提升（低分段内部自行重采样处理，互不干扰）。
+    // ★ 2026-10-02/2026-10-04 语义：高分段条件行 = 原生 full-res 行直通。
+    //   fl2va 例外已随 2026-10-04 重构删除（不再有低清→提升的 keyframe 通路）；
+    //   ref2va/fl 的 boundary/history/参考图均为去噪完成的干净 full-res latent，
+    //   高分段原生直通、不降画面再提升（低分段内部自行重采样处理，互不干扰）。
     var condSegsHigh: [MLXArray] = []
     var lowRefBlocks: [RefBlock] = []
-    if allRefBlocks.isEmpty {
-        let nCond = (condRowsFull.shape[0] - condOffset) / fRows
-        for c in 0..<nCond {
-            let seg = condRowsFull[(condOffset + c * fRows)..<(condOffset + (c + 1) * fRows)]
-            let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gridH, gridW: gridW)   // [1,latH,latW,C]
-            let low = slResizeKeyframeLatent(lat, outH: latHl, outW: latWl,
-                                             keepAlive: keepAlive)                   // [1,latHl,latWl,C]
-            let rows = H3TensorOps.patchifyVideo(low, gridH: gHl, gridW: gWl)
-            keepAlive.hold([lat, low, rows])
-            condSegs.append(rows)
-            // ★ 高清条件 = 同一份低清 keyframe 用 learned upscaler 提升回全分辨率（2026-09-22 起
-            //   不再回退 nearest）：背景结构坐标与低清循环固化的一致 → 消除"低清残留 vs 全分辨率
-            //   keyframe 重注入"的双套网格错位（h3_62 背景重影根因，h3_64 ref2va 复盘）。
-            let up = try slLearnedLiftLatent(low, outH: latH, outW: latW,
-                                             keepAlive: keepAlive)            // [1,latH,latW,C]
-            let rowsHigh = H3TensorOps.patchifyVideo(up, gridH: gridH, gridW: gridW)
-            keepAlive.hold([up, rowsHigh])
-            condSegsHigh.append(rowsHigh)
-        }
-    } else {
-        var offset = condOffset
+    // ★ 2026-10-07 fl 硬锚+视觉块：fl 首尾帧由 H3Pipeline 改为双端 keyframe 硬锚
+    //   （[.first,.last]，cond 段，不占 refBlocks），refBlocks 恒空 → 下方 for 循环零次；
+    //   ref/续接仍走 allRefBlocks（ref 多参考 + 前置参考块）；锚点集合差异全由
+    //   contKeyAnchors 驱动（fl=2 锚、ref 续接=[.first]）。
+    //   纯文生/续接空图零条件行时下方两个 for 循环自然零次（由预算断言兜底）。
+    var offset = condOffset
         // ★ 2026-09-21 修复：ref2va 前置尾段 keyframe 锚点先按 keyframe 口径切行（每段 fRows，
         //   低清重采样同 fl2va），再切参考块；段序与 H3Pipeline 注入的 [preCond][contKey][preRef][ownRef]
         //   严格对齐（此前 ref2va 只切参考块，contKey 段未计入 → 尾帧锚点丢失）。
-        for _ in 0..<contKeyAnchors.count {
+        for (ki, _) in contKeyAnchors.enumerated() {
             guard offset + fRows <= condRowsFull.shape[0] else {
                 throw NSError(domain: "H3SelfLift", code: 7, userInfo: [NSLocalizedDescriptionKey:
                     "ref2va contKey 段行数超出 condRowsFull：\(offset + fRows) > \(condRowsFull.shape[0])"])
@@ -652,7 +643,6 @@ public func runH3Stage1WithSelfLift(
             throw NSError(domain: "H3SelfLift", code: 5, userInfo: [NSLocalizedDescriptionKey:
                 "参考块行数与 condRowsFull 不一致：\(offset) vs \(condRowsFull.shape[0])"])
         }
-    }
     let condRowsLow = condSegs.count == 1 ? condSegs[0] : concatenated(condSegs, axis: 0)
     // ★ 2026-10-02 回退后语义：原始 full-res 条件行同时供低分/高分两路消费。
     //   高分段（condRowsHigh）= 原生 full-res 行直通（fl2va 无参考块用低清→提升版除外，
@@ -673,14 +663,17 @@ public func runH3Stage1WithSelfLift(
     let lowBlockRows: (RefBlock) -> Int = { b in
         b.kind == .video ? Int(b.latentT) * Int(refFrameRows(b)) : Int(refFrameRows(b))
     }
-    let budgetLow = allRefBlocks.isEmpty ? (2 + contKeyAnchors.count) * gHl * gWl : contKeyAnchors.count * gHl * gWl + lowRefBlocks.reduce(0) { $0 + lowBlockRows($1) }
-    let budgetHigh = allRefBlocks.isEmpty ? (2 + contKeyAnchors.count) * fRows : contKeyAnchors.count * fRows + allRefBlocks.reduce(0) { $0 + lowBlockRows($1) }
+    // ★ 2026-10-04 重构：fl/ref 统一预算（fl 首尾帧已是 refBlocks）——
+    //   低分 = 续接锚段 + 各参考块低清行；高分 = 续接锚段(fRows/锚) + 各参考块原生 full-res 行。
+    let anchorLowRows = contKeyAnchors.count * (gHl * gWl)
+    let budgetLow = anchorLowRows + lowRefBlocks.reduce(0) { $0 + lowBlockRows($1) }
+    let budgetHigh = contKeyAnchors.count * fRows + allRefBlocks.reduce(0) { $0 + lowBlockRows($1) }
     guard budgetLow == condRowsLow.shape[0], budgetHigh == condRowsHigh.shape[0] else {
         throw NSError(domain: "H3SelfLift", code: 6, userInfo: [NSLocalizedDescriptionKey:
             "layout cond 预算与实际条件行不一致：低分 \(budgetLow) vs \(condRowsLow.shape[0])，"
             + "高分 \(budgetHigh) vs \(condRowsHigh.shape[0])"])
     }
-    log("SelfLift 条件行：\(allRefBlocks.isEmpty ? "fl2va keyframes ×\(2 + contKeyAnchors.count)（含续接锚点 ×\(contKeyAnchors.count)；高清=低清提升，无重注入）" : "ref2va 锚点 ×\(contKeyAnchors.count) + \(allRefBlocks.count) 参考块（含前置 \(preRefBlocks.count)）")"
+    log("SelfLift 条件行：\(contKeyAnchors.count) 锚点 keyframe 段 + \(allRefBlocks.count) 参考块（含前置 \(preRefBlocks.count)；fl 双端硬锚 [.first,.last] 已含于锚点）"
         + " → 低分 \(condRowsLow.shape[0]) 行（layout 预算 \(budgetLow)）/ 高分 \(condRowsHigh.shape[0]) 行（layout 预算 \(budgetHigh)）")
     // 条件行低分全程每步都要 concat 进模型输入：挂进池子并**先物化**，
     // 让这段重采样（含 bilinear 的下标/权重小张量）在低分循环开始前就结算干净。
@@ -710,14 +703,34 @@ public func runH3Stage1WithSelfLift(
 
     // ── 2. 低分上下文 ──────────────────────────────────────────────────
     // 布局构造与原生路径（H3Pipeline.swift:383-391）同款：续接前置尾段 keyframe 锚点无条件进
-    // keyframes（ref2va 也注入，H3Pipeline 已把 contKeyRows 排在 preRef 之前）；fl2va 追加 [.first,.last]。
+    // keyframes（ref2va 也注入，H3Pipeline 已把 contKeyRows 排在 preRef 之前）。
+    // ★ 2026-10-05 方案A2（fl 双端硬锚）：fl 首尾帧统一走 keyframe 硬锚（.first+.last），
+    //   fl/ref 的 keyframes 统一 = contKeyAnchors（fl=[.first,.last]；ref 续接=[.first]）。
+    // ★ 2026-10-05 fl 锚几何对齐：高分几何（目标网格）折算到低清的等价几何——
+    //   span=gHl*gWl（= 低清网格行数）、grid=低清网格（axisFromSqrtArea，目标网格 0.5 降采样）。
+    //   数值与 nil 默认一致，但两阶段「同一个注入」参数机制同口径显式化；ref+续接不传参仍走 nil 默认。
+    let flKeyframeSpansLow: [UInt32]? = keyframeSpansHigh.map { spans in
+        [UInt32](repeating: UInt32(gHl * gWl), count: spans.count)
+    }
+    let flKeyframeGridsLow: [(h: [Double], w: [Double])?]? = keyframeGridsHigh.map { grids in
+        let lArea = sqrt(Double(latHl) * Double(latWl))
+        let lH = axisFromSqrtArea(dim: UInt32(latHl), patch: H3Const.patchH, sqrtArea: lArea)
+        let lW = axisFromSqrtArea(dim: UInt32(latWl), patch: H3Const.patchW, sqrtArea: lArea)
+        return grids.map { _ in (h: lH, w: lW) }
+    }
     let layoutLow = PackedLayout(textLen: textLen, latentT: layoutLatT,
                                  latentH: UInt32(latHl), latentW: UInt32(latWl),
                                  audioT: audioT,
-                                 keyframes: contKeyAnchors + (allRefBlocks.isEmpty ? [.first, .last] : []),
+                                 keyframes: contKeyAnchors,
                                  frameCount: frameCount,
                                  refs: lowRefBlocks,
-                                 contRefs: contAudioRef)
+                                 contRefs: contAudioRef,
+                                 keyframeSpans: flKeyframeSpansLow,
+                                 keyframeGrids: flKeyframeGridsLow)
+    if let spansHigh = keyframeSpansHigh {
+        log("fl 锚几何对齐：高分 span=\(spansHigh)/grid=目标网格 \(gridH)×\(gridW)；"
+            + "低分折算 span=\(flKeyframeSpansLow ?? [])/grid=低清网格 \(gHl)×\(gWl)（=目标网格 0.5 降采样）")
+    }
     // ref2va 的文本行含 4 个视觉块，AdaLN 模态标签必须与原生 layout 一样下发（H3Pipeline.swift:390），
     // 否则视觉块的 mod 行会落到 text 模态（H3Layout.swift:637 起），条件参考被打错调制。
     layoutLow.textTags = textTags
@@ -1033,14 +1046,19 @@ public func runH3Stage1WithSelfLift(
     log("SelfLift lift sigma \(String(format: "%.4f", split.sigmaK)) dsigma \(String(format: "%.4f", split.sigmaNext - split.sigmaK)) [lift \(latWl)×\(latHl)→\(latW)×\(latH)]（\(Int(-Date().timeIntervalSince(liftT)))s）")
 
     // ── 5. 高分上下文重建（分辨率/序列长度变了，必须整表重算）──────────────
-    // 同上：续接前置尾段 keyframe 锚点无条件进 keyframes（ref2va 也注入）；fl2va 追加 [.first,.last]。
+    // 同上：续接前置尾段 keyframe 锚点无条件进 keyframes（ref2va 也注入）。
+    // ★ 2026-10-05 方案A2（fl 双端硬锚）：fl/ref 的 keyframes 统一 = contKeyAnchors；
+    //   fl 场景高分锚几何显式同口径（span=fRows/锚、grid=目标网格，与 H3Pipeline 方案A2
+    //   构造一致）；ref+续接不传参 → keyframeSpans/Grids nil 默认，行为不变。
     let layoutHigh = PackedLayout(textLen: textLen, latentT: layoutLatT,
                                   latentH: UInt32(latH), latentW: UInt32(latW),
                                   audioT: audioT,
-                                  keyframes: contKeyAnchors + (allRefBlocks.isEmpty ? [.first, .last] : []),
+                                  keyframes: contKeyAnchors,
                                   frameCount: frameCount,
                                   refs: allRefBlocks,
-                                  contRefs: contAudioRef)
+                                  contRefs: contAudioRef,
+                                  keyframeSpans: keyframeSpansHigh,
+                                  keyframeGrids: keyframeGridsHigh)
     layoutHigh.textTags = textTags
     let tsHigh = collectScheduleTs(layout: layoutHigh, sigmas: split.highSigmas,
                                    shiftV: shiftV, shiftA: shiftA, aug: CondNoiseAug())

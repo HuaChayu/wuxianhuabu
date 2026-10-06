@@ -283,7 +283,12 @@ final class GenerationQueue: ObservableObject {
         //   （首尾帧作为 2 个软参考块 + 视觉块，语言固定首尾）。背景重影根因是 keyframes 时间硬锚 +
         //   低清/高清双网格竞争（h3_62/h3_65），refs 软参考无端点锚定（h3_64 已验证无重影），
         //   且高清条件行直接用原生全分辨率参考块，顺带消除低清提升导致的"首尾毛玻璃"（h3_65）。
-        // ★ 2026-09-18 fl2va→refs 开关：默认开启（UI 直跑即生效）；设 NA_H3_FL2VA_AS_REFS=0 可回退旧 fl2va
+        // ★ 2026-10-04 重构：管线端 fl/ref 已统一——首尾帧图不再走 fl 独立 keyframe 硬锚编码，
+        //   而是与 ref 相同的方式进入软参考注入（refImg 段 + 视觉块 + 高清原生直通），
+        //   SelfLiftH3 的 fl 独立分支（低清重采样→learned upscaler 提升）已删除。
+        //   NA_H3_FL2VA_AS_REFS 保留为向后兼容分流开关：=1 时「恰好 2 张首尾帧」在队列端走
+        //   ref2va 传参（referenceImagePaths 传 2 图）；=0 时仍传 firstPath/lastPath，管线端
+        //   同样按软参考处理——两条路径管线内行为一致，仅影响传参分流与日志口径。
         let fl2vaAsRefs = (ProcessInfo.processInfo.environment["NA_H3_FL2VA_AS_REFS"].flatMap { Int($0) } ?? 1) > 0
         // 开关值显式写入 env：默认开启时用户未设变量，管线层也要能读到（用于首/尾帧文本标签）
         if fl2vaAsRefs { setenv("NA_H3_FL2VA_AS_REFS", "1", 1) } else { unsetenv("NA_H3_FL2VA_AS_REFS") }
@@ -326,7 +331,7 @@ final class GenerationQueue: ObservableObject {
                 condSummary = "多参考 \(task.imagePaths.count) 张图（ref2va）"
             }
         } else {
-            condSummary = "首/尾帧 \(task.imagePaths[0]) / \(task.imagePaths[1])（fl2va）"
+            condSummary = "首/尾帧 \(task.imagePaths[0]) / \(task.imagePaths[1])（fl2va→软参考重构：首尾帧作参考图 ×2）"
         }
         // ★ H3 一采第一阶段总步数 N：单一取自偏好设置「模型管理 → H3 一采设置」滑杆（4–12，默认 6）。
         // 该值经 generateVideo(steps:) → sigmaSchedule(steps:) → N = sigmas.count - 1 进入一采链路；

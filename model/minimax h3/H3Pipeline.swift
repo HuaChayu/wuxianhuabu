@@ -138,6 +138,9 @@ public enum H3FL2VAPipeline {
         /// ref2va 多参考图通路：非空即启用（此时首/尾帧被忽略）。
         /// 每张图按官方 reference canvas（短边 2048、32 对齐）编码为独立参考块，
         /// 文本侧生成 `<Picture i>: ` + vision block 序列，prompt 放在最后。
+        /// ★ 2026-10-04 重构：首尾帧图（firstImagePath/lastImagePath）不再走 fl 独立 keyframe
+        ///   硬锚编码，而是以与 ref 相同的方式进入注入路径（refImg 段 + 视觉块 + 高清原生直通），
+        ///   软参考标签固定为 <First frame>/<Last frame>；useRef2VA=false 且首尾帧非空时同样适用。
         referenceImagePaths: [String] = [],
         /// 参考图缩放模式：.match = 缩到与生成画面同面积（默认，序列最短）；
         /// .mid = 短边上限 1024；.max = 短边上限 2048（官方 ref2va，序列最长）
@@ -241,13 +244,29 @@ public enum H3FL2VAPipeline {
         var refVisionBlocks: [H3VisionBlock] = []
         var refVisionLabels: [String] = []
 
-        if useRef2VA && !referenceImagePaths.isEmpty {
-            guard referenceImagePaths.count <= Int(H3Const.maxRefImages) else {
+        // ★ 2026-10-04 重构：fl（首尾帧）与 ref（多参考）统一走参考图软参考编码——
+        //   首尾帧图以与 ref 相同的方式进入注入路径（refImg 段 + 视觉块 + 高清原生直通），
+        //   删除旧 fl 独立 keyframe 硬锚通路（低清重采样→learned upscaler 提升）。
+        //   参考图源 = useRef2VA 时全部多参考图；否则本节点首尾帧两张。
+        let refImageSourcePaths = useRef2VA ? referenceImagePaths : [firstImagePath, lastImagePath]
+        // ★ 2026-10-07 fl 硬锚 + 视觉块（社区口径）：fl 首尾帧走 keyframe 硬锚
+        //   （.first 钉 target 首帧、.last 钉 target 末帧，cond 段）+ 文本侧
+        //   <First frame>/<Last frame> 标签 + 视觉块；无 refImg 软参考段、无 RoPE 拼接。
+        //   严格限定「非 ref2va + 恰好 2 张首尾帧 + 无续接」；ref+续接（continuationSource 非 nil、
+        //   contKeyAnchors=[.first] 已实测成功）完全不受影响。
+        //   守卫 !useRef2VA：ref2va 恰好 2 张参考图时绝不进 fl 硬锚分支（否则多参考图会被
+        //   误当首尾帧硬锚化，refImg 段/refBlocks 丢失 → ref2va 回归）。
+        let flSoftPair = !useRef2VA && continuationSource == nil && refImageSourcePaths.count == 2
+        if flSoftPair {
+            log("fl 硬锚+视觉块：首尾帧 keyframe 硬锚（.first/.last）+ 标签 + 视觉块（ref+续接不动）")
+        }
+        if !refImageSourcePaths.isEmpty {
+            guard refImageSourcePaths.count <= Int(H3Const.maxRefImages) else {
                 throw NSError(domain: "H3REF2VA", code: 1,
                               userInfo: [NSLocalizedDescriptionKey:
-                                "参考图数量 \(referenceImagePaths.count) 超过上限 \(H3Const.maxRefImages)"])
+                                "参考图数量 \(refImageSourcePaths.count) 超过上限 \(H3Const.maxRefImages)"])
             }
-            log("ref2va：\(referenceImagePaths.count) 张参考图")
+            log("\(useRef2VA ? "ref2va" : "fl2va（硬锚+视觉块）")：\(refImageSourcePaths.count) 张参考图")
 
             try autoreleasepool {
                 var vaeWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
@@ -263,10 +282,51 @@ public enum H3FL2VAPipeline {
                 gridW = latW / 2
                 log("ref2va 目标 latent [1,\(latC),\(latT),\(latH),\(latW)]")
                 var rowChunks: [MLXArray] = []
-                for (i, p) in referenceImagePaths.enumerated() {
+                // ★ 2026-10-07 fl 硬锚+视觉块：fl 场景双端 keyframe 硬锚行（目标网格 fRows 行，cond 段）；
+                //   ref 场景恒空（仅 rowChunks/refImg 段）。
+                var keyChunks: [MLXArray] = []
+                var keyCondIDs: [String] = []
+                var keyCondSpans: [Int] = []
+                var keyCondModes: [UInt8] = []
+                var keyCondHs: [UInt32] = []
+                var keyCondWs: [UInt32] = []
+                // ★ 2026-10-07 fl 硬锚+视觉块：rowCond* 元数据仅供 ref 多参考（refImg 段，mode=1），
+                //   fl 场景恒空（fl 走 keyCond*/keyframe 硬锚段）。
+                var rowCondIDs: [String] = []
+                var rowCondSpans: [Int] = []
+                var rowCondModes: [UInt8] = []
+                var rowCondHs: [UInt32] = []
+                var rowCondWs: [UInt32] = []
+                for (i, p) in refImageSourcePaths.enumerated() {
                     guard let dims = h3ImagePixelSize(p) else {
                         throw NSError(domain: "H3REF2VA", code: 2,
                                       userInfo: [NSLocalizedDescriptionKey: "参考图尺寸读取失败：\(p)"])
+                    }
+                    // ★ 2026-10-07 fl 硬锚+视觉块（社区口径）：fl 首尾帧不再进 refImg 软参考段，
+                    //   改走 keyframe 硬锚（cond 段，目标网格）——首帧 .first 钉 target 首帧、
+                    //   尾帧 .last 钉 target 末帧（layoutKeyframes 锚序决定）；视觉块 + 标签保留。
+                    if flSoftPair {
+                        guard let pxAnchor = loadImageBCFHW(path: p, width: width, height: height) else {
+                            throw NSError(domain: "H3REF2VA", code: 2,
+                                          userInfo: [NSLocalizedDescriptionKey: "fl 硬锚图加载失败：\(p)"])
+                        }
+                        let latAnchor = vae!.encodeImage(pxAnchor)   // [1,24,1,latH,latW] 目标网格
+                        let nhwcAnchor = latAnchor.transposed(0, 2, 3, 4, 1).reshaped([1, latH, latW, latC])
+                        let anchorRows = H3TensorOps.patchifyVideo(nhwcAnchor, gridH: gridH, gridW: gridW)
+                        // keyframe 硬锚段（cond 段，目标网格，mode=0）
+                        keyChunks.append(anchorRows)
+                        keyCondIDs.append(p)
+                        keyCondSpans.append(gridH * gridW)        // keyframe 行数 = (latH/2)*(latW/2) = fRows
+                        keyCondModes.append(0)                    // cond 段（keyframe，目标网格）
+                        keyCondHs.append(UInt32(latH))
+                        keyCondWs.append(UInt32(latW))
+                        // 文本侧视觉块 + 首/尾帧标签：与硬锚配套的视觉引导（社区 <Picture N> 同义）
+                        let plane = pxAnchor.reshaped([3, Int(height), Int(width)])
+                        let frames = concatenated([plane, plane], axis: 0)   // [2,3,H,W]
+                        refVisionBlocks.append(H3VisionBlock(frames: frames, grid: gridFor(h: UInt32(height), w: UInt32(width))))
+                        refVisionLabels.append(i == 0 ? "<First frame>: " : "<Last frame>: ")
+                        log("fl 硬锚+视觉块：\(i == 0 ? "首帧" : "尾帧")（\(dims.w)×\(dims.h)）→ keyframe \(i == 0 ? ".first" : ".last") 硬锚（rows \(gridH * gridW)）+ 视觉块 + 标签「\(refVisionLabels[refVisionLabels.count - 1])」")
+                        continue
                     }
                     // 官方 reference canvas：短边 2048 上限、32 对齐；再经 fitCanvas 复核对齐
                     let rc = refImageCanvas(UInt32(dims.w), UInt32(dims.h),
@@ -287,13 +347,19 @@ public enum H3FL2VAPipeline {
                     let plane = px.reshaped([3, Int(vc.h), Int(vc.w)])
                     let frames = concatenated([plane, plane], axis: 0)   // [2,3,H,W]
                     refVisionBlocks.append(H3VisionBlock(frames: frames, grid: gridFor(h: vc.h, w: vc.w)))
-                    refVisionLabels.append(labelFor(kind: .image, ordinal: UInt32(i + 1)))
-                    if (ProcessInfo.processInfo.environment["NA_H3_FL2VA_AS_REFS"].flatMap { Int($0) } ?? 0) > 0
-                        && referenceImagePaths.count == 2 {
-                        // ★ 2026-09-18 首尾帧 as refs：恰好 2 张参考图时把视觉块标签换成
-                        //   首/尾帧语义（而非通用 "Picture 1/2"），让模型明确哪张是开头、
-                        //   哪张是结尾——软参考无 keyframes 时间锚，靠文本标签补时序角色。
-                        refVisionLabels[refVisionLabels.count - 1] = (i == 0 ? "<First frame>: " : "<Last frame>: ")
+                    if useRef2VA {
+                        refVisionLabels.append(labelFor(kind: .image, ordinal: UInt32(i + 1)))
+                        if (ProcessInfo.processInfo.environment["NA_H3_FL2VA_AS_REFS"].flatMap { Int($0) } ?? 0) > 0
+                            && referenceImagePaths.count == 2 {
+                            // ★ 2026-09-18 首尾帧 as refs：恰好 2 张参考图时把视觉块标签换成
+                            //   首/尾帧语义（而非通用 "Picture 1/2"），让模型明确哪张是开头、
+                            //   哪张是结尾——软参考无 keyframes 时间锚，靠文本标签补时序角色。
+                            refVisionLabels[refVisionLabels.count - 1] = (i == 0 ? "<First frame>: " : "<Last frame>: ")
+                        }
+                    } else {
+                        // ★ 2026-10-04 重构：fl 首尾帧软参考恒用首/尾帧语义标签
+                        //   （软参考无 keyframes 时间锚，靠文本标签补时序角色）。
+                        refVisionLabels.append(i == 0 ? "<First frame>: " : "<Last frame>: ")
                     }
                     ownCondIDs.append(p)
                     ownCondSpans.append((lh / 2) * (lw / 2))
@@ -302,9 +368,23 @@ public enum H3FL2VAPipeline {
                     ownCondWs.append(UInt32(lw))
                     log("参考图 \(i + 1)：\(dims.w)×\(dims.h) → 画布 \(vc.w)×\(vc.h)，latent [\(lc),1,\(lh),\(lw)]，rows \((lh / 2) * (lw / 2))")
                 }
-                condRows = rowChunks.count == 1 ? rowChunks[0] : concatenated(rowChunks, axis: 0)
+                // ★ 2026-10-07 fl 硬锚+视觉块：fl 场景行序 = keyframes 硬锚段（keyChunks 双段），
+                //   rowChunks/refBlocks 恒空（无软参考段）；与 layout 段序（keyframes）一致。
+                let allChunks = keyChunks + rowChunks
+                condRows = allChunks.count == 1 ? allChunks[0] : concatenated(allChunks, axis: 0)
                 MLX.eval(condRows)
-                log("参考图编码完成：cond rows \(condRows.shape)")
+                if flSoftPair {
+                    // ★ 2026-10-07 fl 硬锚+视觉块：ownCond 元数据 = keyframe 段全套（rowCond* 恒空），
+                    //   段序与 condRows（仅 keyChunks）严格一致。
+                    ownCondIDs = keyCondIDs + rowCondIDs
+                    ownCondSpans = keyCondSpans + rowCondSpans
+                    ownCondModes = keyCondModes + rowCondModes
+                    ownCondHs = keyCondHs + rowCondHs
+                    ownCondWs = keyCondWs + rowCondWs
+                    log("fl 硬锚+视觉块：cond rows \(condRows.shape)（\(keyChunks.count) 段 keyframes 硬锚，无软参考段）")
+                } else {
+                    log("参考图编码完成：cond rows \(condRows.shape)")
+                }
                 condRowsClean = condRows   // 干净副本（续接拼接/落盘用，不加 aug noise）
 
                 // 噪声增强：r = 0.999·r + 0.001·noise（与 fl2va keyframe 同一规则）
@@ -351,56 +431,9 @@ public enum H3FL2VAPipeline {
             ownCondModes = []
             ownCondHs = []
             ownCondWs = []
-        } else {
-        guard let firstPx = loadImageBCFHW(path: firstImagePath, width: width, height: height),
-              let lastPx = loadImageBCFHW(path: lastImagePath, width: width, height: height) else {
-            throw NSError(domain: "H3FL2VA", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "图片加载失败：\(firstImagePath) / \(lastImagePath)"])
-        }
-        log("图片加载完成：首帧 \(firstPx.shape)，尾帧 \(lastPx.shape)")
-
-        autoreleasepool {
-            var vaeWeights: H3Weights? = try! H3Weights(url: wURL("video_vae.safetensors"))
-            vaeWeights?.cacheEnabled = false
-            var vae: H3VAE? = try! H3VAE.load(vaeWeights!)
-            let firstLat = vae!.encodeImage(firstPx)   // [1,24,1,h,w]
-            let lastLat = vae!.encodeImage(lastPx)     // [1,24,1,h,w]
-            latT = firstLat.shape[2]
-            latH = firstLat.shape[3]
-            latW = firstLat.shape[4]
-            latC = firstLat.shape[1]
-            gridH = latH / 2
-            gridW = latW / 2
-
-            func toRows(_ lat: MLXArray) -> MLXArray {
-                let nhwc = lat.transposed(0, 2, 3, 4, 1).reshaped([latT, latH, latW, latC])
-                return H3TensorOps.patchifyVideo(nhwc, gridH: gridH, gridW: gridW)
-            }
-            let firstRows = toRows(firstLat)
-            let lastRows = toRows(lastLat)
-            condRows = concatenated([firstRows, lastRows], axis: 0)
-            ownCondIDs = [firstImagePath, lastImagePath]
-            ownCondSpans = [firstRows.shape[0], lastRows.shape[0]]
-            ownCondModes = [0, 0]                           // cond 段（keyframe，目标网格）
-            ownCondHs = [0, 0]
-            ownCondWs = [0, 0]
-            MLX.eval(condRows)
-            log("keyframe 编码完成：latent [1,\(latC),\(latT),\(latH),\(latW)]，cond rows \(condRows.shape)")
-            condRowsClean = condRows   // 干净副本（续接拼接/落盘用，不加 aug noise）
-
-            // 噪声增强：r = 0.999·r + 0.001·noise
-            let augNoise = MLXRandom.normal(condRows.shape, key: MLXRandom.key(seed))
-            let augA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), condRows)
-            let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), condRows)
-            condRows = condRows * augA + augNoise * augB
-            MLX.eval(condRows)
-
-            // 释放 VAE 编码器（解码阶段再加载）
-            vae = nil
-            vaeWeights = nil
-            MLX.Memory.clearCache()
-            h3MemLog("VAE 编码器已释放（autoreleasepool 内）")
-        }
+        // ★ 2026-10-04 重构：原 fl2va keyframe 编码分支（低清重采样→learned upscaler 提升）已删除，
+        //   fl 首尾帧与 ref 统一走上方参考图软参考编码（refImg 段 + 视觉块 + 高清原生直通），
+        //   不再维护独立 keyframe 硬锚通路。
         }
         h3MemLog("VAE 编码器已释放（pool drain 后）")
         log("VAE 编码器已释放")
@@ -444,8 +477,9 @@ public enum H3FL2VAPipeline {
         // 无字幕抑制条件：简短标准写法，避免长句误伤画面内容（如广告牌/文字元素）。
         // 作为条件 token 注入文本序列末尾（与首尾帧标签同机制），默认开启，设 NA_H3_NO_SUBTITLES=0 关闭。
         let noSubtitleOn = (ProcessInfo.processInfo.environment["NA_H3_NO_SUBTITLES"].flatMap { $0 == "1" } ?? true)
-        if useRef2VA {
-            // 对齐官方 build_ref2va_presentation：逐张 `<Picture i>: ` + vision block，prompt 收尾
+        if !refVisionBlocks.isEmpty {
+            // ★ 2026-10-04 重构：fl/ref 统一——首尾帧软参考也生成视觉块；
+            //   对齐官方 build_ref2va_presentation：逐张 `<Picture i>: ` + vision block，prompt 收尾
             for (i, vb) in refVisionBlocks.enumerated() {
                 let labelIds = tokenizer.encode(text: refVisionLabels[i], addSpecialTokens: false).map { Int32($0) }
                 presentItems.append(.text(labelIds))
@@ -455,9 +489,9 @@ public enum H3FL2VAPipeline {
             if noSubtitleOn {
                 let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
                 presentItems.append(.text(suppressIds))
-                log("ref2va 文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
+                log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
             } else {
-                log("ref2va 文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
+                log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
             }
         } else {
             if noSubtitleOn {
@@ -479,9 +513,9 @@ public enum H3FL2VAPipeline {
             var teWeights: H3Weights? = try! H3Weights(url: wURL("text_encoder.safetensors"))
             teWeights?.cacheEnabled = false
             var textEncoder: H3TextEncoder? = try! H3TextEncoder.load(teWeights!)
-            if useRef2VA { try! textEncoder!.loadVision(teWeights!) }
+            if !refVisionBlocks.isEmpty { try! textEncoder!.loadVision(teWeights!) }   // ★ 2026-10-04 fl/ref 统一：有视觉块即加载
             let encoded = try! textEncoder!.encodeItems(presentItems)
-            if useRef2VA { textTagsForLayout = encoded.tags }
+            if !refVisionBlocks.isEmpty { textTagsForLayout = encoded.tags }            // ★ 2026-10-04 fl/ref 统一：有视觉块即下发模态标签
             textHidden = encoded.hidden
             // ★ CFG negative 条件行：官方 SelfLiftH3Sampler 默认 negative = 空 prompt。
             //   行数通常远小于 positive，后续在 DiT refine 后 pad 到与 positive 相同 textLen，
@@ -811,12 +845,10 @@ public enum H3FL2VAPipeline {
             // ★ 2026-10-03 前置不再进入条件区（.cond/preCondRows），仅保留时间轴注入
             //   （history 行）与末帧锚（contKeyRows）+ 提示词命令；不再拼入 condRows。
             if let tail = contKeyRows { pieces.append(tail) }       // 前置尾段 keyframe（无条件：layout keyframes 恒含 contKeyAnchors）
-            if !useRef2VA {
-                pieces.append(clean)                                 // 本节点 keyframe 行
-                piecesInjected.append(clean)
-            }
-            if useRef2VA {
-                pieces.append(clean)                                 // 本节点 refImg 行
+            // ★ 2026-10-07 fl 硬锚+视觉块：本节点干净条件行 = fl 双端 keyframe 硬锚行（keyChunks，不入 refBlocks）；
+            //   ref/续接 = refImg 行（refBlocks 非空）；fl 无续接不走本段（condRows 已在编码段直接加噪）。
+            if !refBlocks.isEmpty {
+                pieces.append(clean)                                 // 本节点 refImg 行（fl 首尾帧 / ref 参考图统一）
                 piecesInjected.append(clean)
             }
             if let preRef = continuationRefRows {
@@ -836,20 +868,14 @@ public enum H3FL2VAPipeline {
             let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), merged)
             condRows = merged * augA + augNoise * augB
             MLX.eval(condRows)
-            log("★ 条件直接注入：boundary \(contKeyRows?.shape ?? []) + ownKeyframe \(useRef2VA ? "∅" : String(describing: clean.shape)) + ownRef \(useRef2VA ? String(describing: clean.shape) : "∅") + preRef \(continuationRefRows?.shape ?? []) + history \(continuationHistoryRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 boundary/history = \(mergedInjected.shape)；前置条件行已不注入条件区）")
+            log("★ 条件直接注入：boundary \(contKeyRows?.shape ?? []) + ownRef（fl 硬锚恒空 refBlocks；ref 走 refImg）\(refBlocks.isEmpty ? "∅" : String(describing: clean.shape)) + preRef \(continuationRefRows?.shape ?? []) + history \(continuationHistoryRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 boundary/history = \(mergedInjected.shape)；前置条件行已不注入条件区）")
             injectedCondRowsClean = mergedInjected
-            // 透传段序与注入行严格一致：本节点keyframe + 本节点ref + 前置ref（前置条件行已不注入）
-            injectedCondIDs = (useRef2VA ? [] : ownCondIDs) + (useRef2VA ? ownCondIDs : []) + keptPreRefIDs
-            injectedCondSpans = (useRef2VA ? [] : ownCondSpans) + (useRef2VA ? ownCondSpans : []) + keptPreRefSpans
-            injectedCondModes = (useRef2VA ? [] : ownCondModes)
-                + (useRef2VA ? ownCondModes : [])
-                + [UInt8](repeating: 1, count: keptPreRefIDs.count)
-            injectedCondHs = (useRef2VA ? [] : ownCondHs)
-                + (useRef2VA ? ownCondHs : [])
-                + keptPreRefHs
-            injectedCondWs = (useRef2VA ? [] : ownCondWs)
-                + (useRef2VA ? ownCondWs : [])
-                + keptPreRefWs
+            // 透传段序与注入行严格一致：本节点 refImg（fl/ref 统一）+ 前置 ref（前置条件行已不注入）
+            injectedCondIDs = ownCondIDs + keptPreRefIDs
+            injectedCondSpans = ownCondSpans + keptPreRefSpans
+            injectedCondModes = ownCondModes + [UInt8](repeating: 1, count: keptPreRefIDs.count)
+            injectedCondHs = ownCondHs + keptPreRefHs
+            injectedCondWs = ownCondWs + keptPreRefWs
         } else if continuationActive {
             // ★ 2026-09-20 续接空图：本节点无干净条件行（纯续接链），仅注入前置 .h3cc 去重保留的条件段
             var pieces: [MLXArray] = []
@@ -920,13 +946,18 @@ public enum H3FL2VAPipeline {
             injectedCondWs = []
             log("文本生成：无任何条件行注入，纯文生视频（condRows 零行占位 [0, \(cfg.videoPatchDim)]）")
         }
+        // ★ 2026-10-07 fl 硬锚+视觉块（社区口径）：fl 首尾帧场景追加 [.first,.last] 硬锚——
+        //   .first 钉 target 首帧（cursor 起点）、.last 钉 target 末帧（cursor+spans-frameRescale，
+        //   社区 targetOrigin+temporalSpan-frameSpanScale 同式）；配合视觉块/标签软引导；
+        //   ref+续接（continuationSource 非 nil）恒走 contKeyAnchors，完全不受影响。
+        let layoutKeyframes = flSoftPair ? [.first, .last] + contKeyAnchors : contKeyAnchors
         let layout = PackedLayout(textLen: UInt32(textHidden.shape[0]),
                                   // ★ 2026-09-21 续接改 keyframe 锚点路线：布局只含新段 latentT（前置窗口由
                                   //   keyframe/refAudio 条件约束），与 SelfLift layoutLatT 同口径，避免非
                                   //   SelfLift 路径按旧初值拼窗口后行数错位。
                                   latentT: UInt32(latentT), latentH: UInt32(latH), latentW: UInt32(latW),
                                   audioT: audioT,
-                                  keyframes: contKeyAnchors + (useRef2VA ? [] : [.first, .last]),
+                                  keyframes: layoutKeyframes,
                                   frameCount: effFrameCount,
                                   refs: refBlocks,
                                   contRefs: contRefBlocks,
@@ -942,9 +973,9 @@ public enum H3FL2VAPipeline {
                                 "续接条件行与布局段行数不对齐：condRows=\(injectedTotal) layout=\(condRowsTotal)（续接错位回归）"])
             }
         }
-        if useRef2VA {
+        if !textTagsForLayout.isEmpty {
             layout.textTags = textTagsForLayout
-            log("ref2va 布局：text \(textHidden.shape[0]) + \(refBlocks.count) 参考块 + video/audio 目标")
+            log("\(useRef2VA ? "ref2va" : "fl2va（硬锚+视觉块）") 布局：text \(textHidden.shape[0]) + keyframes \(layoutKeyframes.count) 锚 + refs \(refBlocks.count) 参考块 + video/audio 目标")
         }
 
         // sigma 调度：official = 官方 shift 公式；betaRefined = Beta 分布 + 余弦尾段精修
@@ -1141,6 +1172,11 @@ public enum H3FL2VAPipeline {
                 //   只放手：**不 clearCache、不动 cacheLimit**（撤销依据见 SelfLiftH3 入口屏障注释 ①②）；
                 //   放掉的权重 buffer 落进空闲池，被高分段每步中间量命中复用。
                 releasePixelVAE: { slVae = nil; slVaeWeights = nil })
+            // ★ 2026-10-07 fl 硬锚+视觉块：fl 双端硬锚（[.first,.last]）走 layout 默认几何——
+            //   keyframeSpans/Grids 恒 nil（默认 frameRows + 目标网格，与注入行数一致）；
+            //   SelfLift 两布局 keyframes 段由 contKeyAnchors 参数同源重建。
+            let flKeyframeSpansHigh: [UInt32]? = nil
+            let flKeyframeGridsHigh: [(h: [Double], w: [Double])?]? = nil
             let slOut = try runH3Stage1WithSelfLift(
                 dit: dit!,
                 textStates: refined,
@@ -1167,10 +1203,14 @@ public enum H3FL2VAPipeline {
                 textStatesNeg: refinedNeg,
                 // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线），不再显式传参。
                 continuationWinLatentT: continuationWinLatentT,
-                contKeyAnchors: contKeyAnchors,
+                // ★ 2026-10-07 fl 硬锚+视觉块：contKeyAnchors = layoutKeyframes（fl 双端 [.first,.last]；
+                //   ref+续接恒 [.first]）。
+                contKeyAnchors: layoutKeyframes,
                 preCondRows: 0,                          // ★ 2026-10-03 前置不再进入条件区
                 preRefBlocks: contRefBlocks.filter { $0.kind != .audio },
-                audioContinuationRows: continuationAudioRows)   // ★ 2026-09-21 音频续接：refAudio 锚点（nil=旧缓存回退噪声）
+                audioContinuationRows: continuationAudioRows,   // ★ 2026-09-21 音频续接：refAudio 锚点（nil=旧缓存回退噪声）
+                keyframeSpansHigh: flKeyframeSpansHigh,
+                keyframeGridsHigh: flKeyframeGridsHigh)
                 // 注：contRefBlocks 中新增的 .audio 块仅供主高清布局（contRefs）生成 refAudio 段；
                 //   SelfLift 的音频参考由 audioContinuationRows 参数独立注入（contAudioRef），
                 //   且其 allRefBlocks 支持 image + video（history）块（SelfLiftH3 切行分支），
@@ -1333,7 +1373,10 @@ public enum H3FL2VAPipeline {
                     let l2 = zc.reshaped([latC, 1, H2, W2]).transposed(1, 2, 3, 0)         // [1,H2,W2,C]
                     return H3TensorOps.patchifyVideo(l2, gridH: gH2, gridW: gW2)
                 }
-                // ★ 2026-10-03 续接兼容：前置已不进入条件区，condRows 最前即本节点 keyframe
+                // ★ 2026-10-03 续接兼容：前置已不进入条件区，condRows 最前即本节点条件行。
+                // ★ 2026-10-04 重构提示：fl 首尾帧已软参考化（refImg 段，行数=参考图网格行数、
+                //   非固定 fRows），下方按 fRows 切双 keyframe 仅适用于显式双帧输入的对照/实验
+                //   （自检 p2 场景语义已变化）；生产路径不传 stage2，此分支仅为官方两段式放大保留。
                 var condChunks2: [MLXArray] = []
                 let condA = condRows[0 ..< fRows, 0 ..< vpatch]
                 let condB = condRows[fRows ..< (2 * fRows), 0 ..< vpatch]

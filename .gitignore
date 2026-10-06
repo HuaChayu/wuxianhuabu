@@ -10,3 +10,6 @@ xcuserdata/
 model/minimax h3/temp/
 __pycache__/
 *.pyc
+
+# 带日期后缀的备份文件
+*.bak-*

@@ -325,7 +325,14 @@ public final class PackedLayout {
     public convenience init(textLen: UInt32, latentT: UInt32, latentH: UInt32, latentW: UInt32,
                 audioT: UInt32, keyframes: [KeyframeAnchor], frameCount: UInt32, refs: [RefBlock],
                 contRefs: [RefBlock] = [],
-                preCondRows: UInt32 = 0) {
+                preCondRows: UInt32 = 0,
+                // ★ 2026-10-05 fl 锚几何对齐（方案A2）：fl 场景调用方显式传同口径几何——
+                //   高分锚（span=fRows、目标网格坐标）与低分锚（span=gHl*gWl、低清网格坐标，
+                //   即目标网格 0.5 降采样），两阶段「同一个注入」走同一套几何参数机制
+                //   （SelfLiftH3 fl 场景）。默认 nil = 每锚 frameRows + 布局网格（原行为）；
+                //   非 nil 时 count 必须 == keyframes.count，元素 nil = 该锚用布局默认网格。
+                keyframeSpans: [UInt32]? = nil,
+                keyframeGrids: [(h: [Double], w: [Double])?]? = nil) {
         self.init(seqLen: 0, segments: [], positionIds: [], imgUpdate: [], audioUpdate: [], textTags: [],
                   textLen: textLen, latentT: latentT, latentH: latentH, latentW: latentW, audioT: audioT)
         let area = sqrt(Double(latentH) * Double(latentW))
@@ -334,6 +341,14 @@ public final class PackedLayout {
         let frameRows = UInt32(hAxis.count * wAxis.count)
 
         let nCond = UInt32(keyframes.count)
+        // 每锚行数：默认 frameRows（布局网格）；fl .first full-res 锚用 fRows（目标网格）。
+        if let spans = keyframeSpans, spans.count != keyframes.count {
+            preconditionFailure("keyframeSpans.count 必须等于 keyframes.count")
+        }
+        if let grids = keyframeGrids, grids.count != keyframes.count {
+            preconditionFailure("keyframeGrids.count 必须等于 keyframes.count")
+        }
+        let keyframeRowCount: UInt32 = keyframeSpans?.reduce(0, +) ?? nCond * frameRows
         let nAudioRows = audioT * 2
         let nVideoRows = latentT * frameRows
 
@@ -379,11 +394,11 @@ public final class PackedLayout {
             }
         }
 
-        let seqLen = textLen + preCondRows + nCond * frameRows + contRefRows + refImgRows + refAudioRows + contRefAudioRows + nAudioRows + nVideoRows
+        let seqLen = textLen + preCondRows + keyframeRowCount + contRefRows + refImgRows + refAudioRows + contRefAudioRows + nAudioRows + nVideoRows
         var segments: [Segment] = []
         segments.reserveCapacity(Int(3 + nCond + refSegments + UInt32(contRefs.count)))
         var positionIds = [Double](repeating: 0, count: Int(seqLen) * 3)
-        var imgUpdate = [Bool](repeating: false, count: Int(preCondRows + nCond * frameRows + contRefRows + refImgRows + nVideoRows))
+        var imgUpdate = [Bool](repeating: false, count: Int(preCondRows + keyframeRowCount + contRefRows + refImgRows + nVideoRows))
         var audioUpdate = [Bool](repeating: false, count: Int(contRefAudioRows + refAudioRows + nAudioRows))
 
         var row: UInt32 = 0
@@ -447,7 +462,7 @@ public final class PackedLayout {
             case .audio: break // 负锚 END 对齐，不推进 cursor
             }
         }
-        for anchor in keyframes {
+        for (ki, anchor) in keyframes.enumerated() {
             let condT: Double
             switch anchor {
             case .first:
@@ -459,13 +474,16 @@ public final class PackedLayout {
             case .at(let t):
                 condT = cursor + keyframeTargetAdvance + t
             }
-            segments.append(Segment(start: row, end: row + frameRows, kind: .cond))
-            writeFrameGrid(&positionIds, row: row, t: condT, hAxis: hAxis, wAxis: wAxis)
-            for _ in 0..<Int(frameRows) {
+            // ★ 2026-10-05 fl .first full-res 锚：span/网格按锚独立（默认 = frameRows + 布局网格）
+            let span = keyframeSpans?[ki] ?? frameRows
+            let grid = keyframeGrids?[ki] ?? (hAxis, wAxis)
+            segments.append(Segment(start: row, end: row + span, kind: .cond))
+            writeFrameGrid(&positionIds, row: row, t: condT, hAxis: grid.h, wAxis: grid.w)
+            for _ in 0..<Int(span) {
                 imgUpdate[imgRow] = false
                 imgRow += 1
             }
-            row += frameRows
+            row += span
         }
         _ = frameCount
 
@@ -503,35 +521,15 @@ public final class PackedLayout {
         }
 
         // ref2va blocks, in request order; each advances the cursor.
-        let startCursor = cursor
-        let nImageRefs = refs.reduce(0) { $0 + (($1.kind == .image) ? 1 : 0) }
-        var refsAdvance: Double = 0
-        for b in refs {
-            switch b.kind {
-            case .image: refsAdvance += 1.0
-            case .audio: refsAdvance += Double(b.audioT)
-            case .video:
-                var spans: Double = 0
-                for k in 0..<Int(b.latentT) { spans += videoTSpan(k) }
-                refsAdvance += max(Double(b.audioT), spans)
-            }
-        }
-        var imageIdx = 0
         for b in refs {
             switch b.kind {
             case .image:
                 let g = refGrid(b)
                 segments.append(Segment(start: row, end: row + g.rows, kind: .refImg))
-                let refT: Double
-                if nImageRefs == 2 && imageIdx == 1 {
-                    // 首尾帧软参考：尾帧对齐视频时间轴末端（最后 latent step 起点），
-                    // 避免首尾两帧 RoPE 几乎同位导致开头被两帧内容混合污染。
-                    var spans: Double = 0
-                    for k in 0..<Int(latentT) { spans += videoTSpan(k) }
-                    refT = startCursor + refsAdvance + spans - videoTSpan(Int(latentT) - 1)
-                } else {
-                    refT = cursor
-                }
+                // ★ 2026-10-07 移除尾帧末尾对齐（h3_380 末尾条件图根因）：参考图段（refImg）
+                //   一律顺延 cursor，不把任何条件图钉在视频时间轴末端；软参考时序角色
+                //   由 <First frame>/<Last frame> 标签 + 视觉块承担，全程无时间锚。
+                let refT = cursor
                 writeFrameGrid(&positionIds, row: row, t: refT, hAxis: g.hAxis, wAxis: g.wAxis)
                 for _ in 0..<Int(g.rows) {
                     imgUpdate[imgRow] = false
@@ -539,7 +537,6 @@ public final class PackedLayout {
                 }
                 row += g.rows
                 cursor += 1.0
-                imageIdx += 1
             case .audio:
                 if b.audioT > 0 {
                     let n = b.audioT * 2
