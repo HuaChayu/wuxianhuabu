@@ -1,0 +1,9 @@
+.build/
+.DS_Store
+*.png
+# Large parity goldens + weights live outside the repo (regenerate via zimage-oracle/dump_goldens.py).
+# Keep only the tiny always-on P1 goldens so the math tests run on a fresh clone.
+tests/goldens/*.safetensors
+!tests/goldens/zimage_scheduler.safetensors
+!tests/goldens/zimage_rope.safetensors
+tests/goldens/*.json

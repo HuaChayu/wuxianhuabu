@@ -1,0 +1,1732 @@
+//
+//  minimax h3.swift
+//  无限画布
+//
+//  MiniMax H3 FL2VA 组装管线（文本编码 → DiT 去噪 → VAE 解码 → mp4）
+//
+//  串联流程（对齐 mlx-serve-main/src/minimax_h3.zig 的 generateOne）：
+//    1. 加载 2 张 keyframe 图片 → VAE encodeImage → patchifyVideo → concat
+//       → 噪声增强 r = 0.999·r + 0.001·noise（visualCondTimestep=0.999）
+//    2. tokenizer 编码 prompt → H3TextEncoder.encodeItems([.text(ids)])
+//       → hidden [seq, textDim]（编码器加载后立即释放）
+//    3. H3DiT.load + attachLoras(turbo_lora) + precomputeAdaln + refineText
+//       → Euler 采样：单遍 turbo 直出（官方 4/6 步 LoRA 调度），按 steps 完整跑到 0。
+//       video_in = concat(cond_rows, video_x) axis0，
+//       x += out.video·(sigmas[i+1]-sigmas[i])，每步 clearCache
+//    4. video_x reshape [t,lh2,lw2,24,2,2] → transpose(3,0,1,4,2,5) → contig
+//       → reshape [1,24,t,lh,lw] → H3VAE.decode → pixels [1,3,T,H,W]
+//       （H3 侧不再做 latent 放大/Stage2 refine；放大与第二阶段交给 LTX 二采流程）
+//    5. writeMp4 逐帧写出（复用工程模型公共函数-通用.swift）
+//
+//  内存管理：分阶段加载，用后立即置 nil + MLX.Memory.clearCache()。
+//
+
+import Foundation
+
+/// H3 stage1 内存直通桥（h3+ltx 二采，方案 C）：
+/// generateVideo 内部 VAE 解码出的 stage1 像素帧不落盘，直接持有在 bridge 上，
+/// 队列在 generateVideo 返回后把 pixels 传给像素桥内存入口做二采（无磁盘中间编码损失）。
+public final class H3Stage2MemoryBridge {
+    public var pixels: MLXArray?      // [1,3,T,H,W] f32（[-1,1]，H3 VAE 解码输出，与 readVideoFramesToBCFHW 同域）
+    public var width: Int = 0
+    public var height: Int = 0
+    public var frameCount: Int = 0
+    public var fps: Int = 24
+
+    // ── H3-to-LTX-Latent-Adapter 直通（可选） ──
+    /// adapter 直出的 LTX 归一化 latent：NDHWC [1, F, H/32, W/32, 128]。
+    /// 非 nil 时，队列走「latent 直入二采」路径，跳过 LTX vaeEncodeVideo。
+    /// 若生成时 adapterSkipH3Decode=true，则 pixels 为 nil（H3 完全不解码），
+    /// stage1 预览视频不存在，音轨以 audioTrackPath（独立 wav）承载。
+    public var ltxHalfLatent: MLXArray?
+    /// adapter 模式下 H3 侧等效像素几何（= H3 latent 空间 × 16），供 LTX 侧定尺寸/预算
+    public var adapterPixelWidth: Int = 0
+    public var adapterPixelHeight: Int = 0
+    /// adapter 跳解码模式下的音轨载体（独立 wav）；非 nil 表示无 stage1 mp4，二采音轨取此文件
+    public var audioTrackPath: String?
+}
+import MLX
+import MLXNN
+import MLXRandom
+import MLXLMCommon
+import Tokenizers
+import Hub
+import ImageIO
+
+/// sigma 调度风格（对照实验开关）
+/// - `.official`：官方 shift 公式 `sigmaSchedule`（默认，turbo 4-8 步标准调度）
+/// - `.betaRefined`：Beta(0.6,0.6) 分布 + 余弦尾段精修（`betaRefinedSchedule`，
+///   extra=1 / startAt=0.7），末段不再大步跳 0，用于同 seed 质量对照
+public enum H3SigmaScheduleStyle {
+    case official
+    case betaRefined
+}
+
+/// 第二阶段 H3 refine 配置（官方 latent 升频 + 高分辨率加噪精修链路）。
+/// stage1 采样完成后不清零落地，latent 行形式在内存中直通：
+///   videoX/cond rows → zlat → 空间几何×scale → 回行形式（网格×scale²）
+///   → 按 refineSigmas 加噪 → Euler 低步重采样 → 直接 VAE decode。
+/// scale=1 或 nil 时不启用，行为与旧路径完全一致。
+public struct H3Stage2Config {
+    public var scale: Int = 2
+    /// 视频域（model sigma）精修调度，官方 i2v/ref2va 工作流 3 步 refine。
+    /// 首项即加噪起点，末项必须为 0。
+    public var refineSigmas: [Double] = [0.9035, 0.6316, 0.3158, 0.0]
+    /// refine 段加噪种子（缺省在 stage1 seed 上派生，避免与主采样同噪声退化）
+    public var refineSeed: UInt64? = nil
+
+    public init(scale: Int = 2,
+                refineSigmas: [Double] = [0.9035, 0.6316, 0.3158, 0.0],
+                refineSeed: UInt64? = nil) {
+        self.scale = scale
+        self.refineSigmas = refineSigmas
+        self.refineSeed = refineSeed
+    }
+}
+
+public enum H3FL2VAPipeline {
+
+    /// FL2VA 视频生成入口（异步：tokenizer 构建需要 async）。
+    /// - Parameters:
+    ///   - prompt: 文本提示词
+    ///   - firstImagePath: 首帧图片绝对路径
+    ///   - lastImagePath: 尾帧图片绝对路径
+    ///   - outPath: mp4 输出路径
+    ///   - width/height: 生成分辨率（建议 256，需 32 对齐）
+    ///   - steps: 采样步数（turbo 6 步）
+    ///   - latentT: 潜在帧数（5 → 17 输出帧）
+    ///   - seed: 随机种子
+    ///   - log: 进度回调
+    public static func generateVideo(
+        prompt: String,
+        firstImagePath: String,
+        lastImagePath: String,
+        outPath: String,
+        width: Int = 256,
+        height: Int = 256,
+        steps: UInt32 = 6,
+        latentT: UInt32 = 5,
+        seed: UInt64 = 42,
+        sparsePolicy: SparsePolicy = .mix,
+        scheduleStyle: H3SigmaScheduleStyle = .official,
+        // 分阶段门控已取消：默认 nil，stage1 去噪全程按 sparsePolicy 走 SOL 稀疏注意力，
+        // 不再在首尾段整步回退稠密（SDPA）。【已取消实验参数】全工程无调用点，恒不生效，
+        // 保留该参数仅供显式对照实验：
+        // 传 (start, end) 时 progress = step/total ∈ (start, end) 才稀疏，两端全 dense
+        //（对齐 kijai Sol-Attn 的 percent_to_sigma：start=0.2 / end=0.9）；
+        // 环境变量 NA_H3_SPARSE_GATE=0 仍可强制关闭门控做对照。
+        sparseGatePercent: (start: Float, end: Float)? = nil,
+        // PAB 跨步 attention 缓存：全程接入，按 attnBroadcastRefresh 调度执行——
+        // warmup/tail 强制重算，中间步按 k 间隔刷新，其余步复用上一步 attention 输出。
+        // k<=1 等价禁用；环境变量 NA_H3_PAB=0 可强制关闭做对照，NA_H3_PAB_K 可覆盖间隔扫描。
+        attentionBroadcastK: UInt32 = 2,
+        // ★ SelfLift 第三分支（H3 一采渐进式采样，见 SelfLiftH3-(h3专属).swift）：
+        //   true = stage1 走「低分（×0.5）ts 次 NFE → 零 NFE 过渡块（nearest 直接 latent 提升 +
+        //          VAE 像素锚点一致修正）→ 升回全分辨率 → 高分 N-ts 次 NFE」，总 NFE = N 不变；
+        //   false = 原单条 stage1 循环单遍直出（默认，行为与本次接入前逐字一致，供自检/对照脚本用）。
+        //   生产入口（模型生成队列-通用.swift）按偏好设置「H3 一采设置 → SelfLift 渐进采样」显式传值。
+        //   ts 不写死：transitionStep = 0 → 官方 75% 规则按 N（= sigmas.count - 1，取自步数滑杆）推导。
+        selfLiftEnabled: Bool = false,
+        // ★ SelfLift lowOnly 模式（IC 链路用）：true = H3 一采只跑低分（半清）段，直接返回
+        //   低清 latent（跳过过渡块 + H3 高分循环）；高分（升频×2 + 精修）交由 LTX 二采完成，
+        //   「H3 低分 + LTX 高分」两模型组成 lift。必须与队列二采 fullResInput=false 配套。
+        selfLiftLowOnly: Bool = false,
+        log: (String) -> Void = { s in print("[H3-FL2VA] \(s)"); fflush(stdout) },
+        stage2: H3Stage2Config? = nil,
+        proResOutput: Bool = false,
+        stage2MemBridge: H3Stage2MemoryBridge? = nil,
+        /// ref2va 多参考图通路：非空即启用（此时首/尾帧被忽略）。
+        /// 每张图按官方 reference canvas（短边 2048、32 对齐）编码为独立参考块，
+        /// 文本侧生成 `<Picture i>: ` + vision block 序列，prompt 放在最后。
+        /// ★ 2026-10-04 重构：首尾帧图（firstImagePath/lastImagePath）不再走 fl 独立 keyframe
+        ///   硬锚编码，而是以与 ref 相同的方式进入注入路径（refImg 段 + 视觉块 + 高清原生直通），
+        ///   软参考标签固定为 <First frame>/<Last frame>；useRef2VA=false 且首尾帧非空时同样适用。
+        referenceImagePaths: [String] = [],
+        /// ★ 2026-10-07 UI 显式模式（用户红线：UI 选啥就是啥，不再被启发式覆盖）：
+        ///   true  = UI 选了「首尾帧」模式 → 管线强制走 fl 双端硬锚（flSoftPair，[.first,.last]，
+        ///           不被续接/图数启发式否决）；false = UI 选了「多参考」模式 → 强制不进 fl 硬锚
+        ///           （走 ref2va 软参考）；nil = 无显式选择（旧档/自检脚本）→ 回退下方旧启发式判定。
+        ///   由队列端 task.h3Fl2vaAsRefs 透传（首尾帧=false → true，多参考=true → false）。
+        flFirstLastMode: Bool? = nil,
+        /// 参考图缩放模式：.match = 缩到与生成画面同面积（默认，序列最短）；
+        /// .mid = 短边上限 1024；.max = 短边上限 2048（官方 ref2va，序列最长）
+        referenceSizing: RefImageSizing = .match,
+        /// ★ H3→LTX latent 直通适配器（H3-to-LTX-Latent-Adapter，见 H3-to-LTX-Latent-Adapter-(h3专属).swift）：
+        /// 非 nil 时，在 H3 VAE 解码之前拦截 clean latent，直接映射为 LTX 归一化 latent 挂到 bridge，
+        /// 使队列可走「latent 直入二采」路径，省去 LTX VAE encode（乃至 H3 VAE decode）两步像素往返。
+        h3ToLTXAdapter: H3ToLTXLatentAdapter? = nil,
+        /// adapter 生效时是否连 H3 VAE 解码一并跳过（默认 true：不写 stage1 mp4，音轨单独落 wav
+        /// 由二采最终混流；false：仍解码出 stage1 预览视频，仅省 LTX encode）。
+        adapterSkipH3Decode: Bool = true,
+        // ★ 尾帧延续缓存（.h3cc）消费侧（2026-09-20 重装）：
+        //   non-nil 时，生成前读取前置视频节点尾段 latent 并真正注入采样（1~2 步 warm-up
+        //   短重采样重建上下文）。内部任一校验失败自动回退原生从头生成（零回归）。
+        continuationSource: H3ContinuationCache.Loaded? = nil,
+        /// 本节点是否开启尾帧延续落盘（画布节点 tailFrameEnabled，队列透传）
+        tailFrameEnabled: Bool = true,
+        /// 尾帧延续缓存根目录（<canvasRoot>/cache/h3-continuation）；nil = 禁用缓存 IO
+        continuationCacheRoot: String? = nil,
+        /// 被消费的前置缓存精确 source 节点 ID：生成成功后幂等删除其 .h3cc（不误删自身）
+        continuationConsumedSourceID: UUID? = nil,
+        /// 本节点 ID（落盘文件名用）
+        continuationNodeID: UUID? = nil,
+        /// 分支 ID（多分支输出时区分，可选）
+        continuationBranchID: String? = nil
+    ) async throws -> String {
+        let t0 = Date()
+        let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
+        // ★ 2026-09-19 嵌套目录兼容：下载落位历史上可能产生「根目录/同名子目录」嵌套
+        //   （远端 listFiles 的 Path 自带与模型目录同名的顶层前缀）。生成侧一律按真实
+        //   落位解析：根目录直拼优先，不存在时任意深度递归查找（FileFinder），保证
+        //   嵌套场景也能加载；两者皆无时回退直拼路径（后续加载自然报错，便于定位）。
+        let modelRootURL = URL(fileURLWithPath: modelDir, isDirectory: true)
+        let wURL = { (name: String) -> URL in
+            let direct = modelRootURL.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: direct.path) { return direct }
+            return FileFinder.first(named: name, under: modelRootURL) ?? direct
+        }
+
+        // ── 内存打点（RSS phys_footprint + MLX activeMemory）──
+        func memFootprintKB() -> UInt64 {
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+            let kr = withUnsafeMutablePointer(to: &info) { p in
+                p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { ip in
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), ip, &count)
+                }
+            }
+            return kr == KERN_SUCCESS ? UInt64(info.phys_footprint) / 1024 : 0
+        }
+        func h3MemLog(_ label: String) {
+            let rssMB = Double(memFootprintKB()) / 1024.0
+            let mlxMB = Double(MLX.Memory.activeMemory) / 1024.0 / 1024.0
+            let cacheMB = Double(MLX.Memory.cacheMemory) / 1024.0 / 1024.0
+            log("[MEM] \(label)：RSS \(String(format: "%.0f", rssMB))MB，MLX active \(String(format: "%.0f", mlxMB))MB，MLX cache \(String(format: "%.0f", cacheMB))MB")
+        }
+        // 修复：禁止 cacheLimit = 0（释放即真正 free MTLBuffer），
+        // 否则 GPU 队列尚引用的 buffer 会被提前释放 → MTLDebugCommandBuffer
+        // "references deallocated object" 断言（use-after-free）。
+        // H3 单步中间 buffer（50 层 DiT）远大于 LTX：全局 MemoryPolicy 的 2GB
+        // 缓存池装不下 → allocator 每步 trim 归还 → 下步重分配 → 内存忽高忽低。
+        // 放大到 10GB 让采样循环内中间 buffer 真正跨步复用（不可设 0，见上）。
+        MLX.Memory.cacheLimit = 10_000_000_000
+        // ★ H3 收尾恢复：10GB 缓存池仅供 H3 单步中间 buffer 跨步复用（50 层 DiT >> LTX），
+        // 函数返回/抛错时立即恢复全局 2GB（MemoryPolicy.bufferCacheLimit），避免高水位残留到
+        // 后续像素桥/LTX refine 编译窗口（实测 H3 后 10GB 未恢复 + refine 重编译 → low-swap jetsam）。
+        defer { MLX.Memory.cacheLimit = 2_000_000_000 }
+
+        // ★ 2026-10-07 跨生成 GPU 同步屏障：连续点击生成（上一次刚结束立刻再点）时，
+        // 上一轮收尾的 clearCache / cacheLimit 10GB→2GB trim 会把 GPU 队列可能仍在
+        // 引用的 MTLBuffer 真正释放；本轮首个 eval（参考图/首尾帧 VAE 编码）提交
+        // command buffer 时 Metal Debug 层校验 → "references deallocated object" 断言崩溃
+        // （H3VAE.encodeTiled eval(raw) 处）。入口先同步，确保上一轮全部 GPU 命令落盘完成。
+        Stream.gpu.synchronize()
+
+        // ── 0. 配置 ──
+        let cfg: H3Config = (try? H3Config.load(from: wURL("config.json"))) ?? H3Config()
+        log("config: \(cfg.hiddenSize)h/\(cfg.numLayers)L video_shift=\(cfg.sigmaShiftVideo) audio_shift=\(cfg.sigmaShiftAudio)")
+
+        // ── 1. 条件编码：fl2va 首尾帧 OR ref2va 多参考图 ──
+        // ★ 2026-09-20 空图场景（纯续接/纯文生）：referenceImagePaths 为空但无 keyframe 可锚，
+        //   必须走 ref2va 通路（keyframes=[]、布局只按 contRefs/refs 的 refImg 段计行），
+        //   否则 layout 仍按 [.first,.last] 加 2 帧 cond 行，与注入 condRows 行数错配。
+        let useRef2VA = !referenceImagePaths.isEmpty || (firstImagePath.isEmpty && lastImagePath.isEmpty)
+        var condRows: MLXArray!
+        var condRowsClean: MLXArray!   // 加噪前的干净条件行（供落盘 / 续接拼接）
+        var ownCondIDs: [String] = []  // 本节点条件资源 id（按拼接顺序，落盘 / 下游去重）
+        var ownCondSpans: [Int] = []   // 各资源对应行段行数（spans 之和 == condRows 行数）
+        // v3 网格归属（落盘透传）：ownCondModes[i]=1 → refImg 段（参考图，配自身网格），
+        // ownCondHs/Ws 为该段参考图 latent 尺寸；=0 → cond 段（keyframe，配目标网格）。
+        var ownCondModes: [UInt8] = []
+        var ownCondHs: [UInt32] = []
+        var ownCondWs: [UInt32] = []
+        // ★ 2026-10-03 v4 末帧像素（boundary .first 硬锚）：解码段从像素数组截最后 1 帧
+        //   [1,3,1,H,W]（[-1,1]），随 .h3cc 落盘；续接消费侧 encodeImage 重编码成单帧
+        //   keyframe latent 锚索引0。严禁用低清 latent 升频结果或 latent 末行冒充。
+        var tailFramePixels: MLXArray? = nil
+        var latC = 0, latT = 0, latH = 0, latW = 0, gridH = 0, gridW = 0
+        // ref2va 布局块与文本侧视觉块（顺序严格对应）
+        var refBlocks: [RefBlock] = []
+        var refVisionBlocks: [H3VisionBlock] = []
+        var refVisionLabels: [String] = []
+
+        // ★ 2026-10-04 曾统一 fl/ref 软参考编码（首尾帧图以与 ref 相同方式进入 refImg 段），
+        //   但 2026-10-07 已恢复 fl 双端硬锚分支（见下方 flSoftPair）——软参考仅剩历史注释。
+        //   参考图源 = useRef2VA 时全部多参考图；否则本节点首尾帧两张。
+        let refImageSourcePaths = useRef2VA ? referenceImagePaths : [firstImagePath, lastImagePath]
+        // ★ 2026-10-07 fl 硬锚 + 视觉块（社区口径）：fl 首尾帧走 keyframe 硬锚
+        //   （.first 钉 target 首帧、.last 钉 target 末帧，cond 段）+ 文本侧
+        //   <First frame>/<Last frame> 标签 + 视觉块；无 refImg 软参考段、无 RoPE 拼接。
+        //   ★ 2026-10-07 UI 显式优先（用户红线：选啥就是啥）：flFirstLastMode 非 nil 时
+        //   完全按 UI 选择分流——true（UI 首尾帧）恒走 fl 硬锚（不再被续接/图数启发式否决），
+        //   false（UI 多参考）恒不进 fl 硬锚；仅首尾帧图全空时回退 useRef2VA 通路（续接空图/
+        //   文生无图可锚，硬锚无意义）。nil（旧档/自检脚本）才回退下方旧启发式判定。
+        //   旧启发式守卫 !useRef2VA：ref2va 恰好 2 张参考图时绝不进 fl 硬锚分支（否则多参考图会被
+        //   误当首尾帧硬锚化，refImg 段/refBlocks 丢失 → ref2va 回归）。
+        let flSoftPair: Bool
+        if let flFirstLastMode {
+            flSoftPair = flFirstLastMode && !firstImagePath.isEmpty && !lastImagePath.isEmpty
+        } else {
+            flSoftPair = !useRef2VA && continuationSource == nil && refImageSourcePaths.count == 2
+        }
+        if flSoftPair {
+            log("fl 硬锚+视觉块：首尾帧 keyframe 硬锚（.first/.last）+ 标签 + 视觉块（ref+续接不动）")
+        }
+        if !refImageSourcePaths.isEmpty {
+            guard refImageSourcePaths.count <= Int(H3Const.maxRefImages) else {
+                throw NSError(domain: "H3REF2VA", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "参考图数量 \(refImageSourcePaths.count) 超过上限 \(H3Const.maxRefImages)"])
+            }
+            log("\(flSoftPair ? "fl2va（硬锚+视觉块）" : (useRef2VA ? "ref2va" : "fl2va（软参考）"))：\(refImageSourcePaths.count) 张参考图")
+
+            try autoreleasepool {
+                var vaeWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
+                vaeWeights?.cacheEnabled = false
+                var vae: H3VAE? = try H3VAE.load(vaeWeights!)
+                // 目标 latent 几何：用生成分辨率的探测图走同一条 VAE 通路（不做 /16 假设）
+                let probe = vae!.encodeImage(MLXArray.zeros([1, 3, 1, height, width]), lazyProbe: true)
+                latT = probe.shape[2]
+                latH = probe.shape[3]
+                latW = probe.shape[4]
+                latC = probe.shape[1]
+                gridH = latH / 2
+                gridW = latW / 2
+                log("目标 latent [1,\(latC),\(latT),\(latH),\(latW)]")
+                var rowChunks: [MLXArray] = []
+                // ★ 2026-10-07 fl 硬锚+视觉块：fl 场景双端 keyframe 硬锚行（目标网格 fRows 行，cond 段）；
+                //   ref 场景恒空（仅 rowChunks/refImg 段）。
+                var keyChunks: [MLXArray] = []
+                var keyCondIDs: [String] = []
+                var keyCondSpans: [Int] = []
+                var keyCondModes: [UInt8] = []
+                var keyCondHs: [UInt32] = []
+                var keyCondWs: [UInt32] = []
+                for (i, p) in refImageSourcePaths.enumerated() {
+                    guard let dims = h3ImagePixelSize(p) else {
+                        throw NSError(domain: "H3REF2VA", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "参考图尺寸读取失败：\(p)"])
+                    }
+                    // ★ 2026-10-07 fl 硬锚+视觉块（社区口径）：fl 首尾帧不再进 refImg 软参考段，
+                    //   改走 keyframe 硬锚（cond 段，目标网格）——首帧 .first 钉 target 首帧、
+                    //   尾帧 .last 钉 target 末帧（layoutKeyframes 锚序决定）；视觉块 + 标签保留。
+                    if flSoftPair {
+                        guard let pxAnchor = loadImageBCFHW(path: p, width: width, height: height) else {
+                            throw NSError(domain: "H3REF2VA", code: 2,
+                                          userInfo: [NSLocalizedDescriptionKey: "fl 硬锚图加载失败：\(p)"])
+                        }
+                        let latAnchor = vae!.encodeImage(pxAnchor)   // [1,24,1,latH,latW] 目标网格
+                        let nhwcAnchor = latAnchor.transposed(0, 2, 3, 4, 1).reshaped([1, latH, latW, latC])
+                        let anchorRows = H3TensorOps.patchifyVideo(nhwcAnchor, gridH: gridH, gridW: gridW)
+                        // keyframe 硬锚段（cond 段，目标网格，mode=0）
+                        keyChunks.append(anchorRows)
+                        keyCondIDs.append(p)
+                        keyCondSpans.append(gridH * gridW)        // keyframe 行数 = (latH/2)*(latW/2) = fRows
+                        keyCondModes.append(0)                    // cond 段（keyframe，目标网格）
+                        keyCondHs.append(UInt32(latH))
+                        keyCondWs.append(UInt32(latW))
+                        // 文本侧视觉块 + 首/尾帧标签：与硬锚配套的视觉引导（社区 <Picture N> 同义）
+                        let plane = pxAnchor.reshaped([3, Int(height), Int(width)])
+                        let frames = concatenated([plane, plane], axis: 0)   // [2,3,H,W]
+                        refVisionBlocks.append(H3VisionBlock(frames: frames, grid: gridFor(h: UInt32(height), w: UInt32(width))))
+                        refVisionLabels.append(i == 0 ? "<First frame>: " : "<Last frame>: ")
+                        log("fl 硬锚+视觉块：\(i == 0 ? "首帧" : "尾帧")（\(dims.w)×\(dims.h)）→ keyframe \(i == 0 ? ".first" : ".last") 硬锚（rows \(gridH * gridW)）+ 视觉块 + 标签「\(refVisionLabels[refVisionLabels.count - 1])」")
+                        continue
+                    }
+                    // 官方 reference canvas：短边 2048 上限、32 对齐；再经 fitCanvas 复核对齐
+                    let rc = refImageCanvas(UInt32(dims.w), UInt32(dims.h),
+                                            genW: UInt32(width), genH: UInt32(height),
+                                            mode: referenceSizing)
+                    let vc = fitCanvas(h: rc.h, w: rc.w)
+                    guard let px = loadImageBCFHW(path: p, width: Int(vc.w), height: Int(vc.h)) else {
+                        throw NSError(domain: "H3REF2VA", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "参考图加载失败：\(p)"])
+                    }
+                    let lat = vae!.encodeImage(px)      // [1,24,1,lh,lw]
+                    let lh = lat.shape[3], lw = lat.shape[4], lc = lat.shape[1]
+                    let nhwc = lat.transposed(0, 2, 3, 4, 1).reshaped([1, lh, lw, lc])
+                    rowChunks.append(H3TensorOps.patchifyVideo(nhwc, gridH: lh / 2, gridW: lw / 2))
+                    refBlocks.append(RefBlock(kind: .image, latentH: UInt32(lh), latentW: UInt32(lw),
+                                              latentT: 1, audioT: 0))
+                    // 文本侧视觉块：静帧沿 temporal patch 重复填满 2 帧
+                    let plane = px.reshaped([3, Int(vc.h), Int(vc.w)])
+                    let frames = concatenated([plane, plane], axis: 0)   // [2,3,H,W]
+                    refVisionBlocks.append(H3VisionBlock(frames: frames, grid: gridFor(h: vc.h, w: vc.w)))
+                    if useRef2VA {
+                        refVisionLabels.append(labelFor(kind: .image, ordinal: UInt32(i + 1)))
+                        if (ProcessInfo.processInfo.environment["NA_H3_FL2VA_AS_REFS"].flatMap { Int($0) } ?? 0) > 0
+                            && referenceImagePaths.count == 2 {
+                            // ★ 2026-09-18 首尾帧 as refs：恰好 2 张参考图时把视觉块标签换成
+                            //   首/尾帧语义（而非通用 "Picture 1/2"），让模型明确哪张是开头、
+                            //   哪张是结尾——软参考无 keyframes 时间锚，靠文本标签补时序角色。
+                            refVisionLabels[refVisionLabels.count - 1] = (i == 0 ? "<First frame>: " : "<Last frame>: ")
+                        }
+                    } else {
+                        // ★ 2026-10-04 重构：fl 首尾帧软参考恒用首/尾帧语义标签
+                        //   （软参考无 keyframes 时间锚，靠文本标签补时序角色）。
+                        refVisionLabels.append(i == 0 ? "<First frame>: " : "<Last frame>: ")
+                    }
+                    ownCondIDs.append(p)
+                    ownCondSpans.append((lh / 2) * (lw / 2))
+                    ownCondModes.append(1)                 // refImg 段（参考图自身网格）
+                    ownCondHs.append(UInt32(lh))
+                    ownCondWs.append(UInt32(lw))
+                    log("参考图 \(i + 1)：\(dims.w)×\(dims.h) → 画布 \(vc.w)×\(vc.h)，latent [\(lc),1,\(lh),\(lw)]，rows \((lh / 2) * (lw / 2))")
+                }
+                // ★ 2026-10-07 fl 硬锚+视觉块：fl 场景行序 = keyframes 硬锚段（keyChunks 双段），
+                //   rowChunks/refBlocks 恒空（无软参考段）；与 layout 段序（keyframes）一致。
+                let allChunks = keyChunks + rowChunks
+                condRows = allChunks.count == 1 ? allChunks[0] : concatenated(allChunks, axis: 0)
+                MLX.eval(condRows)
+                if flSoftPair {
+                    // ★ 2026-10-07 fl 硬锚+视觉块：ownCond 元数据 = keyframe 段全套（keyCond*），
+                    //   段序与 condRows（仅 keyChunks）严格一致。
+                    ownCondIDs = keyCondIDs
+                    ownCondSpans = keyCondSpans
+                    ownCondModes = keyCondModes
+                    ownCondHs = keyCondHs
+                    ownCondWs = keyCondWs
+                    log("fl 硬锚+视觉块：cond rows \(condRows.shape)（\(keyChunks.count) 段 keyframes 硬锚，无软参考段）")
+                } else {
+                    log("参考图编码完成：cond rows \(condRows.shape)")
+                }
+                condRowsClean = condRows   // 干净副本（续接拼接/落盘用，不加 aug noise）
+
+                // 噪声增强：r = 0.999·r + 0.001·noise（与 fl2va keyframe 同一规则）
+                let augNoise = MLXRandom.normal(condRows.shape, key: MLXRandom.key(seed))
+                let augA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), condRows)
+                let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), condRows)
+                condRows = condRows * augA + augNoise * augB
+                MLX.eval(condRows)
+
+                // 释放 VAE 编码器（解码阶段再加载）
+                vae = nil
+                vaeWeights = nil
+                h3MemLog("VAE 编码器已释放（autoreleasepool 内）")
+            }
+            // clearCache 移到池外：池内物化的 condRows/condRowsClean 出池后仍会被
+            // 续接拼接段 eval，池内清缓存可能连带释放其 buffer → preCommit UAF。
+            // ★ 2026-10-07 清池前同步：编码段最后一个 eval 已同步完成，但为防后续
+            //   续接拼接/落盘等外部 eval 与清池交错，先落盘 GPU 命令再释放 buffer。
+            Stream.gpu.synchronize()
+            MLX.Memory.clearCache()
+        } else if firstImagePath.isEmpty && lastImagePath.isEmpty {
+        // ★ 2026-09-20 空图分支：本节点无首尾帧图（续接空图 或 纯文生）时，跳过 keyframe 编码，
+        //   仅探测目标 latent 几何（与 ref2va 同法）；条件行由前置 .h3cc 注入或直接零行（文本生成）。
+            autoreleasepool {
+                var vaeWeights: H3Weights? = try! H3Weights(url: wURL("video_vae.safetensors"))
+                vaeWeights?.cacheEnabled = false
+                var vae: H3VAE? = try! H3VAE.load(vaeWeights!)
+                let probe = vae!.encodeImage(MLXArray.zeros([1, 3, 1, height, width]), lazyProbe: true)
+                latT = probe.shape[2]
+                latH = probe.shape[3]
+                latW = probe.shape[4]
+                latC = probe.shape[1]
+                gridH = latH / 2
+                gridW = latW / 2
+                vae = nil
+                vaeWeights = nil
+                MLX.Memory.clearCache()
+            }
+            if continuationSource != nil {
+                log("续接空图：无本节点 keyframe，条件行将由前置 .h3cc 去重注入（ownCondIDs 为空，几何 [\(latT),\(latC),\(latH),\(latW)] grid=\(gridH)×\(gridW)）")
+            } else {
+                log("文本生成：无条件图无续接，跳过 keyframe 编码，零条件行注入（几何 [\(latT),\(latC),\(latH),\(latW)] grid=\(gridH)×\(gridW)）")
+            }
+            condRowsClean = nil
+            ownCondIDs = []
+            ownCondSpans = []
+            ownCondModes = []
+            ownCondHs = []
+            ownCondWs = []
+        // ★ 2026-10-07 现状：fl 首尾帧走上方 flSoftPair 硬锚分支（keyframe 硬锚+视觉块）；
+        //   ref 多参考/续接走上方软参考编码（refImg 段 + 视觉块）；仅空图场景进入本分支（纯探测）。
+        }
+        h3MemLog("VAE 编码器已释放（pool drain 后）")
+        log("VAE 编码器已释放")
+
+        // ── 2. tokenizer + 文本编码 ──
+        // 语言模型目录同样按真实落位解析：根目录直拼 config.json 存在则用根目录，
+        // 否则递归定位 config.json 所在目录（兼容历史嵌套落位）。
+        let lmFolderURL: URL = {
+            if FileManager.default.fileExists(atPath: modelRootURL.appendingPathComponent("config.json").path) {
+                return modelRootURL
+            }
+            return FileFinder.first(named: "config.json", under: modelRootURL)?.deletingLastPathComponent() ?? modelRootURL
+        }()
+        let lmConfig = LanguageModelConfigurationFromHub(modelFolder: lmFolderURL)
+        guard let tokConfig = try? await lmConfig.tokenizerConfig,
+              let tokData = try? await lmConfig.tokenizerData,
+              let tokenizer = try? AutoTokenizer.from(tokenizerConfig: tokConfig, tokenizerData: tokData) else {
+            throw NSError(domain: "H3FL2VA", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "tokenizer 加载失败"])
+        }
+        var promptIds = tokenizer.encode(text: prompt, addSpecialTokens: false).map { Int32($0) }
+        // ★ 续接标记命令（2026-10-03）：本次为 .h3cc 尾帧链式续接（continuationSource 非 nil）时，
+        //   在命令拼接序列（prompt 文本条件）最前面额外拼接续接标记命令，让模型知道这是
+        //   「把上一段接下去」而非新生成；风格与现有命令（如 "no subtitles"）一致：简短英文标记，
+        //   经 tokenizer 编码为独立文本条件 token，不破坏既有拼接逻辑与续接语义（从头生成时零变化）。
+        if continuationSource != nil {
+            // ★ 通用续接提示词前缀（2026-10-03 修订 v3）：续接 = 同一镜头内的因果连续，不是
+            //   「先播一段前置、再另起内容」。前置画面是场景起点，prompt 描述的事件（新主体入场、
+            //   动作、交互）从第一帧起就在同一画面中自然发生；不写死时长/镜头/相机，只有 prompt
+            //   明确写了切换/新镜头/换场景才切。<Video 1> 动态指向续接源，用户原始 prompt 原样
+            //   嵌入其后不做改写，画面继承靠机制层。
+            let contPrefix = """
+            [video continuation] Continue <Video 1> as one continuous shot. Keep its scene and subjects, and let everything described in the prompt happen immediately within that same scene from the first frames: new subjects enter, motions and interactions unfold as part of the continuation. Do not replay the previous segment first, and do not cut to a new scene unless the prompt explicitly says so.
+            """
+            let contMarkIds = tokenizer.encode(text: contPrefix, addSpecialTokens: false).map { Int32($0) }
+            promptIds = contMarkIds + promptIds
+            log("通用续接前缀：命中 .h3cc 尾帧链式续接，前置续接语义壳（\(contMarkIds.count) tokens，同一镜头因果连续、prompt 事件从首帧融合发生、仅显式切换才切，无硬编码时长/镜头）+ 原 prompt（\(promptIds.count - contMarkIds.count) tokens，原样保留未改写）")
+        }
+        var presentItems: [H3PresentItem] = []
+        var textTagsForLayout: [UInt8] = []
+        // 无字幕抑制条件：简短标准写法，避免长句误伤画面内容（如广告牌/文字元素）。
+        // 作为条件 token 注入文本序列末尾（与首尾帧标签同机制），默认开启，设 NA_H3_NO_SUBTITLES=0 关闭。
+        let noSubtitleOn = (ProcessInfo.processInfo.environment["NA_H3_NO_SUBTITLES"].flatMap { $0 == "1" } ?? true)
+        if !refVisionBlocks.isEmpty {
+            // ★ 2026-10-04 重构：fl/ref 统一——首尾帧软参考也生成视觉块；
+            //   对齐官方 build_ref2va_presentation：逐张 `<Picture i>: ` + vision block，prompt 收尾
+            for (i, vb) in refVisionBlocks.enumerated() {
+                let labelIds = tokenizer.encode(text: refVisionLabels[i], addSpecialTokens: false).map { Int32($0) }
+                presentItems.append(.text(labelIds))
+                presentItems.append(.vision(vb))
+            }
+            presentItems.append(.text(promptIds))
+            if noSubtitleOn {
+                let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
+                presentItems.append(.text(suppressIds))
+                log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
+            } else {
+                log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
+            }
+        } else {
+            if noSubtitleOn {
+                let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
+                presentItems = [.text(promptIds), .text(suppressIds)]
+                log("prompt 编码：\(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens")
+            } else {
+                presentItems = [.text(promptIds)]
+            }
+        }
+        log("prompt 编码：\(promptIds.count) tokens")
+
+        var textHidden: MLXArray!
+        var textHiddenNeg: MLXArray? = nil
+        // CFG 开关预判（与第三分支 slCfg.cfgScale 同一公式：仅 NA_H3_SELFLIFT_CFG 显式 >0 时编码
+        // negative 条件行；缺省 0=关闭，避免 turbo LoRA 下白跑双路）。此处需在文本编码前决定。
+        let slCfgScaleNeeded = (ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_CFG"].flatMap(Double.init) ?? 0.0) > 0
+        autoreleasepool {
+            var teWeights: H3Weights? = try! H3Weights(url: wURL("text_encoder.safetensors"))
+            teWeights?.cacheEnabled = false
+            var textEncoder: H3TextEncoder? = try! H3TextEncoder.load(teWeights!)
+            if !refVisionBlocks.isEmpty { try! textEncoder!.loadVision(teWeights!) }   // ★ 2026-10-04 fl/ref 统一：有视觉块即加载
+            let encoded = try! textEncoder!.encodeItems(presentItems)
+            if !refVisionBlocks.isEmpty { textTagsForLayout = encoded.tags }            // ★ 2026-10-04 fl/ref 统一：有视觉块即下发模态标签
+            textHidden = encoded.hidden
+            // ★ CFG negative 条件行：官方 SelfLiftH3Sampler 默认 negative = 空 prompt。
+            //   行数通常远小于 positive，后续在 DiT refine 后 pad 到与 positive 相同 textLen，
+            //   使 negative forward 可复用同一 layout/rope/plan（时间坐标严格一致）。
+            if slCfgScaleNeeded {
+                var negIds = tokenizer.encode(text: "", addSpecialTokens: true).map { Int32($0) }
+                if negIds.isEmpty {
+                    negIds = tokenizer.encode(text: " ", addSpecialTokens: true).map { Int32($0) }
+                }
+                if negIds.isEmpty {
+                    negIds = [Int32(0)]   // 兜底：词表 id 0 必存在；负文本内容不影响 CFG 方向
+                }
+                let encNeg = try! textEncoder!.encodeItems([.text(negIds)])
+                textHiddenNeg = encNeg.hidden
+                MLX.eval(textHiddenNeg!)
+                log("SelfLift CFG negative：空文本 → \(negIds.count) tokens，hidden \(encNeg.hidden.shape)")
+            }
+            MLX.eval(textHidden)
+            h3MemLog("文本编码完成")
+            log("文本编码完成：hidden \(textHidden.shape)，tags \(encoded.tags.count)")
+
+            textEncoder = nil
+            teWeights = nil
+            MLX.Memory.clearCache()
+            h3MemLog("文本编码器置 nil 后（autoreleasepool 内）")
+        }
+        h3MemLog("文本编码器置 nil 后（pool drain 后）")
+        Thread.sleep(forTimeInterval: 3)
+        h3MemLog("文本编码器置 nil 后（sleep 3s）")
+        log("文本编码器已释放")
+
+        // ── 3. DiT 加载 + LoRA + AdaLN 预计算 + 采样 ──
+        h3MemLog("DiT 加载前")
+        log("DiT 开始加载（transformer.safetensors 18.7GB，读取+解析较慢）...")
+        var ditWeights: H3Weights? = try H3Weights(url: wURL("transformer.safetensors"))
+        ditWeights?.cacheEnabled = false
+        var dit: H3DiT? = nil
+        try autoreleasepool {
+            dit = try H3DiT.load(from: ditWeights!, cfg: cfg)
+        }
+        h3MemLog("DiT 权重加载完成")
+        log("DiT 权重加载完成，挂载 turbo LoRA...")
+        // turbo LoRA：官方单遍直出统一用 minimax_h3_turbo_v4_step600_ema（6 步版，
+        // 与 sigmaSchedule(steps:6) 完整 0→1 直出匹配）。可用环境变量 H3_LORA_FILE 覆盖做对照。
+        // 社区二采（lightx2v 4 步 + Stage2 refine）已随 H3LatentUpscaler/H3Stage2Refine 移除。
+        let loraName = ProcessInfo.processInfo.environment["H3_LORA_FILE"]
+            ?? "minimax_h3_turbo_v4_step600_ema.safetensors"
+        let loraURL = wURL(loraName)
+        let loraExists = FileManager.default.fileExists(atPath: loraURL.path)
+        let effectiveLora: URL = loraExists ? loraURL
+            : wURL("minimax_h3_turbo_v4_step600_ema.safetensors")
+        let patched = try dit!.attachLoras(from: [effectiveLora], scales: [1.0])
+        log("turbo LoRA 挂载（\(effectiveLora.lastPathComponent)）：\(patched) 模块")
+
+        // 布局：latentT → 实际输出帧数（h3PlanTemporal 与官方 planTemporal 互逆，37 → 124 帧）；
+        // audioT 按官方 audio_t = round(frame_count * 40 / 24) 折算（124 → 207）
+        let plan = h3PlanTemporal(Int(latentT))
+        let frameCount = UInt32(plan.outputFrames)
+        let audioT = H3Const.audioLatentT(frameCount: frameCount)
+
+        // ★ 尾帧延续缓存消费解析（2026-09-20 重装）：
+        //   指纹校验（模型/分辨率/steps/latentT/帧数/参考图数）+ 几何校验（latC/grid/videoPatchDim）
+        //   全部通过且缓存尾段可重建为行时才激活续接；任一失败回退从头（continuationActive=false，零回归）。
+        var continuationActive = false
+        var continuationWinLatentT = UInt32(0)
+        var continuationWinAudioT = UInt32(0)
+        var continuationWinRows = 0
+        var continuationCacheRows: MLXArray? = nil
+        // ★ 续接 keyframe 锚点（2026-09-21）：前置尾段 latent 按 latent step 切段，作为
+        //   never-denoised 条件行锚进新 clip 时间轴开头；行数据 = continuationCacheRows。
+        var contKeyAnchors: [KeyframeAnchor] = []
+        var contKeyRows: MLXArray? = nil
+        // ★ 2026-10-02 history+boundary 语义（mere-run encodeContinuation / ComfyUI MotionContext）：
+        //   前置尾段去末帧整段 latent 行 → history video 参考块（contRefs 正轴顺延，never-denoised）；
+        //   末帧作 boundary .first 锚。2026-10-03 起 .first 锚改为「末帧像素 encodeImage 重编码
+        //   单帧 keyframe latent」（v4 缓存 tailFrameRGB），hard-boundary latent 末行直通已撤回。
+        var continuationHistoryRows: MLXArray? = nil   // 前置 history latent 行 [（winT-1)*fRows, vpatch]
+        var continuationCondRows: MLXArray? = nil   // 前置干净条件行（去重后，不加 aug noise）→ .cond 段
+        var continuationRefRows: MLXArray? = nil    // 前置 refImg 段干净条件行 → 重建参考图网格（v3）
+        var continuationAudioRows: MLXArray? = nil  // ★ 2026-09-21 音频续接：前置尾段音频 latent 行 [winAudioT*2, 32]
+                                                    //   （clean）→ refAudio 段（never-denoised），nil = 旧缓存无音频
+        // 去重后保留的前置段元数据（供落盘透传，段序与注入行严格一致）
+        var keptPreRefIDs: [String] = []            // refImg 段（参考图）
+        var keptPreRefSpans: [Int] = []
+        var keptPreRefHs: [UInt32] = []
+        var keptPreRefWs: [UInt32] = []
+        var contRefBlocks: [RefBlock] = []          // 续接前置参考块（layout 按各自网格重建 .refImg 段）
+        if let cont = continuationSource {
+            // fpOK 指纹（2026-09-21）：steps 不参与校验——步数为偏好滑杆动态值，
+            // 缓存落盘后用户改动会导致误判失效、回退从头；与 H3ContinuationCache.load
+            // 的宽松指纹口径一致（modelKey/width/height/latentT/frameCount）。
+            let fpOK =
+                cont.header.modelKey == H3ContinuationCache.currentModelKey
+                && cont.header.width == width
+                && cont.header.height == height
+                && cont.header.latentT == latentT
+                && cont.header.frameCount == frameCount
+                // v3（2026-09-20）：refCount 不再作严格匹配项——上游多参考、下游仅尾帧图
+                // 时客观不等，硬约束导致续接失败回退从头（风格漂移）。差异仅告警观察。
+            if cont.header.refCount != referenceImagePaths.count {
+                log("⚠️ 续接 refCount 差异：上游 \(cont.header.refCount) vs 本节点 \(referenceImagePaths.count)（不再阻断，仅告警）")
+            }
+            let geoOK =
+                cont.header.latC == latC
+                && cont.header.gridH == gridH
+                && cont.header.gridW == gridW
+                && cont.header.videoPatchDim == cfg.videoPatchDim
+                && cont.header.winLatentRows > 0
+                && cont.header.winLatentRows % (gridH * gridW) == 0
+            if fpOK && geoOK,
+               let cacheArr = H3ContinuationCache.mlxArray(fromData: cont.latentData,
+                                                           shape: [Int(cont.header.winLatentT),
+                                                                   cont.header.latH, cont.header.latW, cont.header.latC]),
+               cacheArr.shape[0] == Int(cont.header.winLatentT),
+               cacheArr.shape[1] == latH, cacheArr.shape[2] == latW, cacheArr.shape[3] == latC {
+                let cacheRows = H3TensorOps.patchifyVideo(cacheArr, gridH: gridH, gridW: gridW)  // [winRows, vpatch]
+                MLX.eval(cacheRows)
+                continuationActive = true
+                continuationWinLatentT = UInt32(cont.header.winLatentRows / (gridH * gridW))
+                continuationWinAudioT = UInt32(cont.header.winAudioT)
+                continuationWinRows = cont.header.winLatentRows
+                continuationCacheRows = cacheRows
+                // ★ 2026-10-02 改 history+boundary 语义（mere-run encodeContinuation /
+                //   ComfyUI MiniMaxH3MotionContext 双实现源码核对结论）：前置尾段不再逐帧作
+                //   keyframe 锚（逐帧强条件 → 割裂/格子感来源，见 h3 复盘），而是：
+                //     · history：前置尾段去末帧整段 latent 作 video 参考块（布局 contRefs 段
+                //       正轴顺延，never-denoised，整段参考而非逐帧替换 t）；
+                //     · boundary：末帧作 .first 锚（钉新 clip 首帧，t=cursor）。
+                //   target 保持纯噪声起步（2026-10-03 起续接初值恒 nil，非 warm-start）。
+                // ★ 2026-10-02 恢复首帧锚（对照关锚复测）：
+                //   关锚（h3_325→h3_326）复测暴露：无首锚时新段开头自由演化——
+                //   ① 开头接不上（缺末帧画面，播放几帧才撞上延续方向）；
+                //   ② 前 1s+ 频繁虚化闪烁（模型在「参考画面」与「自身漂移」间摇摆）。
+                //   boundary .first 锚为模型提供「首帧=末帧」的强锚点（接续+稳定）。
+                //   2026-10-03 起锚数据源 = 末帧像素 encodeImage 重编码（v4 tailFrameRGB），
+                //   撤回「采样后首帧行直通末帧 latent」的 latent 末行冒充方案（见下）。
+                let winT = Int(continuationWinLatentT)
+                let tailRows = cacheRows
+                let fr = Int(tailRows.shape[0]) / winT
+                if winT > 1 {
+                    // history 行 = 去末帧整段（video 参考块，正轴顺延 never-denoised）
+                    continuationHistoryRows = tailRows[0 ..< (winT - 1) * fr]
+                } else {
+                    // 单帧缓存退化：无 history，仅 boundary .first 锚 + 缓存音频/前置条件延续
+                    continuationHistoryRows = nil
+                }
+                if let hr = continuationHistoryRows { MLX.eval(hr) }
+                // ★ 2026-10-03 boundary .first 锚 = 末帧像素重编码（用户否决 latent 末行直通）：
+                //   索引0 的首锚必须是「末 latent 解码出的最后一个像素图 encodeImage 重编码的
+                //   单帧 keyframe latent」，绝对清晰、绝对遵从前置；严禁低清 latent 升频结果
+                //   或 latent 末行冒充。v4 缓存携带 tailFrameRGB → 末帧像素 → encodeImage；
+                //   旧缓存无像素段 → 关锚（仅 history 延续），避免 latent 末行冒充。
+                if let pxData = cont.tailFramePixelsData,
+                   let th = cont.header.tailFrameH, let tw = cont.header.tailFrameW,
+                   th > 0, tw > 0,
+                   let pxArr = H3ContinuationCache.mlxArray(fromData: pxData, shape: [1, 3, 1, th, tw]) {
+                    let pxF32 = pxArr.asType(.float32)
+                    MLX.eval(pxF32)
+                    var anchorRows: MLXArray? = nil
+                    do {
+                        try autoreleasepool {
+                            var vaeWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
+                            vaeWeights?.cacheEnabled = false
+                            var vae: H3VAE? = try H3VAE.load(vaeWeights!)
+                            let lat = vae!.encodeImage(pxF32)      // [1,24,1,lh,lw]
+                            let lh = lat.shape[3], lw = lat.shape[4], lc = lat.shape[1]
+                            let nhwc = lat.transposed(0, 2, 3, 4, 1).reshaped([1, lh, lw, lc])
+                            anchorRows = H3TensorOps.patchifyVideo(nhwc, gridH: lh / 2, gridW: lw / 2)
+                            MLX.eval(anchorRows)
+                            vae = nil
+                            vaeWeights = nil
+                        }
+                    } catch {
+                        log("⚠️ 末帧像素 encodeImage 失败（\(error.localizedDescription)），关闭 .first 锚（仅 history 延续）")
+                    }
+                    if let ar = anchorRows {
+                        contKeyAnchors = [.first]
+                        contKeyRows = ar
+                        MLX.eval(ar)
+                        log("续接（像素 .first 硬锚）：history 整段 \(winT - 1) latentT video 参考块（行 \(continuationHistoryRows?.shape ?? [])）；末帧像素 \(th)×\(tw) → encodeImage 单帧 keyframe 锚（行 \(ar.shape)，索引0）")
+                    } else {
+                        contKeyAnchors = []
+                        log("⚠️ 末帧像素 encodeImage 无输出，关闭 .first 锚（仅 history 延续）")
+                    }
+                } else {
+                    contKeyAnchors = []
+                    log("⚠️ 续接缓存无末帧像素段（旧版 .h3cc），关闭 .first 首锚（严禁 latent 末行冒充）；仅 history 参考块延续")
+                }
+                // ★ 2026-09-21 音频续接：缓存携带音频 latent 时重建 [winAudioT*2, 32] 行，
+                //   作为 refAudio 段（never-denoised）注入 audio stream；缺失则回退噪声占位。
+                continuationAudioRows = nil
+                if let ad = cont.audioLatentData,
+                   let aRows = cont.header.audioLatentRows, aRows > 0 {
+                    if let aArr = H3ContinuationCache.mlxArray(fromData: ad, shape: [aRows, 32]),
+                       aArr.shape[0] == Int(continuationWinAudioT) * 2 {
+                        continuationAudioRows = aArr.asType(.float32)
+                        MLX.eval(continuationAudioRows)
+                        // ★ 2026-09-23 主高清音频参考注入（与视频 keyframe 同款）：前置音频
+                        //   latent 行进 layout contRefs → refAudio 段（never-denoised、负锚
+                        //   END 对齐目标起点向后延伸），由 H3Layout contRefs .audio 分支生成；
+                        //   行数 = winAudioT*2，与 audioX 拼接对齐。
+                        contRefBlocks.append(RefBlock(kind: .audio, latentH: 0, latentW: 0,
+                                                      latentT: 0, audioT: UInt32(aRows / 2)))
+                        log("续接音频 latent：\(aRows) 行（winAudioT=\(continuationWinAudioT)）→ refAudio 锚点，never-denoised")
+                    } else {
+                        log("⚠️ 续接音频 latent 重建失败（\(aRows) 行 ≠ \(continuationWinAudioT)*2），音频回退噪声占位")
+                    }
+                } else {
+                    log("续接缓存无音频 latent（旧版本），音频回退噪声占位 + 裁切路线")
+                }
+                // 前置干净条件行：v2+ 缓存携带 condRowsData 时重建 [rows, vpatch]，
+                // vpatch 必须与本节点一致才能直接拼接注入。
+                // 去重：header 记录每个资源的 id 与行段，本节点自身已含同 id 资源时跳过该段，
+                // 仅注入本节点新增的条件（旧版文件无元数据时退化为全量注入）。
+                if let cd = cont.condRowsData,
+                   let rows = cont.header.condRowsRows, let vp = cont.header.condRowsVPatch,
+                   vp == cfg.videoPatchDim,
+                   let cr = H3ContinuationCache.mlxArray(fromData: cd, shape: [rows, vp]) {
+                    let preFull = cr.asType(.float32)   // [rows, vp]
+                    let dedupOK = !cont.header.condIDs.isEmpty
+                        && cont.header.condIDs.count == cont.header.condRowSpans.count
+                        && cont.header.condRowSpans.reduce(0, +) == rows
+                    if dedupOK {
+                        // v3 网格归属元数据：modes/hs/ws 与 ids 等长；nil = v2 旧缓存按全 cond 段处理
+                        let modes = cont.header.condRowModes
+                        let hs = cont.header.condRowHs
+                        let ws = cont.header.condRowWs
+                        let metaOK = modes != nil && hs != nil && ws != nil
+                            && modes!.count == cont.header.condIDs.count
+                            && hs!.count == cont.header.condIDs.count
+                            && ws!.count == cont.header.condIDs.count
+                        if !metaOK {
+                            log("⚠️ 续接缓存 v2（无网格归属元数据）：ref2va 前置条件行将按 cond 段注入（位置编码可能错位，建议重新生成 .h3cc）")
+                        }
+                        var kept: [MLXArray] = []        // cond 段（keyframe，走 preCondRows）
+                        var keptRefRows: [MLXArray] = [] // refImg 段（参考图，重建网格）
+                        var skipped = 0
+                        var cursor = 0
+                        for (i, (rid, span)) in zip(cont.header.condIDs, cont.header.condRowSpans).enumerated() {
+                            let seg = preFull[cursor ..< (cursor + span), 0 ..< vp]
+                            if ownCondIDs.contains(rid) {
+                                skipped += 1
+                            } else if metaOK && modes![i] == 1 {
+                                // refImg 段：保留行 + 重建参考块（配参考图自身网格，修位置编码错位）
+                                keptRefRows.append(seg)
+                                keptPreRefIDs.append(rid)
+                                keptPreRefSpans.append(span)
+                                keptPreRefHs.append(hs![i])
+                                keptPreRefWs.append(ws![i])
+                                contRefBlocks.append(RefBlock(kind: .image, latentH: hs![i], latentW: ws![i],
+                                                              latentT: 1, audioT: 0))
+                            } else {
+                                kept.append(seg)
+                            }
+                            cursor += span
+                        }
+                        if kept.isEmpty && keptRefRows.isEmpty {
+                            continuationCondRows = nil
+                            continuationRefRows = nil
+                            log("★ 续接前置条件行 \(rows) 行全部与自身重复（跳过 \(skipped) 个同 id 资源），不注入前置条件")
+                        } else {
+                            if kept.isEmpty {
+                                continuationCondRows = nil
+                            } else {
+                                continuationCondRows = kept.count == 1 ? kept[0] : concatenated(kept, axis: 0)
+                                MLX.eval(continuationCondRows)
+                            }
+                            if keptRefRows.isEmpty {
+                                continuationRefRows = nil
+                            } else {
+                                continuationRefRows = keptRefRows.count == 1 ? keptRefRows[0] : concatenated(keptRefRows, axis: 0)
+                                MLX.eval(continuationRefRows)
+                            }
+                            log("★ 续接前置条件行：cond 段 \(continuationCondRows?.shape ?? [])（\(kept.count) 段）+ refImg 段 \(continuationRefRows?.shape ?? [])（\(keptRefRows.count) 段），跳过 \(skipped) 个同 id 资源")
+                        }
+                    } else {
+                        continuationCondRows = preFull
+                        MLX.eval(continuationCondRows)
+                        log("★ 续接前置条件行：\(cr.shape)（旧版无资源元数据，全量按 cond 段注入，待拼接）")
+                    }
+                } else {
+                    log("⚠️ 前置条件行缺失/不匹配（vpatch 需 =\(cfg.videoPatchDim)），仅注入尾段 latent")
+                }
+                // ★ 2026-10-02 history video 参考块：前置尾段去末帧整段 latent（winT-1 帧）作
+                //   video 参考块追加到 contRefBlocks 末尾（段序 [audio][preRef image][history video]，
+                //   与注入 pieces 的 preRef → history 行序严格一致）。布局 contRefs .video 分支
+                //   按正轴顺延坐标重建 refImg 段；SelfLift 侧 allRefBlocks 同序切行。
+                if let hr = continuationHistoryRows, hr.shape[0] > 0 {
+                    contRefBlocks.append(RefBlock(kind: .video, latentH: UInt32(latH), latentW: UInt32(latW),
+                                                  latentT: UInt32(winT - 1), audioT: 0))
+                    log("续接 history 参考块：前置尾段去末帧 \(winT - 1) latentT 整段作 video 参考（正轴顺延，never-denoised）")
+                }
+                log("★ 续接激活：前置尾段 \(continuationWinLatentT) latentT（\(continuationWinRows) 行）注入采样（winFrames=\(cont.header.winFrames)，warmStart=\(cont.recovery.warmStart)）")
+            } else {
+                log("⚠️ 续接校验未通过（fpOK=\(fpOK) geoOK=\(geoOK)），回退从头生成")
+            }
+        }
+        // 续接总帧布局：总 latentT/audioT/帧数 = 前置窗口 + 本节点（非续接时逐字退化为原值）
+        let effLatentT = continuationActive ? latentT + continuationWinLatentT : latentT
+        let effFrameCount = continuationActive ? UInt32(h3PlanTemporal(Int(effLatentT)).outputFrames) : frameCount
+        // ★ 条件注入：不判断缺图——有前置条件行就把「视频1去重后条件」与「本节点干净条件」直接合并，
+        //   再统一走 aug noise（与官方 keyframe 同规则）。后续由用户在注入层自行演进。
+        //   实际注入集合（干净行 + 资源元数据）：默认本节点自身；
+        //   合并前置后 = 去重保留的前置段 + 本节点，供落盘透传，让下游按「上游实际用过哪些」去重。
+        var injectedCondRowsClean: MLXArray? = condRowsClean
+        var injectedCondIDs = ownCondIDs
+        var injectedCondSpans = ownCondSpans
+        var injectedCondModes = ownCondModes
+        var injectedCondHs = ownCondHs
+        var injectedCondWs = ownCondWs
+        if continuationActive, let clean = condRowsClean {
+            // 段序必须与 layout 一致：text → preCond(.cond) → keyframes(.cond) → refs(.refImg 本节点) → contRefs(.refImg 前置)
+            // 即 [前置cond段] + [前置尾段keyframe(续接锚点)] + [本节点keyframe(fl2va)] + [本节点refImg(ref2va)] + [前置refImg段]
+            // ★ 2026-09-22 段序修复：本节点 refs 前置、contRefs 后置，与 layout 交换同步，
+            //   保证 refImg 段前 N 槽 = 本节点参考图（与视觉块标签严格对应）。
+            var pieces: [MLXArray] = []
+            var piecesInjected: [MLXArray] = []
+            // ★ 2026-10-03 前置不再进入条件区（.cond/preCondRows），仅保留时间轴注入
+            //   （history 行）与末帧锚（contKeyRows）+ 提示词命令；不再拼入 condRows。
+            if let tail = contKeyRows { pieces.append(tail) }       // 前置尾段 keyframe（无条件：layout keyframes 恒含 contKeyAnchors）
+            // ★ 2026-10-07 fl 硬锚+视觉块：本节点干净条件行 = fl 双端 keyframe 硬锚行（keyChunks，不入 refBlocks）；
+            //   ref/续接 = refImg 行（refBlocks 非空）；fl 无续接不走本段（condRows 已在编码段直接加噪）。
+            if !refBlocks.isEmpty {
+                pieces.append(clean)                                 // 本节点 refImg 行（fl 首尾帧 / ref 参考图统一）
+                piecesInjected.append(clean)
+            }
+            if let preRef = continuationRefRows {
+                pieces.append(preRef)
+                piecesInjected.append(preRef)
+            }
+            // ★ 2026-10-02 history 行（前置尾段去末帧整段 latent）：布局 contRefs .video 段在
+            //   preRef 之后，行序严格对齐；不入 piecesInjected（由缓存 latent 派生，不落盘为条件行）。
+            if let hr = continuationHistoryRows, hr.shape[0] > 0 {
+                pieces.append(hr)
+            }
+            let merged = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
+            let mergedInjected = piecesInjected.count == 1 ? piecesInjected[0] : concatenated(piecesInjected, axis: 0)
+            MLX.eval(merged, mergedInjected)
+            let augNoise = MLXRandom.normal(merged.shape, key: MLXRandom.key(seed))
+            let augA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), merged)
+            let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), merged)
+            condRows = merged * augA + augNoise * augB
+            MLX.eval(condRows)
+            log("★ 条件直接注入：boundary \(contKeyRows?.shape ?? []) + ownRef（fl 硬锚恒空 refBlocks；ref 走 refImg）\(refBlocks.isEmpty ? "∅" : String(describing: clean.shape)) + preRef \(continuationRefRows?.shape ?? []) + history \(continuationHistoryRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 boundary/history = \(mergedInjected.shape)；前置条件行已不注入条件区）")
+            injectedCondRowsClean = mergedInjected
+            // 透传段序与注入行严格一致：本节点 refImg（fl/ref 统一）+ 前置 ref（前置条件行已不注入）
+            injectedCondIDs = ownCondIDs + keptPreRefIDs
+            injectedCondSpans = ownCondSpans + keptPreRefSpans
+            injectedCondModes = ownCondModes + [UInt8](repeating: 1, count: keptPreRefIDs.count)
+            injectedCondHs = ownCondHs + keptPreRefHs
+            injectedCondWs = ownCondWs + keptPreRefWs
+        } else if continuationActive {
+            // ★ 2026-09-20 续接空图：本节点无干净条件行（纯续接链），仅注入前置 .h3cc 去重保留的条件段
+            var pieces: [MLXArray] = []
+            var piecesInjected: [MLXArray] = []
+            // ★ 2026-10-03 前置不再进入条件区（同分支1口径），保留末帧锚 + history 时间轴注入
+            if let tail = contKeyRows { pieces.append(tail) }
+            //   ★ 2026-09-23 修复：采样条件行含 contKeyRows（布局 keyframes 段恒含锚点），但落盘透传
+            //   的 clean 条件行只记「preCond + preRef」（与分支1同口径，spans 对齐），否则 save 校验
+            //   spans.reduce(+) == rows 失败 → .h3cc 不落盘 → 下游无缓存可续接。
+            if let preRef = continuationRefRows {
+                pieces.append(preRef)
+                piecesInjected.append(preRef)
+            }
+            // ★ 2026-10-02 history 行（同分支1：不入落盘透传段）
+            if let hr = continuationHistoryRows, hr.shape[0] > 0 {
+                pieces.append(hr)
+            }
+            if pieces.isEmpty {
+                // 理论上不应发生（上游有图必有条件行）；兜底零行，走纯 latent 窗口续接
+                condRows = MLXArray.zeros([0, Int(cfg.videoPatchDim)], dtype: .float32)
+                MLX.eval(condRows)
+                injectedCondRowsClean = nil
+                injectedCondIDs = []
+                injectedCondSpans = []
+                injectedCondModes = []
+                injectedCondHs = []
+                injectedCondWs = []
+                log("续接空图：无任何条件行可注入，纯 latent 窗口续接（零行占位）")
+            } else {
+                let merged = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
+                MLX.eval(merged)
+                let augNoise = MLXRandom.normal(merged.shape, key: MLXRandom.key(seed))
+                let augA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), merged)
+                let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), merged)
+                condRows = merged * augA + augNoise * augB
+                MLX.eval(condRows)
+                if piecesInjected.isEmpty {
+                    // ★ 2026-10-03 前置已不注入条件区，且无参考块可落盘 → 透传置 nil（纯 latent 窗口续接）
+                    injectedCondRowsClean = nil
+                    injectedCondIDs = []
+                    injectedCondSpans = []
+                    injectedCondModes = []
+                    injectedCondHs = []
+                    injectedCondWs = []
+                    log("续接空图：无参考块可落盘，条件行仅采样注入（落盘透传置 nil）")
+                } else {
+                    let mergedInjected = piecesInjected.count == 1 ? piecesInjected[0] : concatenated(piecesInjected, axis: 0)
+                    MLX.eval(mergedInjected)
+                    injectedCondRowsClean = mergedInjected
+                    injectedCondIDs = keptPreRefIDs
+                    injectedCondSpans = keptPreRefSpans
+                    injectedCondModes = [UInt8](repeating: 1, count: keptPreRefIDs.count)
+                    injectedCondHs = keptPreRefHs
+                    injectedCondWs = keptPreRefWs
+                    log("续接空图条件注入：preRef \(continuationRefRows?.shape ?? []) = \(merged.shape)（统一 aug noise；落盘条件行不含 contTail = \(mergedInjected.shape)）")
+                }
+            }
+        } else if condRowsClean == nil {
+            // ★ 2026-09-20 文本生成（文生视频）：无图、无续接（.h3cc 未命中），零条件行占位，
+            //   采样仅由 text 条件驱动（官方 t2v 语义）。
+            condRows = MLXArray.zeros([0, Int(cfg.videoPatchDim)], dtype: .float32)
+            MLX.eval(condRows)
+            injectedCondRowsClean = nil
+            injectedCondIDs = []
+            injectedCondSpans = []
+            injectedCondModes = []
+            injectedCondHs = []
+            injectedCondWs = []
+            log("文本生成：无任何条件行注入，纯文生视频（condRows 零行占位 [0, \(cfg.videoPatchDim)]）")
+        }
+        // ★ 2026-10-07 fl 硬锚+视觉块（社区口径）：fl 首尾帧场景追加 [.first,.last] 硬锚——
+        //   .first 钉 target 首帧（cursor 起点）、.last 钉 target 末帧（cursor+spans-frameRescale，
+        //   社区 targetOrigin+temporalSpan-frameSpanScale 同式）；配合视觉块/标签软引导；
+        //   ref+续接（continuationSource 非 nil）恒走 contKeyAnchors，完全不受影响。
+        let layoutKeyframes = flSoftPair ? [.first, .last] + contKeyAnchors : contKeyAnchors
+        let layout = PackedLayout(textLen: UInt32(textHidden.shape[0]),
+                                  // ★ 2026-09-21 续接改 keyframe 锚点路线：布局只含新段 latentT（前置窗口由
+                                  //   keyframe/refAudio 条件约束），与 SelfLift layoutLatT 同口径，避免非
+                                  //   SelfLift 路径按旧初值拼窗口后行数错位。
+                                  latentT: UInt32(latentT), latentH: UInt32(latH), latentW: UInt32(latW),
+                                  audioT: audioT,
+                                  keyframes: layoutKeyframes,
+                                  frameCount: effFrameCount,
+                                  refs: refBlocks,
+                                  contRefs: contRefBlocks,
+                                  preCondRows: 0)   // ★ 2026-10-03 前置不再进入条件区，preCondRows 恒 0
+        // ★ 行数对齐断言：注入的 condRows 行数必须 == 布局 cond/refImg 段总行数。
+        // 续接位置编码错位的回归防线（此前 ref2va 前置行被塞 .cond 段导致行序错乱）。
+        if continuationActive {
+            let condRowsTotal = Int(layout.condSegmentRows)
+            let injectedTotal = Int(condRows?.shape[0] ?? 0)
+            guard condRowsTotal == injectedTotal else {
+                throw NSError(domain: "H3PIPELINE", code: 99,
+                              userInfo: [NSLocalizedDescriptionKey:
+                                "续接条件行与布局段行数不对齐：condRows=\(injectedTotal) layout=\(condRowsTotal)（续接错位回归）"])
+            }
+        }
+        if !textTagsForLayout.isEmpty {
+            layout.textTags = textTagsForLayout
+            log("\(useRef2VA ? "ref2va" : "fl2va（硬锚+视觉块）") 布局：text \(textHidden.shape[0]) + keyframes \(layoutKeyframes.count) 锚 + refs \(refBlocks.count) 参考块 + video/audio 目标")
+        }
+
+        // sigma 调度：official = 官方 shift 公式；betaRefined = Beta 分布 + 余弦尾段精修
+        // （betaRefinedSchedule 内部保证非零档数 = steps，末位补 0，可直接对位使用）
+        var sigmas: [Double]
+        switch scheduleStyle {
+        case .official:
+            sigmas = sigmaSchedule(steps: steps, shift: cfg.sigmaShiftVideo)
+        case .betaRefined:
+            sigmas = betaRefinedSchedule(totalSteps: Int(steps),
+                                         shift: cfg.sigmaShiftVideo,
+                                         extraSteps: 1,
+                                         startAtSigma: 0.7,
+                                         spacing: .cosine)
+        }
+        // ★ 续接调度（2026-09-21 改，2026-10-03 定稿）：前置尾段改走 keyframe 锚点
+        //   （never-denoised 条件行）+ 参考块，不再作为采样初值加噪对齐——新段纯噪声起步，
+        //   按正常调度跑满本节点 latT（续接初值恒 nil，videoX 只含新段，无需裁剪）。
+        var stage1SegmentCount = sigmas.count - 1
+        let tsList = collectScheduleTs(layout: layout, sigmas: sigmas,
+                                       shiftV: cfg.sigmaShiftVideo, shiftA: cfg.sigmaShiftAudio,
+                                       aug: CondNoiseAug())
+        var refined = MLXArray(0)
+        var refinedNeg: MLXArray? = nil
+        autoreleasepool {
+            dit!.precomputeAdaln(ts: tsList)
+            refined = dit!.refineText(textHidden)
+            // ★ CFG negative 经同一 refineText 变换后 pad 到 positive 相同行数（= textLen），
+            //   复用同一 layout/rope/plan：PackedLayout 的 text 段固定占 textLen 行，negative
+            //   行数不足会平移后续 video/audio 行的时间坐标，两路 forward 不在同一坐标系。
+            if var neg = textHiddenNeg {
+                MLX.eval(neg)
+                if neg.shape[0] < refined.shape[0] {
+                    let pad = MLXArray.zeros([refined.shape[0] - neg.shape[0], neg.shape[1]], dtype: neg.dtype)
+                    neg = concatenated([neg, pad], axis: 0)
+                } else if neg.shape[0] > refined.shape[0] {
+                    neg = neg[0..<refined.shape[0], 0..<neg.shape[1]]
+                }
+                refinedNeg = dit!.refineText(neg)
+                MLX.eval(refinedNeg!)
+                log("SelfLift CFG negative refined：\(refined.shape) → pad → \(refinedNeg!.shape)")
+            }
+            MLX.eval(refined)
+            h3MemLog("DiT 就绪（pool 内）")
+        }
+        let rope = buildRope(layout: layout, invFreq: dit!.invFreq, dtype: PrecisionPolicy.defaultMainDType)
+        h3MemLog("DiT 就绪（pool drain 后）")
+        log("DiT 就绪：refined \(refined.shape)，schedule \(sigmas)")
+
+        // 稀疏注意力开关（由调用方传入）：.off = 50 层全稠密 SDPA；
+        // .mix = 官方策略，anchor 层 dense、其余交替 spatial/temporal。
+        dit!.sparsePolicy = sparsePolicy
+        let policyDesc: String
+        switch sparsePolicy {
+        case .off: policyDesc = "off（50 层全部稠密 SDPA）"
+        case .mix: policyDesc = "mix（首尾2/中间2层 dense anchor，其余交替 spatial/temporal）"
+        case .spatial: policyDesc = "spatial（全部层帧内空间注意力）"
+        case .temporal: policyDesc = "temporal（全部层跨帧时间注意力）"
+        }
+        log("稀疏注意力策略：\(policyDesc)")
+        if let gp = sparseGatePercent {
+            log("稀疏门控：progress ∈ (\(gp.start), \(gp.end)) 中段稀疏，两端整步 dense（\(gp.start * 100)% 前 / \(gp.end * 100)% 后）")
+        } else {
+            log("稀疏门控：关闭（全程按稀疏策略执行）")
+        }
+
+        let nVideoRows = Int(latentT) * gridH * gridW
+        let vpatch = cfg.videoPatchDim
+        let nAudioRows = Int(audioT * 2)
+        var videoX: MLXArray
+        var audioX: MLXArray
+        // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线）：新段纯噪声起步，前置画面由
+        //   contKeyAnchors 条件行锚 + contRefBlocks/continuationHistoryRows 参考块约束。
+        videoX = MLXRandom.normal([nVideoRows, vpatch], key: MLXRandom.key(seed))
+        audioX = MLXRandom.normal([nAudioRows, 32], key: MLXRandom.key(seed &+ 1))
+        MLX.eval(videoX, audioX)
+        log("初始 latent：video \(videoX.shape)，audio \(audioX.shape)")
+        // ★ 2026-09-20 零行保护：文本生成/纯续接空图的 condRows 可能为 0 行，mean/std 跳过防崩
+        let cMean: Float = condRows.shape[0] > 0 ? condRows.mean().item() : 0
+        let cVar: Float = condRows.shape[0] > 0
+            ? ((condRows * condRows).mean() - condRows.mean() * condRows.mean()).item() : 0
+        let vMean: Float = videoX.mean().item()
+        let vVar: Float = ((videoX * videoX).mean() - videoX.mean() * videoX.mean()).item()
+        log("STAT condRows mean=\(cMean) std=\(cVar.squareRoot()) videoX mean=\(vMean) std=\(vVar.squareRoot())")
+
+        let sv = cfg.sigmaShiftVideo
+        let sa = cfg.sigmaShiftAudio
+        // PAB 全程接入：创建跨步缓存，按 k 间隔刷新调度走（复用上一步同层 attention 输出，
+        // 跳过 norm1+qkv+rope+attn；warmup/tail 仍保护首尾步）。env 可关/可调做对照。
+        let pabK: UInt32 = {
+            if ProcessInfo.processInfo.environment["NA_H3_PAB"] == "0" { return 0 }
+            if let s = ProcessInfo.processInfo.environment["NA_H3_PAB_K"], let v = UInt32(s) { return v }
+            return attentionBroadcastK
+        }()
+        let pab1: H3AttnBroadcast? = pabK > 1 ? H3AttnBroadcast(count: dit!.blocks.count) : nil
+        // ── 3.1 SelfLift 第三分支（H3 一采渐进式采样，实现在 SelfLiftH3-(h3专属).swift）─────
+        // ⚠️⚠️ 本机主流链路 = 完整 SelfLift 渐进采样（H3 内部低分×0.5 前缀 + 零 NFE 过渡 +
+        // 高分收尾，直出全清），不使用 LTX 二采桥接。任何内存/swap/二采分析必须以
+        // SelfLift 分支为基准，严禁把本链路描述为「LTX 二采」或引用 LTX DiT 缓存。
+        // 低分（×0.5）跑 ts 次 NFE → 零 NFE 过渡块（官方 H3 路径 nearest 直接 latent 提升 +
+        // VAE 像素锚点一致修正，ρ=0.6）→ 升回全分辨率 → 高分跑 N-ts 次 NFE；
+        // 不变量：低分 NFE + 高分 NFE = N（总 NFE 与单遍路径一致，加速来自低分单步算力下降）。
+        // ts 不写死：transitionStep = 0 → 官方 75% 规则按 N 推导（N 来自面板第一阶段总步数滑杆）。
+        // 过渡块的像素锚点需要在采样中途做一次 VAE decode→encode，故此处临时加载 video_vae，
+        // 过渡块跑完立即置 nil + clearCache（与 1./2. 段 keyframe 编码同一「用后即释」范式）。
+        // ★ 续接 × SelfLift 正交（2026-09-20）：续接不再禁用 SelfLift——Runner 接收前置尾段
+        //   NCDHW latent，降采样拼为低清段前缀初值，整段（前置窗口 + 新段）统一走
+        //   「低分×0.5 → 过渡 → 高分」，与单次生成完全同构（「续接 = 无数个单次」）。
+        //   续接激活时低清曲线强制独立，避免官方 75% 规则吃掉被压缩成 N=2 的调度。
+        // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线）：前置尾段不拼进采样初值，只走
+        //   条件行锚/参考块，videoX 只含本节点新段行，无需裁前置窗口行。
+        if selfLiftEnabled, continuationActive || stage1SegmentCount >= 2 {
+            // 显式覆盖仅 transitionStep = 0（自动）；lowResScale/rho/wMin/wMax 取 SelfLiftConfig 默认＝官方 H3 建议起点；
+            // NA_H3_SELFLIFT_RHO / NA_H3_SELFLIFT_WMIN / NA_H3_SELFLIFT_WMAX 可覆盖。
+            // 默认 rho=0.0（官方默认）：learned upscaler 纯 z_lat 提升，不混合像素锚点。
+            // 决定性实验（NA_H3TEST=26，1344×768×39 帧同 seed 同场景）：learned+rho=0 前后段逐帧全干净，
+            // 而 rho=0.25/0.6/0.9 均有 z_pix VAE 往返伪影注入（运动剧烈后段背景角色双轮廓/鬼影）；
+            // 官方 SelfLiftH3Sampler 默认即 rho=0，像素锚点为可选增强（默认关闭）。
+            // NA_H3_SELFLIFT_RHO / NA_H3_SELFLIFT_WMIN / NA_H3_SELFLIFT_WMAX 可覆盖。
+            let envRho = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_RHO"].flatMap(Double.init)
+            let envWMin = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_WMIN"].flatMap(Float.init)
+            let envWMax = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_WMAX"].flatMap(Float.init)
+            let slCfgBase = SelfLiftConfig(enabled: true,
+                                           transitionStep: 0,
+                                           rho: envRho ?? 0.0,
+                                           wMin: envWMin ?? 1.0,
+                                           wMax: envWMax ?? 1.0)
+            // ★ CFG 引导（2026-09-18 重影根因修复，对齐官方 SelfLiftH3Sampler cfg=5.0）：
+            //   NA_H3_SELFLIFT_CFG 显式覆盖；缺省 0（关闭）——2026-09-18 实测 cfg=5.0 对 600 turbo
+            //   LoRA（蒸馏模型，训练目标 cfg=1）过强：高对比度马赛克/过曝/网格噪点，画面崩坏；
+            //   官方 cfg=5.0 面向原版 H3（非 turbo）。保留机制供显式实验（小值 1.5~3.0 可试）。
+            let envCfgScale = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_CFG"].flatMap(Double.init) ?? 0.0
+            var slCfg = slCfgBase
+            // Runner 已收敛为唯一调度（makeFixedFinalStep），历史解耦 A/B 实验开关（LOW_STEPS /
+            // HIGH_STEPS / HIGH_START）不再被消费；仅 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖 σ_k（默认 0.93）。
+            let decoupleEnv = ProcessInfo.processInfo.environment
+            if let lowK = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_LOW_K"].flatMap(Double.init) {
+                slCfg.decoupleSigmaK = lowK
+                log("SelfLift σ_k 覆盖：NA_H3_SELFLIFT_DECOUPLE_LOW_K=\(lowK)（默认 0.93）")
+            }
+            slCfg.cfgScale = envCfgScale
+            if envCfgScale > 0 {
+                log("SelfLift CFG：cfg=\(envCfgScale)（每步 positive+negative 双 forward；注意 turbo LoRA 蒸馏模型 cfg 过大会过冲）")
+            } else {
+                log("SelfLift CFG：关闭（cfg=0，仅 positive 单路；NA_H3_SELFLIFT_CFG=1.5~3.0 可显式实验）")
+            }
+            let slSigmaK = slCfg.decoupleSigmaK ?? 0.935
+            log("SelfLift 第三分支：开启（用户设计调度：低清 N-1=\(stage1SegmentCount - 1) 步线性到 σ_k=\(slSigmaK)，高清固定 1 步 σ_k→0，总 NFE=\(stage1SegmentCount)；低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
+            // 像素锚点 VAE（decoder + encoder，bf16 实测 ≈5.3GB）只服务过渡块的
+            // decode→encode 往返；rho=0（needsPixelAnchor=false）时 liftPixelAnchor 为
+            // nil、不会调用 hooks 的 decode/encode，故按需加载，rho=0 直接省掉这 5.3GB。
+            // lowOnly 模式（IC 链路）连过渡块都不跑，同样跳过 VAE 加载。
+            var slVaeWeights: H3Weights?
+            var slVae: H3VAE?
+            if slCfg.needsPixelAnchor && !selfLiftLowOnly {
+                slVaeWeights = try H3Weights(url: wURL("video_vae.safetensors"))
+                slVaeWeights?.cacheEnabled = false
+                slVae = try H3VAE.load(slVaeWeights!)
+                h3MemLog("SelfLift 像素锚点 VAE 已加载（≈5.3GB，仅过渡块使用）")
+            } else {
+                h3MemLog("SelfLift ρ=0：跳过像素锚点 VAE 加载（省 ≈5.3GB）")
+            }
+            let slHooks = SelfLiftH3Hooks(
+                decodeToPixels: { px in
+                    guard let vae = slVae else {
+                        fatalError("SelfLift: needsPixelAnchor=false（rho=0）时像素锚点解码不应被调用")
+                    }
+                    return vae.decoder.decode(px)
+                },
+                encodeToLatent: { z in
+                    guard let vae = slVae else {
+                        fatalError("SelfLift: needsPixelAnchor=false（rho=0）时像素锚点编码不应被调用")
+                    }
+                    return vae.encoder.encodeVideo(z)
+                },
+                // ★ 像素锚点 VAE（decoder + encoder，bf16 实测 ≈5.3GB）只服务过渡块；
+                //   Runner 在过渡块出口屏障（已 Stream.gpu.synchronize()）后回调此处提前置 nil，
+                //   把这 5.3GB 从高分段（全分辨率 ~39k token × 高分 NFE）基线里摘掉。
+                //   只放手：**不 clearCache、不动 cacheLimit**（撤销依据见 SelfLiftH3 入口屏障注释 ①②）；
+                //   放掉的权重 buffer 落进空闲池，被高分段每步中间量命中复用。
+                releasePixelVAE: { slVae = nil; slVaeWeights = nil })
+            // ★ 2026-10-07 fl 硬锚+视觉块：fl 双端硬锚（[.first,.last]）走 layout 默认几何——
+            //   keyframeSpans/Grids 恒 nil（默认 frameRows + 目标网格，与注入行数一致）；
+            //   SelfLift 两布局 keyframes 段由 contKeyAnchors 参数同源重建。
+            let flKeyframeSpansHigh: [UInt32]? = nil
+            let flKeyframeGridsHigh: [(h: [Double], w: [Double])?]? = nil
+            let slOut = try runH3Stage1WithSelfLift(
+                dit: dit!,
+                textStates: refined,
+                condRowsFull: condRows,
+                refBlocks: refBlocks,
+                textTags: textTagsForLayout,
+                latT: Int(latentT),
+                latH: latH,
+                latW: latW,
+                latC: latC,
+                audioT: audioT,
+                textLen: UInt32(textHidden.shape[0]),
+                frameCount: effFrameCount,
+                sigmas: sigmas,
+                shiftV: sv,
+                shiftA: sa,
+                seed: seed,
+                sparsePolicy: sparsePolicy,
+                attentionBroadcastK: pabK,
+                cfg: slCfg,
+                hooks: slHooks,
+                log: log,
+                lowOnly: selfLiftLowOnly,
+                textStatesNeg: refinedNeg,
+                // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线），不再显式传参。
+                continuationWinLatentT: continuationWinLatentT,
+                // ★ 2026-10-07 fl 硬锚+视觉块：contKeyAnchors = layoutKeyframes（fl 双端 [.first,.last]；
+                //   ref+续接恒 [.first]）。
+                contKeyAnchors: layoutKeyframes,
+                preCondRows: 0,                          // ★ 2026-10-03 前置不再进入条件区
+                preRefBlocks: contRefBlocks.filter { $0.kind != .audio },
+                audioContinuationRows: continuationAudioRows,   // ★ 2026-09-21 音频续接：refAudio 锚点（nil=旧缓存回退噪声）
+                keyframeSpansHigh: flKeyframeSpansHigh,
+                keyframeGridsHigh: flKeyframeGridsHigh)
+                // 注：contRefBlocks 中新增的 .audio 块仅供主高清布局（contRefs）生成 refAudio 段；
+                //   SelfLift 的音频参考由 audioContinuationRows 参数独立注入（contAudioRef），
+                //   且其 allRefBlocks 支持 image + video（history）块（SelfLiftH3 切行分支），
+                //   故此处过滤 .audio 避免回归。
+            videoX = slOut.videoX
+            audioX = slOut.audioX
+            MLX.eval(videoX, audioX)
+            slVae = nil
+            slVaeWeights = nil
+            MLX.Memory.clearCache()
+            h3MemLog("SelfLift 像素锚点 VAE 已释放（回到全分辨率 \(latW)×\(latH) latent）")
+        } else {
+            if !selfLiftEnabled {
+                log("SelfLift 第三分支：关闭，走原单条 stage1 循环（单遍直出）")
+            } else {
+                // 续接激活但 N<2，或未续接 N<2：均无法切分低分/高分两段，走原单条 stage1 循环
+                log("SelfLift 第三分支：N=\(stage1SegmentCount) < 2，无法切分低分/高分两段，走原单条 stage1 循环")
+            }
+        for i in 0..<stage1SegmentCount {
+            let stepT = Date()
+            // 分阶段门控（默认已取消）：sparseGatePercent 为 nil 时走 else 分支 —— 全程
+            // sparsePolicy，不做任何整步 dense 回退；【已取消实验参数】全工程无调用点，
+            // 恒不生效，此处 gateOn 恒 false；仅当调用方显式传入 (start, end) 时才启用
+            // ComfyUI 式 sigma 门控（progress = i/steps 与 percent_to_sigma 阈值同构，
+            // 0~start% 与 end~100% 整步回退全 dense SDPA，中间段才走稀疏 tau 路由）。
+            var gateMode = "sol"
+            var gateOn = sparseGatePercent != nil
+            if let e = ProcessInfo.processInfo.environment["NA_H3_SPARSE_GATE"], e == "0" { gateOn = false }
+            if gateOn, let gp = sparseGatePercent {
+                let progress = Float(i) / Float(stage1SegmentCount)
+                let denseStep = progress < gp.start || progress > gp.end
+                dit!.sparsePolicy = denseStep ? .off : sparsePolicy
+                gateMode = (denseStep || sparsePolicy == .off) ? "dense" : "sparse"
+            } else {
+                dit!.sparsePolicy = sparsePolicy
+            }
+            let sigma = sigmas[i]
+            let dsigma = sigmas[i + 1] - sigmas[i]
+            let plan = buildTimestepPlanGlobal(layout: layout, sigmaV: sigma, shiftV: sv, shiftA: sa,
+                                               aug: CondNoiseAug(), globalTs: dit!.adalnTables!.ts)
+            let videoIn = concatenated([condRows, videoX], axis: 0)
+            // ★ 2026-09-23 主高清音频参考注入（与视频 keyframe 同款）：前置真实音频行
+            //   （layout refAudio 段，never-denoised）在 forward 输入侧拼到本节点 audioX 之前，
+            //   不进状态变量 → Euler 只更新本节点行、参考行天然 frozen；无解码前裁切。
+            let audioIn: MLXArray
+            if let preA = continuationAudioRows, preA.shape[0] > 0 {
+                audioIn = concatenated([preA, audioX], axis: 0)
+                MLX.eval(audioIn)
+            } else {
+                audioIn = audioX
+            }
+            let attnRefresh = pab1 == nil ? false : attnBroadcastRefresh(i, steps: UInt32(stage1SegmentCount), k: pabK)
+            let pabMark = pab1 == nil ? "" : (attnRefresh ? " bcastRefresh[blk]" : " bcastReuse[blk]")
+            let out = dit!.forward(layout: layout, plan: plan, textStates: refined,
+                                   videoRows: videoIn, audioRows: audioIn, rope: rope,
+                                   sigmaV: sigma, shiftV: sv, shiftA: sa,
+                                   attnBcast: pab1, attnRefresh: attnRefresh)
+            h3DumpRowStats("step\(i)_out_video", out.video, limitRows: 64)
+            h3DumpRowStats("step\(i)_out_audio", out.audio, limitRows: 64)
+            // Euler：x += out.video·dsigma（turbo 音频用精确 Δσa/slope，
+            // 因为 out.audio 已携带 dσa/dσv 缩放，见 Zig audioStepFactor）
+            videoX = videoX + out.video * H3TensorOps.scalarLike(Float(dsigma), out.video)
+            let slopeAF = timeShiftSlope(sigma, fromShift: sv, toShift: sa)
+            let da = (timeShiftSigma(sigmas[i + 1], fromShift: sv, toShift: sa)
+                   - timeShiftSigma(sigma, fromShift: sv, toShift: sa)) / slopeAF
+            audioX = audioX + out.audio * H3TensorOps.scalarLike(Float(da), out.audio)
+            MLX.eval(videoX, audioX)
+            log("step \(i + 1)/\(stage1SegmentCount) sigma \(String(format: "%.4f", sigma)) dsigma \(String(format: "%.4f", dsigma)) [\(gateMode)\(pabMark)]（\(Int(-Date().timeIntervalSince(stepT)))s）")
+        }
+        }   // ← 原单条 stage1 循环结束（SelfLift 第三分支的开/else 收口）
+
+        // ★ 续接裁切：采样完成（σ=0）后只保留本节点新段（输出时长 = 本节点时长）。
+        if continuationActive {
+            // ★ 2026-10-03 fresh-noise 路线（续接初值恒 nil）：videoX 只含本节点新段行，
+            //   无需裁 video 窗口行（旧 warmStart 初值路线已删除）。
+            // （2026-10-03 已移除 hard-boundary latent 末行直通：首锚现由末帧像素 encodeImage
+            //   重编码的单帧 keyframe latent 承担，见续接解析段 contKeyAnchors/.first。）
+            let aTotal = audioX.shape[0]
+            // ★ 2026-09-21 音频续接：有真实前置音频（refAudio 锚点路线）时 Runner 内已裁掉
+            //   前置行，audioX 只含本节点行，此处不再裁（与 video keyframe 锚点路线对称）；
+            //   仅旧缓存回退噪声路线（无前置音频 latent）才裁前置窗口行。
+            let aWinRows = (continuationAudioRows != nil) ? 0 : Int(continuationWinAudioT * 2)
+            let aKeep = Int(audioT * 2) - aWinRows
+            if aWinRows > 0 {
+                audioX = audioX[aWinRows..<aTotal, 0..<32]
+            }
+            MLX.eval(videoX, audioX)
+            log("★ 续接裁切：video 保留后 \(videoX.shape[0]) 行（本节点，无 video 窗口裁切），audio 保留 \(aKeep) 行（总 \(aTotal)）")
+        }
+
+        let pvMean: Float = videoX.mean().item()
+        let pvVar: Float = ((videoX * videoX).mean() - videoX.mean() * videoX.mean()).item()
+        log("STAT post videoX mean=\(pvMean) std=\(pvVar.squareRoot())")
+
+        // 诊断 dump（NA_DUMP_LATENT=1）：采样后 latent 与 cond rows 原始 float32
+        if ProcessInfo.processInfo.environment["NA_DUMP_LATENT"] == "1" {
+            let vx = videoX.asType(.float32)
+            let cr = condRows.asType(.float32)
+            MLX.eval(vx, cr)
+            let vxF = vx.asArray(Float.self)
+            let crF = cr.asArray(Float.self)
+            let vxData = Data(bytes: vxF, count: vxF.count * MemoryLayout<Float>.size)
+            let crData = Data(bytes: crF, count: crF.count * MemoryLayout<Float>.size)
+            try vxData.write(to: URL(fileURLWithPath: "/tmp/h3_videox_raw.bin"))
+            try crData.write(to: URL(fileURLWithPath: "/tmp/h3_condrows_raw.bin"))
+            log("DIAG dumped videoX [\(videoX.shape)] \(vxF.count) floats → /tmp/h3_videox_raw.bin, condRows \(crF.count) floats → /tmp/h3_condrows_raw.bin")
+        }
+
+        log("采样完成")
+
+        // ── 4.5 Stage2（可选）：H3 latent 空间放大 + 加噪 refine（官方两段式）──
+        // stage1 已跑到 σ=0 得到 clean 行 latent；本段在 latent 域内做
+        // 几何空间×scale → 按 refineSigmas 起点加噪 → 低步 Euler 精修，
+        // 全程不落地像素，最终 zForDecode 直接喂 VAE decode（行数按放大网格重建）。
+        var zForDecode: MLXArray
+        if selfLiftLowOnly, selfLiftEnabled, stage1SegmentCount >= 2 {
+            // SelfLift lowOnly：runner 已直接返回低清 NCDHW latent [1,C,T,latHl,latWl]（半清网格），
+            // 不再是全清 rows——stage2 放大与 rows→zlat reshape 全部跳过；
+            // 高分（升频×2 + 精修）在 LTX 二采侧完成（fullResInput=false）。
+            // ⚠️ 本机不使用 lowOnly（那是「H3 低分 + LTX 高分」两模型 lift 的预留口）；
+            // 用户主流 = 上方 3.1 完整 SelfLift 第三分支（H3 内部低分+过渡+高分直出全清），
+            // 不经过 LTX 二采。此分支仅为历史/实验保留，swap 分析勿归因到 LTX。
+            zForDecode = videoX
+            MLX.eval(zForDecode)
+            log("SelfLift lowOnly：直接采用低清 zForDecode \(zForDecode.shape)（半清，高分交由 LTX 二采升频×2 + IC 精修）")
+        } else if let s2cfg = stage2, s2cfg.scale > 1 {
+            let sc = s2cfg.scale
+            guard sc == 2 else {
+                throw NSError(domain: "H3FL2VA", code: 12,
+                              userInfo: [NSLocalizedDescriptionKey: "Stage2 目前仅支持 scale=2"])
+            }
+            let fRows = gridH * gridW                  // 低清每帧行数（cond 单帧 = fRows）
+            let vpatch = videoX.shape[1]
+            let H2 = latH * sc
+            let W2 = latW * sc
+            let gH2 = gridH * sc
+            let gW2 = gridW * sc
+            let nVideoRows2 = Int(latentT) * gH2 * gW2
+            log("Stage2 开始：latent \(latC)×\(latentT)×\(latH)×\(latW) → ×\(sc) → \(latC)×\(latentT)×\(H2)×\(W2)，refine \(s2cfg.refineSigmas.count - 1) 步 sigmas \(s2cfg.refineSigmas)")
+
+            // 0/①/② 几何双线性放大（b 基线同族：trilinear 空间 latent ×2，不加载学习型权重）
+            let videoX2: MLXArray
+            let condRows2: MLXArray
+            do {
+                // ① video 行 → zlat → 几何 ×2 放大 → 新网格行
+                let cleanVLat = H3TensorOps.unpatchifyVideo(videoX, gridH: gridH, gridW: gridW) // [T,h,w,C]
+                var zBig = cleanVLat.transposed(3, 0, 1, 2).reshaped([1, latC, Int(latentT), latH, latW]) // [1,C,T,h,w]
+                MLX.eval(zBig)
+                zBig = h3SpatialUpsample2x5D(zBig)                                           // [1,C,T,2h,2w]
+                let bigVLat = zBig.reshaped([latC, Int(latentT), H2, W2]).transposed(1, 2, 3, 0)  // [T,H2,W2,C]
+                videoX2 = H3TensorOps.patchifyVideo(bigVLat, gridH: gH2, gridW: gW2)          // [T*gH2*gW2, C*4]
+                MLX.eval(videoX2)
+                log("Stage2 视频 latent 放大完成：rows \(videoX.shape) → \(videoX2.shape)")
+
+                // ② cond rows（2 个 keyframe 单帧 latent）各自放大 → 新网格行
+                func upCondRows(_ rows: MLXArray) -> MLXArray {
+                    let l = H3TensorOps.unpatchifyVideo(rows, gridH: gridH, gridW: gridW) // [1,h,w,C]
+                    var zc = l.transposed(3, 0, 1, 2).reshaped([1, latC, 1, latH, latW])   // [1,C,1,h,w]
+                    zc = h3SpatialUpsample2x5D(zc)                                         // [1,C,1,2h,2w]
+                    let l2 = zc.reshaped([latC, 1, H2, W2]).transposed(1, 2, 3, 0)         // [1,H2,W2,C]
+                    return H3TensorOps.patchifyVideo(l2, gridH: gH2, gridW: gW2)
+                }
+                // ★ 2026-10-03 续接兼容：前置已不进入条件区，condRows 最前即本节点条件行。
+                // ★ 2026-10-04 重构提示：fl 首尾帧已软参考化（refImg 段，行数=参考图网格行数、
+                //   非固定 fRows），下方按 fRows 切双 keyframe 仅适用于显式双帧输入的对照/实验
+                //   （自检 p2 场景语义已变化）；生产路径不传 stage2，此分支仅为官方两段式放大保留。
+                var condChunks2: [MLXArray] = []
+                let condA = condRows[0 ..< fRows, 0 ..< vpatch]
+                let condB = condRows[fRows ..< (2 * fRows), 0 ..< vpatch]
+                condChunks2.append(upCondRows(condA))
+                condChunks2.append(upCondRows(condB))
+                condRows2 = concatenated(condChunks2, axis: 0)
+                MLX.eval(condRows2)
+                log("Stage2 cond rows 放大完成：\(condRows2.shape)（行数×\(sc * sc)）")
+            }
+
+            // ③ 重建 layout / rope / AdaLN 表（音频 T 不变，仅空间网格变化）
+            let layout2 = PackedLayout(textLen: UInt32(textHidden.shape[0]),
+                                       latentT: latentT, latentH: UInt32(H2), latentW: UInt32(W2),
+                                       audioT: audioT,
+                                       keyframes: [.first, .last],
+                                       frameCount: frameCount,
+                                       preCondRows: 0)   // ★ 2026-10-03 前置不再进入条件区
+            let sigmas2 = s2cfg.refineSigmas
+            guard sigmas2.count >= 2, sigmas2.last! == 0.0 else {
+                throw NSError(domain: "H3FL2VA", code: 13,
+                              userInfo: [NSLocalizedDescriptionKey: "Stage2 refineSigmas 必须 ≥2 项且末项为 0"])
+            }
+            let ts2 = collectScheduleTs(layout: layout2, sigmas: sigmas2,
+                                        shiftV: sv, shiftA: sa, aug: CondNoiseAug())
+            dit!.precomputeAdaln(ts: ts2)
+            let rope2 = buildRope(layout: layout2, invFreq: dit!.invFreq,
+                                  dtype: PrecisionPolicy.defaultMainDType)
+
+            // ④ 加噪：clean 行 → σ0 起点（flow：x = σ0·ε + (1-σ0)·x_clean，ε 派生种子）
+            let rSeed = s2cfg.refineSeed ?? (seed &+ 777)
+            let s0 = sigmas2[0]
+            let epsV = MLXRandom.normal([nVideoRows2, vpatch], key: MLXRandom.key(rSeed)).asType(videoX2.dtype)
+            var vx2 = videoX2 * H3TensorOps.scalarLike(Float(1.0 - s0), videoX2)
+            vx2 = vx2 + epsV * H3TensorOps.scalarLike(Float(s0), videoX2)
+            let sa0 = timeShiftSigma(s0, fromShift: sv, toShift: sa)
+            let epsA = MLXRandom.normal(audioX.shape, key: MLXRandom.key(rSeed &+ 1)).asType(audioX.dtype)
+            var ax2 = audioX * H3TensorOps.scalarLike(Float(1.0 - sa0), audioX)
+            ax2 = ax2 + epsA * H3TensorOps.scalarLike(Float(sa0), audioX)
+            MLX.eval(vx2, ax2)
+            log("Stage2 加噪完成：video σ0=\(s0)（audio σ0=\(sa0)），seed=\(rSeed)")
+
+            // ⑤ refine 低步 Euler（循环体与 stage1 一致，σ 走 refineSigmas；同样全程接 PAB，
+            // refine 通常仅 3~4 步，调度自然几乎全 refresh——无收益也无画质风险）
+            let pab2: H3AttnBroadcast? = pabK > 1 ? H3AttnBroadcast(count: dit!.blocks.count) : nil
+            for i in 0 ..< (sigmas2.count - 1) {
+                let stepT = Date()
+                let sigma = sigmas2[i]
+                let dsigma = sigmas2[i + 1] - sigmas2[i]
+                let plan = buildTimestepPlanGlobal(layout: layout2, sigmaV: sigma, shiftV: sv, shiftA: sa,
+                                                   aug: CondNoiseAug(), globalTs: ts2)
+                let videoIn = concatenated([condRows2, vx2], axis: 0)
+                let attnRefresh2 = pab2 == nil ? false : attnBroadcastRefresh(i, steps: UInt32(sigmas2.count - 1), k: pabK)
+                let pabMark2 = pab2 == nil ? "" : (attnRefresh2 ? " bcastRefresh[blk]" : " bcastReuse[blk]")
+                let out = dit!.forward(layout: layout2, plan: plan, textStates: refined,
+                                       videoRows: videoIn, audioRows: ax2, rope: rope2,
+                                       sigmaV: sigma, shiftV: sv, shiftA: sa,
+                                       attnBcast: pab2, attnRefresh: attnRefresh2)
+                vx2 = vx2 + out.video * H3TensorOps.scalarLike(Float(dsigma), out.video)
+                let slopeAF = timeShiftSlope(sigma, fromShift: sv, toShift: sa)
+                let da = (timeShiftSigma(sigmas2[i + 1], fromShift: sv, toShift: sa)
+                       - timeShiftSigma(sigma, fromShift: sv, toShift: sa)) / slopeAF
+                ax2 = ax2 + out.audio * H3TensorOps.scalarLike(Float(da), out.audio)
+                MLX.eval(vx2, ax2)
+                log("Stage2 step \(i + 1)/\(sigmas2.count - 1) sigma \(String(format: "%.4f", sigma)) dsigma \(String(format: "%.4f", dsigma)) [bcast\(pabMark2 == "" ? "off" : pabMark2)]（\(Int(-Date().timeIntervalSince(stepT)))s）")
+            }
+            audioX = ax2
+
+            // ⑥ refine 后的行 → zlat [1,C,T,H2,W2]（decode 段宽高自动取新尺寸）
+            let s2Mean: Float = vx2.mean().item()
+            let s2Var: Float = ((vx2 * vx2).mean().asType(.float32) - vx2.mean() * vx2.mean()).item(Float.self)
+            log("Stage2 refine 后 STAT：videoX mean=\(s2Mean) std=\(s2Var.squareRoot())")
+            let finLat = H3TensorOps.unpatchifyVideo(vx2, gridH: gH2, gridW: gW2) // [T,H2,W2,C]
+            zForDecode = finLat.transposed(3, 0, 1, 2).reshaped([1, latC, Int(latentT), H2, W2])
+            MLX.eval(zForDecode)
+            log("Stage2 完成：zForDecode \(zForDecode.shape)（宽高 ×\(sc)）")
+        } else {
+            // 原单遍路径：行形式直接 reshape 成 zlat [1,C,T,H,W] 供 VAE 解码
+            let lh2 = latH / 2
+            let lw2 = latW / 2
+            let v6 = videoX.reshaped([Int(latentT), lh2, lw2, latC, 2, 2])
+            let vp = v6.transposed(3, 0, 1, 4, 2, 5)
+            zForDecode = vp.reshaped([1, latC, Int(latentT), latH, latW])
+        }
+
+        log("DiT 释放")
+        dit = nil
+        ditWeights = nil
+        // ★ 2026-10-07 清池前同步：DiT 最后一步采样 eval 提交的 command buffer 异步执行，
+        //   先同步落盘再 clearCache，避免 trim 释放仍被 GPU 队列引用的 buffer（跨生成 UAF）。
+        Stream.gpu.synchronize()
+        MLX.Memory.clearCache()
+
+        // ── 4.9 H3→LTX latent 直通适配器（可选）：在 VAE 解码之前拦截 clean latent ──
+        // 官方 H3-to-LTX-Latent-Adapter：H3 归一化 latent →［时间线性重采样 + 最近邻打包(3 槽)
+        // → 2× pixel-unshuffle → Conv3D 残差主干］→ LTX 归一化 latent，可直接进 LTX Stage2 refine。
+        // 一步替代「H3 VAE decode → 像素 → LTX VAE encode」两步像素往返。
+        // 适配器不改变采样结果，失败时自动回退原像素桥路径（不影响出片）。
+        var adapterActive = false
+        var adapterSkipDecode = false
+        var silentPath = proResOutput ? (outPath + ".silent.mov") : (outPath + ".silent.mp4")
+        var fCount = 0
+        var h = 0
+        var w = 0
+        if let adapter = h3ToLTXAdapter, let bridge = stage2MemBridge {
+            do {
+                let tA = Date()
+                let latShape = zForDecode.shape
+                let ltxLatent = try adapter.convert(h3LatentNCDHW: zForDecode, pixelFrames: Int(frameCount))
+                bridge.ltxHalfLatent = ltxLatent
+                bridge.adapterPixelWidth = latShape[4] * H3ToLTXAdapterConst.h3SpatialCompression
+                bridge.adapterPixelHeight = latShape[3] * H3ToLTXAdapterConst.h3SpatialCompression
+                adapterActive = true
+                adapterSkipDecode = adapterSkipH3Decode
+                let aSec = String(format: "%.1f", Date().timeIntervalSince(tA))
+                log("★ H3→LTX 适配器直通完成（\(aSec)s）：H3 latent \(latShape) → LTX latent \(ltxLatent.shape)"
+                    + "（等效像素 \(bridge.adapterPixelWidth)×\(bridge.adapterPixelHeight) @ \(frameCount) 帧）"
+                    + "，已省去 LTX VAE 编码\(adapterSkipH3Decode ? "与 H3 VAE 解码" : "")")
+            } catch {
+                adapterActive = false
+                adapterSkipDecode = false
+                stage2MemBridge?.ltxHalfLatent = nil
+                log("⚠️ H3→LTX 适配器不可用（\(error.localizedDescription)），回退像素桥路径（H3 decode → LTX encode）")
+            }
+        }
+
+        // ── 5. VAE 解码 + 写无声视频（proResOutput=true → .mov/ProRes422，否则 .mp4/h264；同一池内完成：像素大数组写完立即释放，再进音频段） ──
+        // adapter 直通且要求跳解码时不进此段：无 stage1 mp4，音轨改由 5.1 单独落 wav 承载。
+        if adapterActive && adapterSkipDecode {
+            h = stage2MemBridge?.adapterPixelHeight ?? 0
+            w = stage2MemBridge?.adapterPixelWidth ?? 0
+            fCount = Int(frameCount)
+            // 像素为空，但尺寸/帧率元数据仍需回填：二采据此推输出帧率与日志几何。
+            stage2MemBridge?.width = w
+            stage2MemBridge?.height = h
+            stage2MemBridge?.frameCount = fCount
+            stage2MemBridge?.fps = Int(H3Const.fps)
+            log("⏭️ adapter 直通模式：跳过 H3 VAE 解码，不写 stage1 视频文件"
+                + "（像素几何 \(w)×\(h) @ \(fCount) 帧，仅供 LTX 侧尺寸推导）")
+        } else {
+        var decWeights: H3Weights? = try H3Weights(url: wURL("video_vae.safetensors"))
+        var decoder: H3VAE? = try H3VAE.load(decWeights!)
+        try autoreleasepool {
+            var pixels = decoder!.decode(zForDecode)
+            MLX.eval(pixels)
+            log("VAE 解码完成：\(pixels.shape)")
+            fCount = pixels.shape[2]
+            h = pixels.shape[3]
+            w = pixels.shape[4]
+            // ★ 2026-10-03 v4 末帧像素（boundary .first 硬锚数据源）：截解码像素最后一帧
+            //   [1,3,1,H,W]（[-1,1]），随 .h3cc 落盘供下游 encodeImage 重编码成单帧 keyframe
+            //   latent 锚索引0。绝对清晰、绝对遵从前置；严禁低清 latent 升频结果或 latent 末行冒充。
+            if tailFrameEnabled {
+                let t = pixels.shape[2] - 1
+                let tf = pixels[0 ..< 1, 0 ..< 3, t ..< (t + 1), 0 ..< h, 0 ..< w].contiguous()
+                MLX.eval(tf)
+                tailFramePixels = tf
+            }
+            // 内存直通（方案 C）：stage1 像素帧不落盘，由 bridge 持有供像素桥直接 VAE 编码；
+            // 落盘为 ProRes 422 .mov（proResOutput=true，10bit v210；无二采时即最终产物，
+            // 有二采时作高质量预览/音轨源）。
+            if let bridge = stage2MemBridge {
+                bridge.pixels = pixels
+                bridge.width = w
+                bridge.height = h
+                bridge.frameCount = fCount
+                bridge.fps = Int(H3Const.fps)
+            }
+            // 先写纯视频轨（writeMp4 本身不含音频，此处不动视频编码路径），
+            // 随后单独解码 32kHz 立体声音频（audio_vae vocoder）并混入 outPath。
+            try writeMp4(frameCount: fCount, width: w, height: h, fps: Int(H3Const.fps), to: silentPath, proRes: proResOutput, h264MaxQuality: !proResOutput) { f, base, bytesPerRow, isV210 in
+                let frameArr = pixels[0 ..< 1, 0 ..< 3, f ..< (f + 1), 0 ..< h, 0 ..< w]
+                let squeezed = frameArr.reshaped([3, h, w])
+                // isV210 由 writeMp4 按 proRes 传入：ProRes → 10bit v210；h264 预览 → 原 8bit 32ARGB
+                return fillFrameForPixelBuffer(squeezed, width: w, height: h, base: base, bytesPerRow: bytesPerRow, isV210: isV210)
+            }
+        }
+        decoder = nil
+        decWeights = nil
+        // ★ 2026-10-07 清池前同步：解码最后一步 eval 提交的 command buffer 异步执行，
+        //   先同步落盘再 clearCache，保证收尾时 GPU 队列完全空闲、缓冲生命周期干净，
+        //   避免下一次点击生成时 VAE 编码 eval 引用已释放 MTLBuffer（preCommit UAF）。
+        Stream.gpu.synchronize()
+        MLX.Memory.clearCache()
+        log("无声视频已写出：\(silentPath)（\(fCount) 帧 \(w)×\(h)），VAE 解码器与像素数组已释放")
+        }
+
+        // ── 5.1 音频 vocoder 解码 + 混入音轨 ──
+        // 对齐 minimax_h3_audio.zig：audioRows [2T,32] → audioRowsToLatent
+        // → [1,32,2,T] → decode（BigVGAN）→ 波形 [S,L] → interleave WAV → mux。
+        do {
+            let aT = Int(audioT)
+            log("音频解码开始：latent rows \(audioX.shape)，audioT=\(aT) ...")
+            let aLatent = try H3AudioVAE.audioRowsToLatent(audioX, audioT: aT)   // [1,32,2,T]
+            let tA = Date()
+            let audioVAE = try H3AudioVAE.load(url: wURL("audio_vae.safetensors"))
+            let wave = try audioVAE.decode(aLatent)                              // [S,L] f32 [-1,1]
+            let aSec = Int(Date().timeIntervalSince(tA))
+            let frames = wave.shape[1]
+            log("音频解码完成（\(aSec)s）：wave \(wave.shape)（\(Float(frames) / Float(H3AudioConst.sampleRate))s @32kHz）")
+
+            // [S, L] → [L, S] interleaved f32 → wav（32kHz 立体声，RIFF f32）
+            let inter = wave.transposed(1, 0).contiguous()
+            let pcm = inter.asArray(Float.self)
+            let pcmMean = pcm.reduce(0, +) / Float(max(pcm.count, 1))
+            let pcmMax = pcm.map { abs($0) }.max() ?? 0
+            log("   波形 mean=\(pcmMean) maxAbs=\(pcmMax) NaN=\(pcm.contains { !$0.isFinite })")
+            let wavPath = outPath + ".wav"
+            writeWav(pcm, sampleRate: H3AudioConst.sampleRate,
+                     channels: H3AudioConst.stereoChannels, to: wavPath)
+            log("wav 已写出：\(wavPath)")
+            if adapterActive && adapterSkipDecode {
+                // adapter 直通：无 stage1 视频可混流，保留 wav 作为音轨载体，
+                // 由 LTX 二采在最终出片时混流（见 bridge.audioTrackPath）。
+                stage2MemBridge?.audioTrackPath = wavPath
+                log("音轨载体已保留（adapter 直通，无 stage1 视频文件）：\(wavPath)")
+            } else {
+                try muxAudio(videoPath: silentPath, wavPath: wavPath, to: outPath, proRes: proResOutput)
+                log("音轨已混入：\(outPath)")
+                try? FileManager.default.removeItem(atPath: wavPath)
+                try? FileManager.default.removeItem(atPath: silentPath)
+            }
+        } catch {
+            // 音频失败不丢视频：无声视频兜底保留为 outPath
+            log("⚠️ 音频解码/混流失败（\(error.localizedDescription)），保留无声视频")
+            if adapterActive && adapterSkipDecode {
+                log("   （adapter 直通模式无 stage1 视频，需由 LTX 侧无声产物兜底）")
+            } else {
+                if FileManager.default.fileExists(atPath: outPath) {
+                    try? FileManager.default.removeItem(atPath: outPath)
+                }
+                try? FileManager.default.moveItem(atPath: silentPath, toPath: outPath)
+            }
+        }
+        // 总耗时：分钟进制度（≥60s 显示 Xm Ys，否则仅 Xs）
+        let totalSec = Int(Date().timeIntervalSince(t0))
+        let totalStr = totalSec >= 60 ? "\(totalSec / 60)m \(totalSec % 60)s" : "\(totalSec)s"
+        if adapterActive && adapterSkipDecode {
+            let latShape = stage2MemBridge?.ltxHalfLatent?.shape ?? []
+            log("H3 阶段完成（adapter 直通，未解码像素）：LTX latent \(latShape)，"
+                + "像素几何 \(w)×\(h) @ \(fCount) 帧，音轨载体 \(stage2MemBridge?.audioTrackPath ?? "无")，总耗时 \(totalStr)")
+        } else {
+            log("视频写出完成：\(outPath)（\(fCount) 帧 \(w)×\(h)，总耗时 \(totalStr)）")
+        }
+
+        // ★ 尾帧延续落盘（.h3cc）：本节点开启 tailFrameEnabled 时，把最终 clean videoX 尾段
+        //   2~4 秒窗口（默认 3s）的 latent 落盘，供下游视频节点续接消费。
+        //   只落窗口、不存全量 / KV cache；失败仅日志不中断生成。
+        if tailFrameEnabled,
+           let cacheRoot = continuationCacheRoot,
+           let nodeID = continuationNodeID {
+            do {
+                // 续接窗口由全局 continuationContextFrames（像素帧）换算：
+                // alignFrameCount → frames；videoLatentT → latentT（22 帧 → 7 step）；
+                // audioLatentT → 同步音频窗口。落盘/消费/裁切共用同一换算入口。
+                let winFrames = H3Const.alignFrameCount(H3Const.continuationContextFrames)
+                let win = H3ContinuationCache.Window(seconds: Double(winFrames) / Double(H3Const.fps),
+                                                     frames: winFrames,
+                                                     latentT: H3Const.videoLatentT(frameCount: winFrames),
+                                                     audioT: H3Const.audioLatentT(frameCount: winFrames))
+                let winRows = win.rows(gridH: gridH, gridW: gridW)
+                guard videoX.shape[0] >= winRows else {
+                    log("⚠️ 尾帧延续落盘跳过：本节点行数 \(videoX.shape[0]) < 窗口行数 \(winRows)（帧数过短）")
+                    throw NSError(domain: "H3ContinuationCache", code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "帧数过短"])
+                }
+                let vp = videoX.shape[1]
+                let tail = videoX[(videoX.shape[0] - winRows)..<videoX.shape[0], 0..<vp]
+                let tailLat = H3TensorOps.unpatchifyVideo(tail, gridH: gridH, gridW: gridW)  // [winT,H,W,C]
+                MLX.eval(tailLat)
+                // ★ 2026-09-21 音频续接：与视频窗口对齐落盘真实尾段音频 latent（行数 = winAudioT*2，
+                //   与 Runner 注入的 refAudio 段一致），供下次续接作前置锚点；无音频通道时存 nil。
+                var audioTail: MLXArray? = nil
+                if audioX.shape[0] > 0 {
+                    let avail = audioX.shape[0]
+                    // ★ 2026-09-23 修复：音频窗口行数取落盘窗口自身等长换算（win.audioT*2），
+                    //   与视频 tail 同口径（视频取末尾 winRows 行，音频取末尾 win.audioT*2 行）。
+                    //   此前误用消费侧 continuationWinAudioT（非续接时恒为 0），导致首次生成
+                    //   的 .h3cc 永远不落音频 latent、下游 refAudio 锚点从未生效。
+                    let want = Int(win.audioT) * 2
+                    let take = min(want, avail)
+                    if take > 0 {
+                        audioTail = audioX[(avail - take)..<avail, 0..<32]
+                        MLX.eval(audioTail)
+                    }
+                }
+                let expect = H3ContinuationCache.Expect(modelKey: H3ContinuationCache.currentModelKey,
+                                                        width: width, height: height, steps: steps,
+                                                        latentT: latentT, frameCount: frameCount,
+                                                        refCount: referenceImagePaths.count)
+                let url = try H3ContinuationCache.save(nodeID: nodeID, branchID: continuationBranchID,
+                                                       rootDir: cacheRoot, tailLatent: tailLat, win: win,
+                                                       fingerprint: expect,
+                                                       latH: latH, latW: latW, latC: latC,
+                                                       gridH: gridH, gridW: gridW,
+                                                       videoPatchDim: cfg.videoPatchDim,
+                                                       condRows: injectedCondRowsClean,
+                                                       condIDs: injectedCondIDs,
+                                                       condRowSpans: injectedCondSpans,
+                                                       condRowModes: injectedCondModes,
+                                                       condRowHs: injectedCondHs,
+                                                       condRowWs: injectedCondWs,
+                                                       audioLatent: audioTail,
+                                                       tailFramePixels: tailFramePixels)
+                log("★ 尾帧延续已落盘：\(url.path)（窗口 \(win.seconds)s / \(win.frames) 帧 / \(win.latentT) latentT，条件行 \(injectedCondRowsClean?.shape ?? [])，实际注入 ids \(injectedCondIDs) spans \(injectedCondSpans)，音频 latent \(audioTail?.shape[0] ?? 0) 行）")
+            } catch {
+                log("⚠️ 尾帧延续落盘失败（\(error.localizedDescription)），不影响本次生成")
+            }
+        }
+
+        // ★ 生成成功后删除被消费的前置缓存（幂等）：按精确 source 节点 ID 删除，
+        //   绝不误删自身刚落的盘（自身 ID = continuationNodeID，与 source 不同）。
+        //   【已停用 2026-09-21 存档】保留前驱 .h3cc 缓存避免链式续接回溯上游时缓存被删，
+        //   如需恢复改回 if continuationActive。
+        if false,
+           continuationActive,
+           let cacheRoot = continuationCacheRoot,
+           let srcID = continuationConsumedSourceID {
+            H3ContinuationCache.delete(nodeID: srcID, branchID: nil, rootDir: cacheRoot)
+            log("★ 已删除被消费前置缓存：\(srcID.uuidString)（幂等）")
+        }
+
+        return outPath
+    }
+}
+
+/// Stage2 空间几何放大：latent [1,C,T,H,W]（H/W 偶）→ [1,C,T,2H,2W]。
+/// 双线性（align_corners=false 近似，与 b 基线产物同族），纯 slice/加权实现，
+/// 不引入任何学习型权重。偶数输出 = 0.75·x[i]+0.25·x[i−1]，
+/// 奇数输出 = 0.75·x[i]+0.25·x[i+1]（边界复制）。
+private func h3SpatialUpsample2x5D(_ z: MLXArray) -> MLXArray {
+    let c = z.shape[1]
+    let t = z.shape[2]
+    precondition(c >= 1 && t >= 1)
+
+    // 对最后维（长度 m）做 align_corners=false 式 ×2：返回 [1, c, t, hh, m*2]
+    func lin2xLast(_ x: MLXArray) -> MLXArray {
+        let hh = x.shape[3]
+        let m = x.shape[4]
+        precondition(m >= 2)
+        let xL = x[0 ..< 1, 0 ..< c, 0 ..< t, 0 ..< hh, 0 ..< m]
+        let xLeft = concatenated([x[0 ..< 1, 0 ..< c, 0 ..< t, 0 ..< hh, 0 ..< 1],
+                                  x[0 ..< 1, 0 ..< c, 0 ..< t, 0 ..< hh, 0 ..< (m - 1)]], axis: 4)
+        let xRight = concatenated([x[0 ..< 1, 0 ..< c, 0 ..< t, 0 ..< hh, 1 ..< m],
+                                   x[0 ..< 1, 0 ..< c, 0 ..< t, 0 ..< hh, (m - 1) ..< m]], axis: 4)
+        let even = xL * H3TensorOps.scalarLike(0.75, x) + xLeft * H3TensorOps.scalarLike(0.25, x)
+        let odd = xL * H3TensorOps.scalarLike(0.75, x) + xRight * H3TensorOps.scalarLike(0.25, x)
+        let ee = even.reshaped([1, c, t, hh, m, 1])
+        let oo = odd.reshaped([1, c, t, hh, m, 1])
+        return concatenated([ee, oo], axis: 5).reshaped([1, c, t, hh, m * 2])
+    }
+
+    // W 方向 ×2（最后维 = w）
+    let xW = lin2xLast(z)                                        // [1,C,T,h,2w]
+    // H 方向 ×2（交换最后两维后复用末轴插值）
+    let xT = xW.transposed(0, 1, 2, 4, 3)                        // [1,C,T,2w,h]
+    let xH = lin2xLast(xT)                                       // [1,C,T,2w,2h]
+    return xH.transposed(0, 1, 2, 4, 3)                          // [1,C,T,2h,2w]
+}
+
+// MARK: - ref2va 参考图工具
+
+/// 读取图片像素尺寸（不解码整图，供 reference canvas 计算）。
+func h3ImagePixelSize(_ path: String) -> (w: Int, h: Int)? {
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+          let w = props[kCGImagePropertyPixelWidth] as? Int,
+          let h = props[kCGImagePropertyPixelHeight] as? Int,
+          w > 0, h > 0 else { return nil }
+    return (w, h)
+}

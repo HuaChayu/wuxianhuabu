@@ -1,0 +1,34 @@
+# SwiftPM / Xcode 构建产物
+**/.build/
+**/.swiftpm/
+DerivedData/
+xcuserdata/
+# 备份与系统文件
+*.bak
+.DS_Store
+# 本地调试产物
+model/minimax h3/temp/
+__pycache__/
+*.pyc
+
+# 带日期后缀的备份文件
+*.bak-*
+*.bak_*
+*.b3x
+
+# CoreML 模型包（预编译模型，不入库）
+**/*.mlpackage/
+!Packages/RealESRGAN_x2plus_522_fp16.mlpackage/
+
+# xcodeproj 内误生成的编译缓存垃圾目录
+无限画布.xcodeproj/-I/
+
+# 顶层 Xcode 构建产物
+build/
+# 临时帧输出
+temp_h3_408_frames/
+# 大模型权重（避免推送超大文件；测试 golden 小文件白名单保留）
+**/*.safetensors
+!Packages/z-image-swift/Tests/goldens/
+**/*.ckpt
+**/*.gguf

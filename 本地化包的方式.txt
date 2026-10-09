@@ -1,0 +1,166 @@
+============================================================
+如何将 Swift 依赖包本地化到项目、如何写入/恢复、如何更新
+（无限画布 · 操作手册）
+============================================================
+
+一、为什么需要"本地化包"
+------------------------------------------------------------
+工程「无限画布.xcodeproj」通过 SPM（Swift Package Manager）引用多个
+Swift 依赖包（mlx-swift、mlx-swift-lm、mlx-engine-swift、ZImage 等）。
+SPM 默认会从网络拉取依赖并缓存在 DerivedData 中；一旦网络不可用、
+仓库被删、或 xcode-select 指向 CommandLineTools 导致 SDK 定位失败，
+工程将无法解析依赖、无法编译。
+
+"本地化"的含义：把依赖包的源码（checkouts 目录）直接放到本机固定
+路径，并让工程以「本地路径引用」（XCLocalSwiftPackageReference）方式
+引用它们，从而摆脱对网络和 Xcode 版本状态的依赖，随时可编译、可恢复。
+
+本项目本地包的两个关键位置：
+  1) 工程内本地包：      /Users/huachayui/Desktop/无限画布/Packages/z-image-swift
+                         （即 ZImage 包，位于项目目录内）
+  2) DerivedData 依赖池：/Users/huachayui/Library/Developer/Xcode/DerivedData/
+                          无限画布/SourcePackages/checkouts/
+                         （18 个第三方依赖的源码目录，如下）
+        EventSource           mlx-engine-swift     mlx-profiling
+        mlx-swift             mlx-swift-lm         swift-argument-parser
+        swift-asn1            swift-atomics        swift-collections
+        swift-crypto          swift-huggingface    swift-jinja
+        swift-nio             swift-numerics       swift-syntax
+        swift-system          swift-transformers   yyjson
+
+
+二、本地包引用机制
+------------------------------------------------------------
+1) xcodeproj 对"本地目录包"使用 XCLocalSwiftPackageReference 引用：
+   - 工程内的 ZImage：引用路径为项目内相对路径 Packages/z-image-swift；
+   - 其他 17 个依赖：引用路径指向 DerivedData 的
+     SourcePackages/checkouts/<包名> 目录（@ local 形式）。
+2) 判定方法：在工程目录执行
+     xcodebuild -resolvePackageDependencies -project 无限画布.xcodeproj
+   或打开 Xcode 的 File > Packages > Resolve Package Versions，
+   观察输出中每个包显示 "@ local" 即表示已本地化。
+   示例输出（部分）：
+     mlx-swift-lm: .../SourcePackages/checkouts/mlx-swift-lm @ local
+     ZImage: /Users/huachayui/Desktop/无限画布/Packages/z-image-swift @ local
+3) 本地化的本质：让 DerivedData/SourcePackages/checkouts 下各目录的
+   源码内容与实际依赖版本一致。SPM 解析时会优先使用该目录里的源码，
+   不再联网拉取。
+
+
+三、本地化写入 / 恢复方法
+------------------------------------------------------------
+适用场景：checkouts 目录缺失、被误删、内容不完整，或换了机器需要
+恢复本地依赖。
+
+步骤 1：确认备份源存在
+  依赖源码的"备份源"位于工程内本地包的 SPM 缓存中：
+    /Users/huachayui/Desktop/无限画布/Packages/z-image-swift/.build/checkouts/
+  该目录存放了各依赖被解析时下载的源码副本（含 18 个包）。
+
+步骤 2：复制依赖目录到 DerivedData 依赖池
+  mkdir -p "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts"
+  cp -R "/Users/huachayui/Desktop/无限画布/Packages/z-image-swift/.build/checkouts/"* \
+        "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/"
+  复制完成后核对数量：
+    ls "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts" | wc -l
+  期望输出：18
+
+步骤 3：重新解析依赖验证
+  cd /Users/huachayui/Desktop/无限画布
+  xcodebuild -resolvePackageDependencies -project 无限画布.xcodeproj
+  输出中应看到各包显示 "@ local"（见第二节第 2 点）。
+
+步骤 4（可选）：编译验证
+  xcodebuild -scheme 无限画布 -configuration Debug build
+  最终出现 ** BUILD SUCCEEDED ** 即恢复成功。
+
+
+四、更新方法
+------------------------------------------------------------
+适用场景：需要把依赖升级到新版（例如 mlx-swift-lm 出了新版本）。
+
+步骤 1：切换到 Xcode-beta（若 xcode-select 已指向 CommandLineTools）
+  export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+
+步骤 2：在本地包目录执行 swift package update 拉取新版
+  cd /Users/huachayui/Desktop/无限画布/Packages/z-image-swift
+  swift package update
+  该命令会根据 Package.swift 的版本约束（如 .upToNextMinor(from: "0.31.4")）
+  拉取允许范围内的最新版本，并更新 .build/checkouts 里的源码副本。
+
+步骤 3：将新版 checkouts 同步覆盖到 DerivedData 依赖池
+  cp -R "/Users/huachayui/Desktop/无限画布/Packages/z-image-swift/.build/checkouts/"* \
+        "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/"
+  （覆盖同名目录即为升级；目录名不变，内容为新版源码）
+
+步骤 4：重新解析依赖 + 编译验证
+  cd /Users/huachayui/Desktop/无限画布
+  xcodebuild -resolvePackageDependencies -project 无限画布.xcodeproj
+  xcodebuild -scheme 无限画布 -configuration Debug build
+  若出现 API 变动导致的编译错误，需同步修改工程代码以适配新版 API。
+
+注意：更新后如果某个依赖"漂移"回网络引用（输出不再显示 @ local），
+重复"步骤 3 的覆盖 + 步骤 4 的解析"即可强制拉回本地源码。
+
+
+五、DEVELOPER_DIR 切换（SDK 定位失败时）
+------------------------------------------------------------
+现象：xcode-select -p 指向 /Library/Developer/CommandLineTools，
+执行 xcodebuild 报 SDK / 平台定位失败（找不到 MacOSX.sdk 等）。
+
+解决办法：用 DEVELOPER_DIR 环境变量临时切换到 Xcode-beta，无需修改
+系统全局 xcode-select：
+
+  export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+
+之后在同一终端里再执行 xcodebuild 即可正常解析与编译。
+若想永久生效，可把该 export 写入 ~/.zshrc。
+
+
+六、本次实际执行的关键命令示例
+------------------------------------------------------------
+1) 查看当前开发者目录（诊断用）
+     xcode-select -p
+
+2) 切换到 Xcode-beta 开发者目录
+     export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+
+3) 恢复本地依赖（复制 18 个包到 DerivedData 依赖池）
+     cp -R "/Users/huachayui/Desktop/无限画布/Packages/z-image-swift/.build/checkouts/"* \
+           "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/"
+     ls "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts" | wc -l
+     # => 18
+
+4) 更新依赖到新版
+     cd /Users/huachayui/Desktop/无限画布/Packages/z-image-swift
+     swift package update
+     cp -R .build/checkouts/* \
+           "/Users/huachayui/Library/Developer/Xcode/DerivedData/无限画布/SourcePackages/checkouts/"
+
+5) 解析依赖 + 编译验证
+     cd /Users/huachayui/Desktop/无限画布
+     xcodebuild -resolvePackageDependencies -project 无限画布.xcodeproj
+     xcodebuild -scheme 无限画布 -configuration Debug build
+     # => ** BUILD SUCCEEDED **
+
+6) 本次恢复后的包版本清单（resolved）
+     mlx-swift          0.31.6
+     mlx-swift-lm       3.31.4
+     mlx-engine-swift   0.47.0
+     mlx-profiling      0.1.0
+     swift-transformers 1.3.3
+     swift-huggingface  0.9.0
+     swift-jinja        2.4.2
+     swift-syntax       603.0.2
+     swift-collections  1.6.0
+     swift-numerics     1.1.1
+     swift-argument-parser 1.8.2
+     swift-crypto       4.5.1
+     swift-asn1         1.7.1
+     yyjson             0.12.0
+     EventSource        1.5.1
+
+============================================================
+（文档结束）
+============================================================
+（内容由AI生成，仅供参考）
