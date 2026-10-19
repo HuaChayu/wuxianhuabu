@@ -245,6 +245,16 @@ public enum H3FL2VAPipeline {
         //   keyframe latent 锚索引0。严禁用低清 latent 升频结果或 latent 末行冒充。
         var tailFramePixels: MLXArray? = nil
         var latC = 0, latT = 0, latH = 0, latW = 0, gridH = 0, gridW = 0
+        // ★ 2026-10-19 SelfLift 原生半清条件行：lift 开启时在源图 encode 阶段额外编一份
+        //   0.5 像素（面积 1/4）条件行——一份给高分（full-res）、一份给低清（half），
+        //   低清段不再由 full-res latent 在 latent 域 bilinear 降采样（那条“额外条件处理”
+        //   路径在 lift 模式下不再被消费，仅作回退）。
+        //   NA_H3_LIFT_NATIVE_LOW=0 可关闭本路径（A/B 对照：原生半清 vs latent 降采样旧路径）。
+        let nativeLowCondEnabled = (ProcessInfo.processInfo.environment["NA_H3_LIFT_NATIVE_LOW"] ?? "1") != "0"
+        var lowCondRowsNative: MLXArray? = nil
+        var lowCondBuildOK = true
+        var lowKeyChunks: [MLXArray] = []
+        var lowRowChunks: [MLXArray] = []
         // ref2va 布局块与文本侧视觉块（顺序严格对应）
         var refBlocks: [RefBlock] = []
         var refVisionBlocks: [H3VisionBlock] = []
@@ -302,6 +312,16 @@ public enum H3FL2VAPipeline {
                 var keyCondModes: [UInt8] = []
                 var keyCondHs: [UInt32] = []
                 var keyCondWs: [UInt32] = []
+                // ★ 2026-10-19 逐张屏障：多参考（4 张及以上）连续 VAE 编码时，缓存池会累积到
+                //   cacheLimit(10GB) 上限（实测 9586MB / RSS 19GB）；下一次分配触发 MLX allocator
+                //   trim 真释放，而仍在 GPU 队列中的 command buffer 引用了被释放的 MTLBuffer，
+                //   于是在 preCommit 抛 "references deallocated object" 断言（多参考必崩、
+                //   双图 FL 因未顶满缓存池而不复现）。每编完一张即 sync+清池，把上限窗口彻底消除。
+                func refEncodeBarrier(_ tag: String) {
+                    Stream.gpu.synchronize()
+                    MLX.Memory.clearCache()
+                    log("[MEM] 参考图编码屏障（\(tag)）：sync + clearCache → MLX active \(MLX.Memory.activeMemory / 1_000_000)MB，cache \(MLX.Memory.cacheMemory / 1_000_000)MB")
+                }
                 for (i, p) in refImageSourcePaths.enumerated() {
                     guard let dims = h3ImagePixelSize(p) else {
                         throw NSError(domain: "H3REF2VA", code: 2,
@@ -320,6 +340,27 @@ public enum H3FL2VAPipeline {
                         let anchorRows = H3TensorOps.patchifyVideo(nhwcAnchor, gridH: gridH, gridW: gridW)
                         // keyframe 硬锚段（cond 段，目标网格，mode=0）
                         keyChunks.append(anchorRows)
+                        // ★ 2026-10-19 SelfLift 原生半清：同一张源图再按 0.5 像素编一份 latent
+                        //   （像素域 encode，比 full-res latent 降采样后再喂低清 forward 更干净）。
+                        if selfLiftEnabled {
+                            let halfW = max(16, Int(width) / 2)
+                            let halfH = max(16, Int(height) / 2)
+                            if let pxHalf = loadImageBCFHW(path: p, width: halfW, height: halfH) {
+                                let latHalf = vae!.encodeImage(pxHalf)      // [1,24,1,latHl,latWl]
+                                let lh = latHalf.shape[3], lw = latHalf.shape[4]
+                                if lh == latH / 2 && lw == latW / 2 {
+                                    let nhwcHalf = latHalf.transposed(0, 2, 3, 4, 1).reshaped([1, lh, lw, latC])
+                                    lowKeyChunks.append(H3TensorOps.patchifyVideo(nhwcHalf, gridH: lh / 2, gridW: lw / 2))
+                                    log("SelfLift 原生半清：\(i == 0 ? "首帧" : "尾帧") \(halfW)×\(halfH) → latent [\(lh),\(lw)]，rows \((lh / 2) * (lw / 2))")
+                                } else {
+                                    lowCondBuildOK = false
+                                    log("⚠️ SelfLift 原生半清尺寸不匹配（\(lh)×\(lw) vs \(latH / 2)×\(latW / 2)），回退 latent 降采样旧路径")
+                                }
+                            } else {
+                                lowCondBuildOK = false
+                                log("⚠️ SelfLift 原生半清图加载失败（\(p)），回退 latent 降采样旧路径")
+                            }
+                        }
                         keyCondIDs.append(p)
                         keyCondSpans.append(gridH * gridW)        // keyframe 行数 = (latH/2)*(latW/2) = fRows
                         keyCondModes.append(0)                    // cond 段（keyframe，目标网格）
@@ -331,6 +372,7 @@ public enum H3FL2VAPipeline {
                         refVisionBlocks.append(H3VisionBlock(frames: frames, grid: gridFor(h: UInt32(height), w: UInt32(width))))
                         refVisionLabels.append(i == 0 ? "<First frame>: " : "<Last frame>: ")
                         log("fl 硬锚+视觉块：\(i == 0 ? "首帧" : "尾帧")（\(dims.w)×\(dims.h)）→ keyframe \(i == 0 ? ".first" : ".last") 硬锚（rows \(gridH * gridW)）+ 视觉块 + 标签「\(refVisionLabels[refVisionLabels.count - 1])」")
+                        refEncodeBarrier("fl 图 \(i + 1)")
                         continue
                     }
                     // 官方 reference canvas：短边 2048 上限、32 对齐；再经 fitCanvas 复核对齐
@@ -346,6 +388,27 @@ public enum H3FL2VAPipeline {
                     let lh = lat.shape[3], lw = lat.shape[4], lc = lat.shape[1]
                     let nhwc = lat.transposed(0, 2, 3, 4, 1).reshaped([1, lh, lw, lc])
                     rowChunks.append(H3TensorOps.patchifyVideo(nhwc, gridH: lh / 2, gridW: lw / 2))
+                    // ★ 2026-10-19 SelfLift 原生半清：参考图同样按 0.5 画布再编一份
+                    if selfLiftEnabled {
+                        let halfW = max(16, Int(vc.w) / 2), halfH = max(16, Int(vc.h) / 2)
+                        let lhHalf = Int((Double(lh) * 0.5 / 2).rounded()) * 2
+                        let lwHalf = Int((Double(lw) * 0.5 / 2).rounded()) * 2
+                        if let pxHalf = loadImageBCFHW(path: p, width: halfW, height: halfH) {
+                            let latHalf = vae!.encodeImage(pxHalf)
+                            let lh2 = latHalf.shape[3], lw2 = latHalf.shape[4]
+                            if lh2 == lhHalf && lw2 == lwHalf {
+                                let nhwcHalf = latHalf.transposed(0, 2, 3, 4, 1).reshaped([1, lh2, lw2, latC])
+                                lowRowChunks.append(H3TensorOps.patchifyVideo(nhwcHalf, gridH: lh2 / 2, gridW: lw2 / 2))
+                                log("SelfLift 原生半清：参考图 \(i + 1) \(halfW)×\(halfH) → latent [\(lh2),\(lw2)]")
+                            } else {
+                                lowCondBuildOK = false
+                                log("⚠️ SelfLift 原生半清参考图尺寸不匹配（\(lh2)×\(lw2) vs \(lhHalf)×\(lwHalf)），回退 latent 降采样旧路径")
+                            }
+                        } else {
+                            lowCondBuildOK = false
+                            log("⚠️ SelfLift 原生半清参考图加载失败（\(p)），回退 latent 降采样旧路径")
+                        }
+                    }
                     refBlocks.append(RefBlock(kind: .image, latentH: UInt32(lh), latentW: UInt32(lw),
                                               latentT: 1, audioT: 0))
                     // 文本侧视觉块：静帧沿 temporal patch 重复填满 2 帧
@@ -372,12 +435,26 @@ public enum H3FL2VAPipeline {
                     ownCondHs.append(UInt32(lh))
                     ownCondWs.append(UInt32(lw))
                     log("参考图 \(i + 1)：\(dims.w)×\(dims.h) → 画布 \(vc.w)×\(vc.h)，latent [\(lc),1,\(lh),\(lw)]，rows \((lh / 2) * (lw / 2))")
+                    refEncodeBarrier("参考图 \(i + 1)")
                 }
                 // ★ 2026-10-07 fl 硬锚+视觉块：fl 场景行序 = keyframes 硬锚段（keyChunks 双段），
                 //   rowChunks/refBlocks 恒空（无软参考段）；与 layout 段序（keyframes）一致。
                 let allChunks = keyChunks + rowChunks
                 condRows = allChunks.count == 1 ? allChunks[0] : concatenated(allChunks, axis: 0)
                 MLX.eval(condRows)
+                // ★ 2026-10-19 原生半清条件行汇总：仅当**全部段**都成功按 0.5 编好才直通，
+                //   任何一段失败/尺寸不匹配 → nil（Runner 走旧路径，零回归）。
+                let lowAllChunks = lowKeyChunks + lowRowChunks
+                if selfLiftEnabled, nativeLowCondEnabled, lowCondBuildOK,
+                   lowAllChunks.count == allChunks.count, !lowAllChunks.isEmpty {
+                    let mergedLow = lowAllChunks.count == 1 ? lowAllChunks[0] : concatenated(lowAllChunks, axis: 0)
+                    MLX.eval(mergedLow)
+                    lowCondRowsNative = mergedLow
+                    log("SelfLift 原生半清条件行：\(lowAllChunks.count) 段 rows \(mergedLow.shape)（源图 0.5 像素直接 encode，供低清段）")
+                } else if selfLiftEnabled {
+                    lowCondRowsNative = nil
+                    log("SelfLift 原生半清条件行：未建立（段数/尺寸校验未通过），回退 latent 降采样旧路径")
+                }
                 if flSoftPair {
                     // ★ 2026-10-07 fl 硬锚+视觉块：ownCond 元数据 = keyframe 段全套（keyCond*），
                     //   段序与 condRows（仅 keyChunks）严格一致。
@@ -398,6 +475,15 @@ public enum H3FL2VAPipeline {
                 let augB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), condRows)
                 condRows = condRows * augA + augNoise * augB
                 MLX.eval(condRows)
+                // 原生半清条件行按同一规则做视觉条件噪声增强（r = 0.999·r + 0.001·noise）
+                if var low = lowCondRowsNative {
+                    let lowNoise = MLXRandom.normal(low.shape, key: MLXRandom.key(seed))
+                    let lowA = H3TensorOps.scalarLike(Float(H3Const.visualCondTimestep), low)
+                    let lowB = H3TensorOps.scalarLike(Float(1.0 - H3Const.visualCondTimestep), low)
+                    low = low * lowA + lowNoise * lowB
+                    MLX.eval(low)
+                    lowCondRowsNative = low
+                }
 
                 // 释放 VAE 编码器（解码阶段再加载）
                 vae = nil
@@ -1068,7 +1154,30 @@ public enum H3FL2VAPipeline {
             if let s = ProcessInfo.processInfo.environment["NA_H3_PAB_K"], let v = UInt32(s) { return v }
             return attentionBroadcastK
         }()
-        let pab1: H3AttnBroadcast? = pabK > 1 ? H3AttnBroadcast(count: dit!.blocks.count) : nil
+        // ★ 2026-10-19 PAB 内存护栏（直出路径致命项，与 SelfLift 改动无关）：
+        //   PAB 常驻体积 = 层数 × (at[S,inner] + mlp[S,hidden]) × 2B。
+        //   S=72576（1344×768 长片）时 = 50 × (72576×7168 + 72576×5376) × 2B ≈ 91GB，
+        //   物理内存只有 48GB → 第 1 个 forward 就开始全局换页，内核按 low-swap 强杀
+        //   （kernel: compressed memory 94283 MiB / killing due to low-swap）。
+        //   SelfLift 高分段早已因同一原因默认关闭 PAB（见 SelfLiftH3 高分 PAB 注释），
+        //   直出路径却仍全程开启——历史遗留漏洞。这里按预算统一护栏：
+        //   预估常驻 > 6GB 时不建缓存；forward 走 cacheable=false 分支，每步现算，
+        //   与「每步都 refresh」逐位等价，只损失跨步复用加速。
+        //   强制开关：NA_H3_PAB_BUDGET_GB 覆盖预算，NA_H3_PAB=0 仍全局关闭。
+        let pabRows = condRows.shape[0] + videoX.shape[0] + audioX.shape[0]
+        let pabHidden = condRows.shape[1]
+        let pabInner = cfg.numHeads * cfg.headDim
+        let pabEstBytes = Double(dit!.blocks.count) * Double(pabRows)
+            * Double(pabInner + pabHidden) * 2.0
+        let pabBudgetGB = ProcessInfo.processInfo.environment["NA_H3_PAB_BUDGET_GB"]
+            .flatMap(Double.init) ?? 6.0
+        let pabAllowed = pabK > 1 && pabEstBytes <= pabBudgetGB * 1_000_000_000
+        if pabK > 1 && !pabAllowed {
+            log("PAB 内存护栏：预估常驻 \(String(format: "%.1f", pabEstBytes / 1_000_000_000))GB"
+                + " > 预算 \(String(format: "%.1f", pabBudgetGB))GB（行数 \(pabRows)，层数 \(dit!.blocks.count)），"
+                + "已关闭跨步缓存（每步现算，数值等价）")
+        }
+        let pab1: H3AttnBroadcast? = pabAllowed ? H3AttnBroadcast(count: dit!.blocks.count) : nil
         // ── 3.1 SelfLift 第三分支（H3 一采渐进式采样，实现在 SelfLiftH3-(h3专属).swift）─────
         // ⚠️⚠️ 本机主流链路 = 完整 SelfLift 渐进采样（H3 内部低分×0.5 前缀 + 零 NFE 过渡 +
         // 高分收尾，直出全清），不使用 LTX 二采桥接。任何内存/swap/二采分析必须以
@@ -1108,20 +1217,38 @@ public enum H3FL2VAPipeline {
             let envCfgScale = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_CFG"].flatMap(Double.init) ?? 0.0
             var slCfg = slCfgBase
             // Runner 已收敛为唯一调度（makeFixedFinalStep），历史解耦 A/B 实验开关（LOW_STEPS /
-            // HIGH_STEPS / HIGH_START）不再被消费；仅 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖 σ_k（默认 0.93）。
+            // HIGH_STEPS / HIGH_START）不再被消费；仅 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖 σ_k（默认 0.6）。
             let decoupleEnv = ProcessInfo.processInfo.environment
             if let lowK = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_LOW_K"].flatMap(Double.init) {
                 slCfg.decoupleSigmaK = lowK
-                log("SelfLift σ_k 覆盖：NA_H3_SELFLIFT_DECOUPLE_LOW_K=\(lowK)（默认 0.93）")
+                log("SelfLift σ_k 覆盖：NA_H3_SELFLIFT_DECOUPLE_LOW_K=\(lowK)（默认 0.6：低清止于 σ=0.6）")
             }
+            // ★ 2026-10-19 用户设计：低清止于 σ_k=0.6 → clean 端点升频 → 高清按 σ_ren=0.65 重加噪接手。
+            //   显式覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA；未设时 clean 端点默认 0.65（高清重画 65%），
+            //   带噪直通档跟随 σ_k（等深，不重加噪）。等深 clean（σ_ren=σ_k）历史已证鬼影，不作默认。
+            let envRen = decoupleEnv["NA_H3_SELFLIFT_RENOISE_SIGMA"].flatMap(Double.init)
+            if let r = envRen {
+                slCfg.renoiseSigma = r
+                log("SelfLift σ_ren 覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA=\(r)")
+            }
+            // ★ 交接状态类型（2026-10-19 用户需求）：默认「clean 端点」——低清末步 Eq.3 预测
+            //   clean x0，升频后按 σ_next=σ_k 重加噪交高清，高清 1 步 σ_k→0。
+            //   带噪直通（末步 Euler 落在 σ_k、升频后不重加噪）保留作 A/B 对照：
+            //   NA_H3_SELFLIFT_CLEAN_HANDOFF=0 可切到带噪直通。
+            let cleanHandoffEnv = (decoupleEnv["NA_H3_SELFLIFT_CLEAN_HANDOFF"] ?? "1") != "0"
+            slCfg.cleanEndpointHandoff = cleanHandoffEnv
+            log("SelfLift 交接模式：\(cleanHandoffEnv ? "clean 端点（默认：Eq.3 x0 → 升频 → 按 σ_next=σ_k 重加噪）" : "带噪直通（σ_k 含噪 x → 升频 → 不重加噪，高清接手续跑）")")
             slCfg.cfgScale = envCfgScale
             if envCfgScale > 0 {
                 log("SelfLift CFG：cfg=\(envCfgScale)（每步 positive+negative 双 forward；注意 turbo LoRA 蒸馏模型 cfg 过大会过冲）")
             } else {
                 log("SelfLift CFG：关闭（cfg=0，仅 positive 单路；NA_H3_SELFLIFT_CFG=1.5~3.0 可显式实验）")
             }
-            let slSigmaK = slCfg.decoupleSigmaK ?? 0.935
-            log("SelfLift 第三分支：开启（用户设计调度：低清 N-1=\(stage1SegmentCount - 1) 步线性到 σ_k=\(slSigmaK)，高清固定 1 步 σ_k→0，总 NFE=\(stage1SegmentCount)；低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
+            let slSigmaK = slCfg.decoupleSigmaK ?? 0.6
+            let slRen = slCfg.renoiseSigma ?? (cleanHandoffEnv ? 0.65 : (slSigmaK <= 1e-9 ? 0.65 : slSigmaK))
+            log("SelfLift 第三分支：开启（低清 N-1=\(stage1SegmentCount - 1) 步线性到 σ_k=\(slSigmaK)\(slSigmaK <= 1e-9 ? "（跑满完整流程）" : "")，"
+                + "升频后按 σ_ren=\(slRen) 重加噪，高清固定 1 步 σ_ren→0，总 NFE=\(stage1SegmentCount)；"
+                + "低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
             // 像素锚点 VAE（decoder + encoder，bf16 实测 ≈5.3GB）只服务过渡块的
             // decode→encode 往返；rho=0（needsPixelAnchor=false）时 liftPixelAnchor 为
             // nil、不会调用 hooks 的 decode/encode，故按需加载，rho=0 直接省掉这 5.3GB。
@@ -1164,6 +1291,8 @@ public enum H3FL2VAPipeline {
                 dit: dit!,
                 textStates: refined,
                 condRowsFull: condRows,
+                // ★ 2026-10-19 续接场景前置条件行由 Runner 自行拼接，原生半清行无法覆盖 → 传 nil
+                condRowsLowOverride: continuationSource == nil ? lowCondRowsNative : nil,
                 refBlocks: refBlocks,
                 textTags: textTagsForLayout,
                 latT: Int(latentT),

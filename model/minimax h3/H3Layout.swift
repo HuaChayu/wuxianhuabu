@@ -774,9 +774,12 @@ public struct TimestepPlan {
     }
 }
 
-public func buildTimestepPlan(layout: PackedLayout, sigmaV: Double, shiftV: Double, shiftA: Double, aug: CondNoiseAug) -> TimestepPlan {
+public func buildTimestepPlan(layout: PackedLayout, sigmaV: Double, shiftV: Double, shiftA: Double, aug: CondNoiseAug, audioSigma: Double? = nil) -> TimestepPlan {
     let tV = 1.0 - sigmaV
-    let tA = 1.0 - timeShiftSigma(sigmaV, fromShift: shiftV, toShift: shiftA)
+    // ★ 音频调度解耦（2026-10-16）：音频行时间坐标 tA 优先取音频自身调度 sigma_a（audioSigma），
+    //   不再由视频 sigma_v 经 timeShiftSigma 换算 —— sigma_k→1 时后者会把音频行程压缩到低清
+    //   单步的约 5%，其余约 78% 全压进高分单步 Euler，跨度过大 → 削波/高频崩坏。nil 保持旧行为。
+    let tA = 1.0 - (audioSigma ?? timeShiftSigma(sigmaV, fromShift: shiftV, toShift: shiftA))
 
     var uniq: [Double] = []
     func add(_ v: Double) {
@@ -838,8 +841,9 @@ public func buildTimestepPlan(layout: PackedLayout, sigmaV: Double, shiftV: Doub
 /// Same plan but with every run's mod row remapped into a GLOBAL sorted
 /// schedule table (the shape AdaLN precompute serves rows from).
 public func buildTimestepPlanGlobal(layout: PackedLayout, sigmaV: Double, shiftV: Double, shiftA: Double,
-                                    aug: CondNoiseAug, globalTs: [Double]) -> TimestepPlan {
-    var p = buildTimestepPlan(layout: layout, sigmaV: sigmaV, shiftV: shiftV, shiftA: shiftA, aug: aug)
+                                    aug: CondNoiseAug, globalTs: [Double], audioSigma: Double? = nil) -> TimestepPlan {
+    var p = buildTimestepPlan(layout: layout, sigmaV: sigmaV, shiftV: shiftV, shiftA: shiftA, aug: aug,
+                              audioSigma: audioSigma)
     for (i, r) in p.runs.enumerated() {
         let t = p.uniqueT[Int(r.modRow / 3)]
         let tag = r.modRow % 3
@@ -853,10 +857,13 @@ public func buildTimestepPlanGlobal(layout: PackedLayout, sigmaV: Double, shiftV
 
 /// The union of every step's unique timesteps, sorted ascending — the table
 /// AdaLN precompute evaluates.
-public func collectScheduleTs(layout: PackedLayout, sigmas: [Double], shiftV: Double, shiftA: Double, aug: CondNoiseAug) -> [Double] {
+public func collectScheduleTs(layout: PackedLayout, sigmas: [Double], shiftV: Double, shiftA: Double, aug: CondNoiseAug, audioSigmas: [Double]? = nil) -> [Double] {
     var list: [Double] = []
-    for sig in sigmas {
-        let p = buildTimestepPlan(layout: layout, sigmaV: sig, shiftV: shiftV, shiftA: shiftA, aug: aug)
+    for (i, sig) in sigmas.enumerated() {
+        // ★ 音频调度解耦（2026-10-16）：逐位配对音频自身调度 sigma_a；长度不足回退 nil（旧行为）。
+        let aSig = (audioSigmas?.count ?? 0) > i ? audioSigmas![i] : nil
+        let p = buildTimestepPlan(layout: layout, sigmaV: sig, shiftV: shiftV, shiftA: shiftA, aug: aug,
+                                  audioSigma: aSig)
         for t in p.uniqueT where !list.contains(t) {
             list.append(t)
         }

@@ -104,9 +104,27 @@ public struct SelfLiftConfig: Sendable {
     /// CFG 引导给 keyframe 结构裁决力，压制低清残留。
     public var cfgScale: Double
 
-    /// σ_k 覆盖入口（低清终点 / 重加噪深度）：nil 时用 `makeFixedFinalStep` 默认 0.93；
+    /// σ_k 覆盖入口（低清终点 / 交接深度）：nil 时用 `makeFixedFinalStep` 默认 0.5；
     /// 环境变量 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖（命名沿用旧解耦 A/B 时代）。
     public var decoupleSigmaK: Double?
+
+    /// 交接状态类型开关（2026-10-19 用户需求，默认 false = 带噪直通）：
+    ///   · false（默认）：低清末步不做 Eq.3 clean 预测，正常 Euler 走到 σ_k，交接的是 σ_k 处的
+    ///     **带噪 x**；升频后不重加噪、不补 Euler，高清直接接手这份含噪态继续跑到 0。
+    ///     动机：重影根因正是「σ_k 处预测的半成品 clean x0（内容权重仅约 7.7%）升频后被重加噪，
+    ///     与高清重画的内容叠加成鬼影」；高清需要的是噪点状态而不是 clean 内容。
+    ///   · true：恢复旧路径（Eq.3 clean x0 → 升频 → 按 σ_next 重加噪）。
+    ///     **该路径仅关闭、不从代码移除**，供 A/B 对比与 lowOnly 二采链路使用。
+    /// 环境变量 NA_H3_SELFLIFT_CLEAN_HANDOFF=1 可显式恢复旧路径。
+    public var cleanEndpointHandoff: Bool
+
+    /// 重加噪深度 σ_ren（2026-10-19 用户设计）：低清跑满到 σ=0 后，clean x0 升频到高清，
+    /// 再按 σ_ren 重加噪（Eq.10 新噪声）交给高清收尾。nil = 跟随 sigmaK（等深连续，旧语义）；
+    /// σ_k=0 时默认取 0.3（环境变量 NA_H3_SELFLIFT_RENOISE_SIGMA 可覆盖）。
+    /// 动机：σ_k=0.5 等深交接时高清要从 50% 噪声里一次重建全部细节，单步跨度过大 →
+    /// 纹理/色彩先验接管（风格大变）+ 每帧噪声残差不同步（闪烁）；改成「低清跑满出干净结构，
+    /// 高清只从 0.3 的浅噪声里做一次细化」。
+    public var renoiseSigma: Double?
 
     /// - Parameter transitionStep: ts 显式覆盖值；传 0（默认）表示不写死，按总步数 N 自动推导
     public init(enabled: Bool = true,
@@ -116,7 +134,9 @@ public struct SelfLiftConfig: Sendable {
                 wMin: Float = 1.0,
                 wMax: Float = 1.0,
                 cfgScale: Double = 0.0,
-                decoupleSigmaK: Double? = nil) {
+                decoupleSigmaK: Double? = nil,
+                cleanEndpointHandoff: Bool = true,
+                renoiseSigma: Double? = nil) {
         self.enabled = enabled
         self.transitionStep = transitionStep
         self.lowResScale = lowResScale
@@ -125,6 +145,8 @@ public struct SelfLiftConfig: Sendable {
         self.wMax = wMax
         self.cfgScale = cfgScale
         self.decoupleSigmaK = decoupleSigmaK
+        self.cleanEndpointHandoff = cleanEndpointHandoff
+        self.renoiseSigma = renoiseSigma
     }
 
     /// 解析出本次调度实际使用的 ts：
@@ -289,25 +311,48 @@ public struct SelfLiftScheduleSplit: Sendable {
 
     // ──────────────────────────────────────────────────────────────────────
     // 固定最后一步高清（M=1）等深调度（用户原始设计，2026-10-09 移除补 Euler）：
-    //   低清 L = N-1 步，线性等距跑到 σ_k（默认 0.93）；升频后按 σ_next=σ_k 重加噪，
+    //   低清 L = N-1 步，线性等距跑到 σ_k（默认 0.6）；升频后按 σ_ren 重加噪接高清，
     //   不补 Euler，高清固定 1 步 σ_k → 0（等深连续，与旧版 decouple 行为一致）。
+    //   默认交接状态为 clean 端点：末步 Eq.3 预测 x0 → 升频 → 按 σ_next=σ_k 重加噪；
+    //   带噪直通（末步 Euler 落在 σ_k、升频后不重加噪）由 cleanEndpoint=false 选择。
     // ──────────────────────────────────────────────────────────────────────
     /// - Parameter totalSteps: 面板第一阶段总步数 N（总 NFE = 低清 N-1 + 高清 1 = N）
-    /// - Parameter sigmaK: 低清终点 / 重加噪过渡值，默认 0.93（2026-10-09 试过 0.5/0.75 均失败；0.95 等深残留 5% 但画面偏软，改回 0.93 等深残留 7%，仍满足旧安全线 ≤13%）
-    public static func makeFixedFinalStep(totalSteps: Int, sigmaK: Double = 0.935) throws -> SelfLiftScheduleSplit {
+    /// - Parameter sigmaK: 低清终点 / 交接深度，默认 0.6（2026-10-19 用户逐档微调 0.86→0.92→0.90→0.95→0.8→0.7→0.6，clean 端点交高清）
+    /// - Parameter cleanEndpoint: true=末步 Eq.3 预测 clean x0 并重加噪（默认）；false=末步正常 Euler 落在 σ_k、交出含噪 x（带噪直通）
+    public static func makeFixedFinalStep(totalSteps: Int, sigmaK: Double = 0.6,
+                                         renoiseSigma: Double? = nil,
+                                         cleanEndpoint: Bool = true) throws -> SelfLiftScheduleSplit {
         let n = totalSteps
         guard n >= 3 else { throw SelfLiftScheduleError.tooFewSteps(n) }
-        let l = n - 1                              // 低清 NFE（末步在 σ_k 处预测 x0）
-        let dLow = (1.0 - sigmaK) / Double(l - 1)  // 低清前 l-1 段线性等距步长
-        let sigmaNext = sigmaK                     // 用户设计：等深连续（σ_next == σ_k，重加噪后直接进高清首步，不补 Euler）
-        var lowSigmas = (0..<l).map { 1.0 - dLow * Double($0) }   // [1 … σ_k]（l 项）
-        lowSigmas.append(sigmaNext)                // 低清末步 Euler 占位 = σ_k（过渡块会重建，无副作用）
-        let highSigmas = [sigmaNext, 0.0]          // 高清固定 1 步 σ_k → 0
+        let l = n - 1                              // 低清 NFE
+        // ★ 2026-10-19 用户设计（当前默认）：低清止于 σ_k=0.6，clean 端点交高清（重加噪回 σ_ren=0.65）。
+        //   步长口径：
+        //    · sigmaK ≈ 0（跑满）：dLow = 1/l —— 低清 l 步线性 1→0；末步（σ=1/l）的 Eq.3 x0
+        //      与「Euler 到 0」完全等价（x - σ·v），因此两种 cleanEndpoint 取值结果一致，不多跑空转步。
+        //    · sigmaK > 0（中途交接）：沿用旧口径 —— cleanEndpoint=true 时前 l-1 段等距、末步停在 σ_k
+        //      做 Eq.3（Euler 丢弃）；false 时 l 段等距、末步 Euler 真正落在 σ_k。
+        let lowToZero = sigmaK <= 1e-9
+        let dLow: Double
+        if lowToZero {
+            dLow = 1.0 / Double(l)
+        } else {
+            dLow = (1.0 - sigmaK) / Double(cleanEndpoint ? (l - 1) : l)
+        }
+        // 低清出口深度：跑满时是 0，否则是 σ_k。
+        let lowExit = lowToZero ? 0.0 : sigmaK
+        // 高清起点：
+        //  · clean 端点（默认）→ σ_ren 默认 0.65：用户指定档位，高清认领 35% 升频内容、65% 重画。
+        //  · 带噪直通 → σ_next = σ_k（等深连续，不重加噪；跑满时 0.65）。
+        let ren = renoiseSigma ?? (cleanEndpoint ? 0.65 : (lowToZero ? 0.65 : sigmaK))
+        let sigmaNext = ren
+        var lowSigmas = (0..<l).map { 1.0 - dLow * Double($0) }   // [1 … lowExit]（l 项）
+        lowSigmas.append(lowExit)                  // 低清末步占位（clean 模式末步 Eq.3 用，Euler 丢弃）
+        let highSigmas = [sigmaNext, 0.0]          // 高清固定 1 步 σ_ren → 0
         return SelfLiftScheduleSplit(
             lowSigmas: lowSigmas,
             highSigmas: highSigmas,
             transitionStep: l,
-            sigmaK: sigmaK,
+            sigmaK: lowExit,
             sigmaNext: sigmaNext)
     }
 
@@ -470,11 +515,16 @@ public enum SelfLiftCore {
 
 public enum SelfLiftTransition {
 
-    /// 执行一次完整的 SelfLift 过渡块，返回「已提升、已重加噪、并补完 (σ_k → σ_next) Euler」的新状态。
+    /// 执行一次 SelfLift 过渡块。返回语义由 `cfg.cleanEndpointHandoff` 决定：
+    ///   · false（默认，带噪直通）：返回「σ_k 处的带噪 x 被升频到目标分辨率」的状态，**不重加噪、不补 Euler**；
+    ///     高清接手的噪声深度就是 σ_k，与低清出口等深连续。
+    ///   · true（旧路径，仅关闭不移除）：返回「clean x0 升频后按 σ_next 重加噪」的状态。
     ///
     /// 调用方职责：
-    ///   1. 低分第 ts 次前向之后拿到 `lowCleanX0`（Eq.3），并**丢弃**该步本应执行的 Euler 更新；
-    ///   2. 提供 `noise`（目标分辨率、与返回状态同形状的标准正态）；
+    ///   1. 低分第 ts 次前向之后给出交接状态 `lowState`：
+    ///      · 带噪直通模式 → 正常 Euler 更新后的 videoX（σ_k 处的带噪 x）；
+    ///      · clean 模式 → Eq.3 产出的 `lowCleanX0`，并**丢弃**该步本应执行的 Euler 更新；
+    ///   2. 提供 `noise`（目标分辨率、与返回状态同形状的标准正态；带噪直通模式下不会被执行）；
     ///   3. 用返回状态替换当前采样状态，然后按 `split.highSigmas` 继续跑完剩余步。
     ///
     /// - Parameter holdIntermediate: 可选强引用回调。过渡块里每个中间状态（提升结果 / 像素锚点 /
@@ -484,7 +534,7 @@ public enum SelfLiftTransition {
     public static func run<State>(
         split: SelfLiftScheduleSplit,
         cfg: SelfLiftConfig,
-        lowCleanX0: State,
+        lowState: State,
         noise: State,
         liftLatent: (State) -> State,
         liftPixelAnchor: ((State) -> State)?,
@@ -492,11 +542,22 @@ public enum SelfLiftTransition {
         noiseScaling: (State, Double, State) -> State,
         holdIntermediate: ((State) -> Void)? = nil
     ) -> State {
-        let zLat = cfg.needsLatentLift ? liftLatent(lowCleanX0) : lowCleanX0
+        let zLat = cfg.needsLatentLift ? liftLatent(lowState) : lowState
         holdIntermediate?(zLat)
+        // ★ 2026-10-19（用户需求）默认走带噪直通：交接状态本身就是 σ_k 的含噪 x，升频后原样交给高清，
+        //   不重加噪（否则会把升频后的噪声实现再乘一遍新的 ε，高清看到的噪声深度与低清出口不对等）、
+        //   不补 Euler。高清需要噪点状态接着处理，而不是 clean 内容。
+        //   clean 路径（含像素锚点 Eq.6-9 修正 + Eq.10 重加噪）整体保留在下面，仅由开关关闭。
+        // ★ 2026-10-19 用户设计（低清跑满 + 浅重加噪）：判据从「只看开关」改为「看高清起点是否等于
+        //   低清出口」——σ_next ≠ σ_k（如 0 → 0.3）必须重加噪；两者相等（等深连续）且开关关闭时
+        //   才是原样的带噪直通。
+        let needsRenoise = cfg.cleanEndpointHandoff || abs(split.sigmaNext - split.sigmaK) > 1e-9
+        if !needsRenoise {
+            return zLat
+        }
         var z0High = zLat
         if cfg.needsPixelAnchor, let anchor = liftPixelAnchor {
-            let zPix = anchor(lowCleanX0)
+            let zPix = anchor(lowState)
             holdIntermediate?(zPix)
             z0High = consistencyLift(zLat, zPix)
         }

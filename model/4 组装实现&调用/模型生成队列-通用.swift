@@ -373,8 +373,14 @@ final class GenerationQueue: ObservableObject {
         //   网格噪点，画面崩坏；官方 cfg=5.0 面向原版 H3（非 turbo）。故默认注入 0=关闭（恢复
         //   单路正常画面）；机制保留，显式设 NA_H3_SELFLIFT_CFG=1.5~3.0 可实验性开启。
         setenv("NA_H3_SELFLIFT_CFG", "0", 1)
+        // ★ 低清交接状态（2026-10-19 σ_k=0.5 实测定案）：带噪直通（不 Eq.3、不重加噪）仅在噪声占比
+        //   极低的浅档成立；0.5 档低清 latent 含噪过半，升频器会把这团非 iid 噪声改写成块相关斑块，
+        //   高清单步 0.5→0 跨度大 → 色偏/重影/边缘糊。故 0.5 档强制恢复 clean 交接：
+        //   Eq.3 预测 clean x0 → 升频 → 按 σ_k 用 Eq.10 重加噪交给高清。鬼影风险只在 σ_k≈0.93
+        //   （低清已近成品、细节错位）出现，0.5 档低清无成型细节，不触发。仍置 0 可实验性回退。
+        setenv("NA_H3_SELFLIFT_CLEAN_HANDOFF", "1", 1)
         // 日志描述：用户设计调度（低清 N-1 + 高清固定 1 步）
-        let h3SlDesc = "SelfLift 用户设计调度：低清 \(h3Stage1Steps - 1) 步(σ_k=0.93) + 高清固定 1 步"
+        let h3SlDesc = "SelfLift 用户设计调度：低清 \(h3Stage1Steps - 1) 步(σ_k=0.5) + 高清固定 1 步"
         if stage2On {
             pipelineLog("H3 视频生成：目标直出 \(genW)×\(genH)（SelfLift 内部×0.5 除2，外部不再÷2）\(h3Stage1Steps) 步 turbo（\(h3SlDesc)），再接 Stage2 refine（第二阶段开，\(h3LowOnly ? "lowOnly 分工：H3 只出低分半清，LTX 二采升频×2 + 高清精修" : "全清 latent 直通、不再升频×2")；Apple 超分\(appleSROn ? "开" : "关")）@ \(alignedFrames) 帧（latentT=\(latentT)），条件：\(condSummary)")
         } else if appleSROn {

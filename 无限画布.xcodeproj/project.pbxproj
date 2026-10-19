@@ -51,6 +51,16 @@
 		5AD7A09930358BF8007525F8 /* 媒体播放.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "媒体播放.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		5ACA61D5302EE9EB00C0EF7E /* Exceptions for "model" folder in "无限画布" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				"real esrgan/upscale_main.swift",
+			);
+			target = 000000000000000100000000 /* 无限画布 */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		000000000000000000000010 /* ui */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
@@ -59,6 +69,9 @@
 		};
 		5ACA61D5302EE9EB00C0EF7D /* model */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				5ACA61D5302EE9EB00C0EF7E /* Exceptions for "model" folder in "无限画布" target */,
+			);
 			path = model;
 			sourceTree = "<group>";
 		};

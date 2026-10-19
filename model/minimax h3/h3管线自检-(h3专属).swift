@@ -254,6 +254,10 @@ enum H3PipelineRun {
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "20" {
             return runRef2VATest()
         }
+        // NA_H3TEST=91：SelfLift dump latent 离线解码（NCDHW f32 .bin → mp4，供逐段看片定位脏源）
+        if ProcessInfo.processInfo.environment["NA_H3TEST"] == "91" {
+            return runH3DecodeDumpTest()
+        }
         // NA_H3TEST=9：ComfyUI sol-attn 移植（H3SolAttn）合成数值自检（不加载模型）
         if ProcessInfo.processInfo.environment["NA_H3TEST"] == "9" {
             return H3SolAttn.selfTest()
@@ -1269,6 +1273,96 @@ enum H3PipelineRun {
         }
 
         _ = sem.wait(timeout: .now() + 5400)
+        MLX.Memory.clearCache()
+        log("退出码 \(code)")
+        return code
+    }
+
+    // NA_H3TEST=91：把 NA_DUMP_SELFLIFT 落盘的 NCDHW f32 latent（5×Int32 头 + float32 体）
+    // 直接走 H3 video VAE 解码成 h264 mp4，供「低清 / 升频 / 一致性」各阶段看片比对。
+    // 环境变量：NA_SLDECODE_DIR（run 目录，缺省取 /tmp/h3_selflift_dump 下最新 run_*）、
+    //           NA_SLDECODE_NAMES（逗号分隔，默认 z0_low.bin,z_lat.bin）、
+    //           NA_SLDECODE_OUT（输出目录，缺省 <run>/decode）、NA_SLDECODE_FPS（默认 H3Const.fps）。
+    static func runH3DecodeDumpTest() -> Int32 {
+        let env = ProcessInfo.processInfo.environment
+        func log(_ s: String) { print("[SLDECODE] \(s)"); fflush(stdout) }
+
+        let root = env["NA_SLDECODE_DIR"] ?? "/tmp/h3_selflift_dump"
+        var dir = root
+        if env["NA_SLDECODE_DIR"] == nil,
+           let items = try? FileManager.default.contentsOfDirectory(atPath: root) {
+            if let last = items.filter({ $0.hasPrefix("run_") }).sorted().last {
+                dir = root + "/" + last
+            }
+        }
+        let names = (env["NA_SLDECODE_NAMES"] ?? "z0_low.bin,z_lat.bin")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let outDir = env["NA_SLDECODE_OUT"] ?? (dir + "/decode")
+        let fps = Int(env["NA_SLDECODE_FPS"] ?? "") ?? Int(H3Const.fps)
+        try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        log("输入目录 \(dir)；输出目录 \(outDir)；fps=\(fps)")
+
+        let modelDir = "\(CommonPaths.modelRoot)/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-mlx-6bit"
+        // 嵌套目录兼容（与生成侧一致）：根目录直拼优先，不存在时递归查找
+        let modelRootURL = URL(fileURLWithPath: modelDir, isDirectory: true)
+        var vaeURL = modelRootURL.appendingPathComponent("video_vae.safetensors")
+        if !FileManager.default.fileExists(atPath: vaeURL.path) {
+            vaeURL = FileFinder.first(named: "video_vae.safetensors", under: modelRootURL) ?? vaeURL
+        }
+        log("VAE 权重 \(vaeURL.path)")
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 1
+
+        Task {
+            do {
+                let w = try H3Weights(url: vaeURL)
+                w.cacheEnabled = false
+                let vae = try H3VAE.load(w)
+                for name in names {
+                    let p = "\(dir)/\(name)"
+                    guard FileManager.default.fileExists(atPath: p) else {
+                        log("跳过（文件不存在）：\(p)"); continue
+                    }
+                    let data = try Data(contentsOf: URL(fileURLWithPath: p))
+                    guard data.count > 20 else { log("跳过（文件过短）：\(p)"); continue }
+                    let hdr = data.subdata(in: 0..<20)
+                    var shape: [Int] = []
+                    for i in 0..<5 {
+                        let v = hdr[i * 4..<(i * 4 + 4)].withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+                        shape.append(Int(v))
+                    }
+                    let body = data.subdata(in: 20..<data.count)
+                    var floats = [Float](repeating: 0, count: body.count / 4)
+                    _ = floats.withUnsafeMutableBytes { body.copyBytes(to: $0) }
+                    guard floats.count == shape.reduce(1, *) else {
+                        log("跳过（尺寸不符）：\(name) shape=\(shape) floats=\(floats.count)"); continue
+                    }
+                    let t0 = Date()
+                    let z = MLXArray(floats, shape)
+                    var pixels = vae.decode(z)
+                    MLX.eval(pixels)
+                    let fCount = pixels.shape[2], h = pixels.shape[3], wd = pixels.shape[4]
+                    let stem = name.replacingOccurrences(of: ".bin", with: "")
+                    let outPath = "\(outDir)/\(stem)_\(wd)x\(h)_\(fCount)f.mp4"
+                    try writeMp4(frameCount: fCount, width: wd, height: h, fps: fps,
+                                 to: outPath, h264MaxQuality: true) { f, base, bpr, isV210 in
+                        let fr = pixels[0..<1, 0..<3, f..<(f + 1), 0..<h, 0..<wd].reshaped([3, h, wd])
+                        return fillFrameForPixelBuffer(fr, width: wd, height: h,
+                                                       base: base, bytesPerRow: bpr, isV210: isV210)
+                    }
+                    let sec = String(format: "%.1f", Date().timeIntervalSince(t0))
+                    log("✅ \(name) \(shape) → \(outPath)（\(fCount) 帧 \(wd)×\(h)，\(sec)s）")
+                    pixels = MLXArray(0)
+                    MLX.Memory.clearCache()
+                }
+                code = 0
+            } catch {
+                log("❌ 解码失败：\(error)")
+                code = 1
+            }
+            sem.signal()
+        }
+        _ = sem.wait(timeout: .now() + 3600)
         MLX.Memory.clearCache()
         log("退出码 \(code)")
         return code

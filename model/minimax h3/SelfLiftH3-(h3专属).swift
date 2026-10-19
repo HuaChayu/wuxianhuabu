@@ -380,6 +380,10 @@ public func runH3Stage1WithSelfLift(
     dit: H3DiT,
     textStates: MLXArray,
     condRowsFull: MLXArray,
+    // ★ 2026-10-19 原生半清条件行（源图阶段多编一份 0.5 像素 → 直喂低清段）：
+    //   非 nil 时低分条件行不再由 full-res latent 在 latent 域 bilinear 降采样
+    //   （官方 `_resize_keyframes` 旧路径保留为回退：含 history video 块 / 行数不匹配时自动走旧路）。
+    condRowsLowOverride: MLXArray? = nil,
     refBlocks: [RefBlock] = [],
     textTags: [UInt8] = [],
     latT: Int,
@@ -446,16 +450,38 @@ public func runH3Stage1WithSelfLift(
     //   （总 NFE 5 < 官方 N=6，不浪费算力）。
     let split: SelfLiftScheduleSplit
     // ★ 用户既定设计（2026-10-09 收敛为唯一调度，不再有官方 75% 档/解耦 A/B 档）：
-    //   总步数 N → 低清 N-1 步线性等距跑到 σ_k（默认 0.93，可经
-    //   NA_H3_SELFLIFT_DECOUPLE_LOW_K 覆盖；无反推、无 0.5、无 HIGH_STEPS 独立高清步数），
-    //   高清固定最后 1 步 σ_next → 0（等深 σ_next=σ_k，重加噪后不补 Euler 直接接高清 1 步）。
+    //   总步数 N → 低清 N-1 步线性等距跑到 σ_k（默认 0.5，可经
+    //   NA_H3_SELFLIFT_DECOUPLE_LOW_K 覆盖；无反推、无 HIGH_STEPS 独立高清步数），
+    //   高清固定最后 1 步 σ_next → 0（等深 σ_next=σ_k，不补 Euler 直接接高清 1 步）。
+    //   ★ 2026-10-19（用户需求）：σ_k 由 0.95 改 0.5 —— 低清只跑到半清（细节尚未成型），
+    //     剩下的交给高清单步收；交接状态改为带噪直通（见 cfg.cleanEndpointHandoff）。
     //   语义即 SelfLiftScheduleSplit.makeFixedFinalStep(totalSteps:sigmaK:)。
+    //   ★ 交接状态类型（2026-10-19）：默认「带噪直通」——低清末步不做 Eq.3 clean 预测，正常 Euler
+    //     走到 σ_k，交出去的就是 σ_k 处的含噪 x（高清需要噪点状态继续处理）。
+    //     · cfg.cleanEndpointHandoff=true → 恢复旧路径（Eq.3 x0 → 升频 → 重加噪）；仅关闭不移除，代码保留。
+    //     · lowOnly（H3 一采只出低分半清 latent 给 LTX 二采）仍需要 clean 端点作为下游输入，强制保留。
+    //     lowOnly 是入参，故此处即可定档（下方低清循环共用同一变量）。
+    let useCleanEndpoint = cfg.cleanEndpointHandoff || lowOnly
     split = try SelfLiftScheduleSplit.makeFixedFinalStep(
         totalSteps: sigmas.count - 1,
-        sigmaK: cfg.decoupleSigmaK ?? 0.935)
-    log("SelfLift 用户设计调度：低清 L=\(split.lowNFE)（终点 σ_k=\(String(format: "%.4f", split.sigmaK))）"
-        + "→ 提升 → 按 σ_next=σ_k 重加噪（等深，不补 Euler）→ 高清固定 1 步；"
-        + "原调度 N=\(sigmas.count - 1) 已绕开")
+        sigmaK: cfg.decoupleSigmaK ?? 0.6,
+        renoiseSigma: cfg.renoiseSigma,
+        cleanEndpoint: useCleanEndpoint)
+    // ★ 音频调度解耦（2026-10-16）：音频行改用 H3 原生音频调度 sigmaSchedule(总NFE, shiftA)，
+    //   与视频侧提升点 sigma_k 解耦。低清段取前 lowNFE+1 项、高分段取自 lowNFE 起的 highNFE+1 项，
+    //   逐位喂给 buildTimestepPlan(audioSigma:) 与 da 的 delta_sigma_a 计算。
+    //   修复动机：sigma_k→1 时旧口径（音频随视频 sigma_v 经 timeShiftSigma 换算）低清单步仅覆盖
+    //   音频行程约 5%，其余约 78% 压进高分单步 Euler → 跨度过大导致削波与高频崩坏。
+    let audioSigmas = sigmaSchedule(steps: UInt32(split.lowNFE + split.highNFE), shift: shiftA)
+    let audioSigmasLow = Array(audioSigmas[0...split.lowNFE])
+    let audioSigmasHigh = Array(audioSigmas[split.lowNFE...])
+    log("SelfLift 音频调度解耦：总 NFE=\(split.lowNFE + split.highNFE) shiftA=\(String(format: "%.4f", shiftA))，"
+        + "低清 sigma_a \(String(format: "%.4f", audioSigmasLow[0]))→\(String(format: "%.4f", audioSigmasLow[split.lowNFE]))，"
+        + "高分 \(String(format: "%.4f", audioSigmasHigh[0]))→\(String(format: "%.4f", audioSigmasHigh[split.highNFE]))")
+    let lowRunsToZero = split.sigmaK <= 1e-9
+    log("SelfLift 用户设计调度：低清 L=\(split.lowNFE)（终点 σ_k=\(String(format: "%.4f", split.sigmaK))\(lowRunsToZero ? "，跑满完整流程" : "")）"
+        + "→ 提升 → \(abs(split.sigmaNext - split.sigmaK) > 1e-9 ? "按 σ_ren=\(String(format: "%.4f", split.sigmaNext)) 重加噪" : "等深交接（σ_next=σ_k，不重加噪）")"
+        + " → 高清固定 1 步 → 0；原调度 N=\(sigmas.count - 1) 已绕开")
 
     // CFG 引导状态（官方 SelfLiftH3Sampler 默认 cfg=5.0 全程双路；工程旧行为无 CFG 单路）。
     let cfgScale = cfg.cfgScale
@@ -500,6 +526,14 @@ public func runH3Stage1WithSelfLift(
     //   此前 preRef 先切 → 与注入行序错位（参考块 latent 内容读错行区，ref2va 续接
     //   画面污染的潜在来源，本次一并修复）。
     let allRefBlocks = refBlocks + preRefBlocks
+
+    // ★ 2026-10-19 原生半清条件行启用判定：history video 参考块无法在源图阶段预编
+    //   （其 latent 来自前置 .h3cc），出现即回退旧路径；keyframe / refImg 段可整段直通。
+    let nativeLowCond: MLXArray? = (condRowsLowOverride != nil
+        && !allRefBlocks.contains { $0.kind == .video }) ? condRowsLowOverride : nil
+    if condRowsLowOverride != nil, nativeLowCond == nil {
+        log("SelfLift 原生半清条件行：检测到 history video 参考块，回退 latent 域降采样旧路径")
+    }
     let condOffset = Int(preCondRows)
     var condSegs: [MLXArray] = []
     // ★ 2026-10-02/2026-10-04 语义：高分段条件行 = 原生 full-res 行直通。
@@ -525,12 +559,14 @@ public func runH3Stage1WithSelfLift(
             }
             let seg = condRowsFull[offset..<(offset + fRows)]
             offset += fRows
-            let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gridH, gridW: gridW)   // [1,latH,latW,C]
-            let low = slResizeKeyframeLatent(lat, outH: latHl, outW: latWl,
-                                             keepAlive: keepAlive)                   // [1,latHl,latWl,C]
-            let rows = H3TensorOps.patchifyVideo(low, gridH: gHl, gridW: gWl)
-            keepAlive.hold([lat, low, rows])
-            condSegs.append(rows)
+            if nativeLowCond == nil {
+                let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gridH, gridW: gridW)   // [1,latH,latW,C]
+                let low = slResizeKeyframeLatent(lat, outH: latHl, outW: latWl,
+                                                 keepAlive: keepAlive)                   // [1,latHl,latWl,C]
+                let rows = H3TensorOps.patchifyVideo(low, gridH: gHl, gridW: gWl)
+                keepAlive.hold([lat, low, rows])
+                condSegs.append(rows)
+            }
             // ★ 2026-10-02 回退（用户确认）：前置尾段 latent 是去噪完成的高清 full-res 结果，
             //   高分段直接原生行直通（与低分内部处理解耦）——不再低清重采样→learned upscaler
             //   提升（多此一举且降画面，还引入 2×2 提升网格）。
@@ -552,15 +588,17 @@ public func runH3Stage1WithSelfLift(
                 }
                 let seg = condRowsFull[offset..<(offset + n)]
                 offset += n
-                let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gh, gridW: gw)         // [1,latH,latW,C]
                 let lh = slLowResSize(Int(b.latentH), scale: cfg.lowResScale)
                 let lw = slLowResSize(Int(b.latentW), scale: cfg.lowResScale)
-                let low = slResizeKeyframeLatent(lat, outH: lh, outW: lw,
-                                                 keepAlive: keepAlive)                   // [1,lh,lw,C]
-                let rows = H3TensorOps.patchifyVideo(low, gridH: lh / Int(H3Const.patchH),
-                                                     gridW: lw / Int(H3Const.patchW))
-                keepAlive.hold([lat, low, rows])
-                condSegs.append(rows)
+                if nativeLowCond == nil {
+                    let lat = H3TensorOps.unpatchifyVideo(seg, gridH: gh, gridW: gw)         // [1,latH,latW,C]
+                    let low = slResizeKeyframeLatent(lat, outH: lh, outW: lw,
+                                                     keepAlive: keepAlive)                   // [1,lh,lw,C]
+                    let rows = H3TensorOps.patchifyVideo(low, gridH: lh / Int(H3Const.patchH),
+                                                         gridW: lw / Int(H3Const.patchW))
+                    keepAlive.hold([lat, low, rows])
+                    condSegs.append(rows)
+                }
                 // ★ 参考图行（含前置 refImg）为 VAE 编码的干净 latent，无低清 patch 网格残留，
                 //   保持原生全分辨率注入高清 forward（非端点锚定，低清/高清两套对静态参考无碍）。
                 condSegsHigh.append(seg)
@@ -607,7 +645,16 @@ public func runH3Stage1WithSelfLift(
             throw NSError(domain: "H3SelfLift", code: 5, userInfo: [NSLocalizedDescriptionKey:
                 "参考块行数与 condRowsFull 不一致：\(offset) vs \(condRowsFull.shape[0])"])
         }
-    let condRowsLow = condSegs.count == 1 ? condSegs[0] : concatenated(condSegs, axis: 0)
+    // ★ 2026-10-19 原生半清条件行直通：调用方在源图 encode 阶段已按 0.5 像素编好整份条件行，
+    //   低清段直接消费 —— 不再走「full-res latent → 逐帧 bilinear + 加性均值对齐」的
+    //   重复条件处理（那条路径画质不受益，且每段多算一遍）。
+    let condRowsLow: MLXArray
+    if let nativeLowCond {
+        condRowsLow = nativeLowCond
+        log("SelfLift 低清条件行：原生半清直通（rows \(nativeLowCond.shape[0])，跳过 latent 域降采样）")
+    } else {
+        condRowsLow = condSegs.count == 1 ? condSegs[0] : concatenated(condSegs, axis: 0)
+    }
     // ★ 2026-10-02 回退后语义：原始 full-res 条件行同时供低分/高分两路消费。
     //   高分段（condRowsHigh）= 原生 full-res 行直通（fl2va 无参考块用低清→提升版除外，
     //   那是官方 keyframe encodeImage 语义；ref2va 的 boundary/history 均为去噪完成的
@@ -699,7 +746,8 @@ public func runH3Stage1WithSelfLift(
     // 否则视觉块的 mod 行会落到 text 模态（H3Layout.swift:637 起），条件参考被打错调制。
     layoutLow.textTags = textTags
     let tsLow = collectScheduleTs(layout: layoutLow, sigmas: split.lowSigmas,
-                                  shiftV: shiftV, shiftA: shiftA, aug: CondNoiseAug())
+                                  shiftV: shiftV, shiftA: shiftA, aug: CondNoiseAug(),
+                                  audioSigmas: audioSigmasLow)
     dit.precomputeAdaln(ts: tsLow)
     let ropeLow = buildRope(layout: layoutLow, invFreq: dit.invFreq)
 
@@ -721,10 +769,25 @@ public func runH3Stage1WithSelfLift(
     MLX.eval(videoX, audioX)
 
     let pabK = attentionBroadcastK
+    // ★ 2026-10-19 粗步长守卫：PAB 跨步复用的前提是「相邻步 σ 几乎不变」。
+    //   旧调度（σ_k=0.95、5 步）每步 Δσ≈0.0125，复用安全；低清跑满到 0 时每步 Δσ≈1/l
+    //   （N=6 → 0.2，是旧值的 16 倍），把 Δσ=0.2 前的 attention/MLP 输出直接套到当前步，
+    //   等于把上一个噪声深度的内容叠进来 → 鬼影 / 细节污染 / 步间闪烁。
+    //   这里按实际 σ 步长自动禁用低清段复用（k 视作 1 = 每步重算），只多花算力、不改数值语义。
+    //   NA_H3_SELFLIFT_PAB_MAX_DSIGMA 可覆盖阈值（默认 0.04，按 k 步累计 Δσ 判定，σ_k=0.6 档 Δσ=0.1333×2=0.267 超线（阈值 0.02，维持每步重算）→低清不复用；
+    //   设成很大的值即恢复旧行为）。
+    let sigmaGapMax = zip(split.lowSigmas.dropFirst(), split.lowSigmas).map { $0 - $1 }.max() ?? 0
+    let pabGapLimit = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_PAB_MAX_DSIGMA"].flatMap(Double.init) ?? 0.02
+    // ★ 按「一次复用的实际跨度」判定：k 步才刷新一次 ⇒ 过期跨度 = k × Δσ，不能只看单步 Δσ。
+    let pabStaleGap = sigmaGapMax * Double(max(pabK, 1))
+    let lowPabK: UInt32 = (pabK > 1 && pabStaleGap >= pabGapLimit) ? 1 : pabK
+    if lowPabK != pabK {
+        log("SelfLift 低分 PAB 守卫：低分复用跨度 k·Δσ=\(String(format: "%.4f", pabStaleGap))（Δσ=\(String(format: "%.4f", sigmaGapMax))×k\(pabK)）> \(pabGapLimit) → 低分清空跨步复用（k \(pabK)→1，每步重算）")
+    }
     let makePab: () -> H3AttnBroadcast? = { pabK > 1 ? H3AttnBroadcast(count: dit.blocks.count) : nil }
     var pab = makePab()
 
-    // ── 3. 低分循环（第 ts 步只取端点预测，不做 Euler）────────────────────
+    // ── 3. 低分循环（默认逐段 Euler 到 σ_k；clean 端点模式末步改取 Eq.3 预测、丢弃 Euler）──
     slMem("低分段 · 起步（DiT 全权重 + 低分 PAB \(pab == nil ? "关闭" : "开启")）")
     var lowCleanX0: MLXArray? = nil
     for i in 0..<split.lowNFE {
@@ -735,9 +798,10 @@ public func runH3Stage1WithSelfLift(
 
         let plan = buildTimestepPlanGlobal(layout: layoutLow, sigmaV: sigma,
                                            shiftV: shiftV, shiftA: shiftA,
-                                           aug: CondNoiseAug(), globalTs: dit.adalnTables!.ts)
+                                           aug: CondNoiseAug(), globalTs: dit.adalnTables!.ts,
+                                           audioSigma: audioSigmasLow[i])
         let videoIn = concatenated([condRowsLow, videoX], axis: 0)
-        let refresh = pab == nil ? false : attnBroadcastRefresh(i, steps: UInt32(split.lowNFE), k: pabK)
+        let refresh = pab == nil ? false : attnBroadcastRefresh(i, steps: UInt32(split.lowNFE), k: lowPabK)
         let outPos = dit.forward(layout: layoutLow, plan: plan, textStates: textStates,
                                  videoRows: videoIn, audioRows: audioX, rope: ropeLow,
                                  sigmaV: sigma, shiftV: shiftV, shiftA: shiftA,
@@ -758,22 +822,27 @@ public func runH3Stage1WithSelfLift(
             out = H3DiTOutput(video: outPos.video, audio: outPos.audio)
         }
 
+        // ★ 音频调度解耦（2026-10-16）：delta_sigma_a 取音频自身调度的相邻差，不再由视频 sigma 换算；
+        //   slopeAF 仍用于抵消 out.audio 携带的 d_sigma_a/d_sigma_v 缩放（与原生 H3Pipeline 同款）。
         let slopeAF = timeShiftSlope(sigma, fromShift: shiftV, toShift: shiftA)
-        let da = (timeShiftSigma(sigmaNext, fromShift: shiftV, toShift: shiftA)
-                - timeShiftSigma(sigma, fromShift: shiftV, toShift: shiftA)) / slopeAF
+        let da = (audioSigmasLow[i + 1] - audioSigmasLow[i]) / slopeAF
 
         // 步内缩放因子（4 字节标量张量）先取出并挂进强引用池：它们是本步懒图（加噪/音频更新）
         // 的输入 buffer，若在 eval 之前就失去 Swift 侧引用，小 buffer 会被分配器空闲池回收。
         let vScale = H3TensorOps.scalarLike(Float(sigmaNext - sigma), out.video)
         let aScale = H3TensorOps.scalarLike(Float(da), out.audio)
         keepAlive.hold([vScale, aScale])
-        if i == split.lowNFE - 1 {
-            // Eq.3：clean endpoint；丢弃本步 video 的 Euler 更新
+        if i == split.lowNFE - 1, useCleanEndpoint {
+            // 旧路径（clean 端点）：Eq.3 预测 clean x0；丢弃本步 video 的 Euler 更新。
+            // ★ 2026-10-19 起默认**不走**这里（仅关闭不移除）：clean x0 内容权重在 σ_k 处过低，
+            //   升频后与高清重画内容不重合 → 鬼影。开关见 cfg.cleanEndpointHandoff。
             lowCleanX0 = SelfLiftCore.cleanEndpoint(x: videoX, velocity: out.video, sigma: sigma,
                                                     keepAlive: keepAlive)
             // 音频不参与提升，按正常 Euler 边界步跟到 σ_next（只更新本节点行）
             audioX = updateAudioX(audioX, delta: out.audio * aScale)
         } else {
+            // 带噪直通（默认）/ 中间步：正常 Euler 更新。末步在 σ_k 处停下来，
+            // videoX 即 σ_k 的带噪 x，直接作为交接状态（不预测 clean、不丢 Euler）。
             videoX = videoX + out.video * vScale
             audioX = updateAudioX(audioX, delta: out.audio * aScale)
         }
@@ -797,7 +866,17 @@ public func runH3Stage1WithSelfLift(
         let lowBcastMark = pab == nil ? "" : (refresh ? " bcastRefresh" : " bcastReuse")
         log("SelfLift 低分 \(i + 1)/\(split.lowNFE) sigma \(String(format: "%.4f", sigma)) dsigma \(String(format: "%.4f", sigmaNext - sigma)) [low\(lowBcastMark)]（\(Int(-Date().timeIntervalSince(stepT)))s）")
     }
-    guard let x0Low = lowCleanX0 else { throw SelfLiftScheduleError.tooFewSteps(0) }
+    // 交接状态：clean 模式下必须是 Eq.3 x0；带噪直通模式下就是 σ_k 处的 videoX。
+    if cfg.cleanEndpointHandoff, lowCleanX0 == nil {
+        throw SelfLiftScheduleError.tooFewSteps(0)
+    }
+    let handoffState: MLXArray = lowCleanX0 ?? videoX
+    if !useCleanEndpoint {
+        log("SelfLift 交接状态：低清出口取 σ_k=\(String(format: "%.4f", split.sigmaK)) 的 x（末步正常 Euler，跑满时即 clean 成品）"
+            + "；过渡块按 σ_ren=\(String(format: "%.4f", split.sigmaNext)) \(abs(split.sigmaNext - split.sigmaK) > 1e-9 ? "重加噪" : "等深直通")")
+    } else {
+        log("SelfLift 交接状态：clean 端点 —— 低清出口 Eq.3/z0 升频后按 σ_ren=\(String(format: "%.4f", split.sigmaNext)) 重加噪")
+    }
 
     // ── 3.5 阶段边界屏障（低分出口 → 过渡块入口）───────────────────────────
     // 过渡块是整个 SelfLift 分支里唯一一段「大分配浪 + 大回收浪」窗口：VAE decode（36 层
@@ -829,14 +908,14 @@ public func runH3Stage1WithSelfLift(
     //    0.95×rws，使 b) 更易被顶到，属负向改动。
     // ③ 第五轮起只补一道「入口清池」（clearCache），不抬 cacheLimit、不加窗口内逻辑；
     //    窗口内各步内存水位由只读诊断 slDiag 打点，供复测把崩溃位置收敛到具体步骤。
-    MLX.eval(x0Low)
+    MLX.eval(handoffState)
     Stream.gpu.synchronize()
 
     // ── 3.6 lowOnly 出口（IC 链路）：低清段完成即返回，跳过过渡块 + 高分循环 ──
     // H3 一采只出低分半清 latent，高分由 LTX 二采负责（升频×2 + 高清 IC 精修，factor=2）。
     // 返回形态：NCDHW [1,C,T,latHl,latWl]（半清网格），供 H3Pipeline 的 adapter 直转 LTX 域。
     if lowOnly {
-        let z0LowLat = toNCDHW(H3TensorOps.unpatchifyVideo(x0Low, gridH: gHl, gridW: gWl), c: latC)
+        let z0LowLat = toNCDHW(H3TensorOps.unpatchifyVideo(handoffState, gridH: gHl, gridW: gWl), c: latC)
         MLX.eval(z0LowLat)
         log("SelfLift lowOnly：低清段完成（NFE=\(split.lowNFE)，latent \(latHl)×\(latWl)），"
             + "直接返回低清 latent \(z0LowLat.shape)；高分交由 LTX 二采升频×2 + IC 精修")
@@ -869,6 +948,31 @@ public func runH3Stage1WithSelfLift(
     // 故不放在函数体内 —— 局部 func 的使用点不能早于其声明点）。
     slDiag("入口屏障后起步")
 
+    // ── 3.9 latent 落盘（低清出口 / 升频器出口，高清之前）──────────────────
+    // ★ 2026-10-19（用户需求）：lift 模式默认把「高清之前」的关键阶段 latent 落盘，
+    //   NCDHW float32，文件头 5 个 Int32 = shape，供离线解码成视频逐阶段对比。
+    //   NA_DUMP_SELFLIFT=0 关闭；NA_DUMP_SELFLIFT_DIR 指定根目录
+    //   （默认 /tmp/h3_selflift_dump/run_<时间戳>/，每次生成独立子目录，不互相覆盖）。
+    let selfLiftDumpEnabled = (ProcessInfo.processInfo.environment["NA_DUMP_SELFLIFT"] ?? "1") != "0"
+    let selfLiftDumpDir: String = {
+        let base = ProcessInfo.processInfo.environment["NA_DUMP_SELFLIFT_DIR"] ?? "/tmp/h3_selflift_dump"
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd_HHmmss"
+        return base + "/run_" + df.string(from: Date())
+    }()
+    let dumpSelfLift: (String, MLXArray) -> Void = { name, arr in
+        guard selfLiftDumpEnabled else { return }
+        let f = arr.asType(.float32)
+        MLX.eval(f)
+        let floats = f.asArray(Float.self)
+        var header = arr.shape.map { Int32($0) }
+        var data = Data(bytes: &header, count: header.count * MemoryLayout<Int32>.size)
+        floats.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
+        try? FileManager.default.createDirectory(atPath: selfLiftDumpDir, withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: selfLiftDumpDir + "/" + name))
+        pipelineLog("SELFLIFT-DUMP \(name) shape=\(arr.shape) floats=\(floats.count) → \(selfLiftDumpDir)/\(name)")
+    }
+
     // ── 4. 过渡块（零 NFE）──────────────────────────────────────────────
     // 4.1 直接 latent 提升：官方 learned upscaler（H3LatentUpscaler，时间维感知，
     //     实测 1344×768 高分辨率下显著消除帧间双像/面部重影，见 h3_scene_ab 自检结论）。
@@ -882,6 +986,9 @@ public func runH3Stage1WithSelfLift(
         } catch {
             preconditionFailure("learned upscaler 不可用，SelfLift 终止（nearest 回退已于 2026-09-22 移除）：\(error.localizedDescription)")
         }
+        // ★ 2026-10-19 升频器出口 latent（高清之前，rho=0 时这是唯一能拿到 z_lat 的点：
+        //   旧实现只在 consistencyRows 里 dump，rho=0 该闭包不执行 → z_lat 永远落不了盘）
+        dumpSelfLift("z_lat.bin", toNCDHW(up, c: latC))
         let rowsOut = H3TensorOps.patchifyVideo(up, gridH: gridH, gridW: gridW)
         keepAlive.hold([lat, up, rowsOut])
         return rowsOut
@@ -921,26 +1028,14 @@ public func runH3Stage1WithSelfLift(
         return rowsOut
     }
     // 4.3 Eq.6-9：在 NCDHW 域按通道求不一致度
-    // NA_DUMP_SELFLIFT=1：导出 z0_low / z_lat / z_pix / z0_high 四份 latent（NCDHW float32，
-    // 文件头部 5 个 Int32 为 shape），供离线验证两路提升差异与重影根因（h3_53 复盘）。
-    // 注意：debug 模式会在过渡块内提前物化三份高清 latent，内存峰值略升，仅诊断时开启。
-    let dumpSelfLift: (String, MLXArray) -> Void = { name, arr in
-        let f = arr.asType(.float32)
-        MLX.eval(f)
-        let floats = f.asArray(Float.self)
-        let dims = arr.shape.map { Int32($0) }
-        var header = dims
-        var data = Data(bytes: &header, count: header.count * MemoryLayout<Int32>.size)
-        floats.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
-        let dir = ProcessInfo.processInfo.environment["NA_DUMP_SELFLIFT_DIR"] ?? "/tmp/h3_selflift_dump"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: dir + "/" + name))
-        pipelineLog("SELFLIFT-DUMP \(name) shape=\(arr.shape) floats=\(floats.count) → \(dir)/\(name)")
-    }
-    if ProcessInfo.processInfo.environment["NA_DUMP_SELFLIFT"] == "1" {
-        // z0_low 是低清网格 rows，先还原成 NCDHW latent 再落盘（与 z_lat/z_pix 同域可比）
-        let z0LowLat = toNCDHW(H3TensorOps.unpatchifyVideo(x0Low, gridH: gHl, gridW: gWl), c: latC)
-        dumpSelfLift("z0_low.bin", z0LowLat)
+    // latent 落盘 helper 已上移到 4.1 之前（z0_low / z_lat 在过渡块入口即写出）。
+    if selfLiftDumpEnabled {
+        // 低清出口状态是 rows，先还原成 NCDHW latent 再落盘（与 z_lat/z_pix 同域可比）。
+        // ★ 两种模式文件语义不同，分开命名，避免离线解码时误判：
+        //   · clean 模式 → z0_low.bin（Eq.3 clean x0）
+        //   · 带噪直通（默认）→ x_low_sigmak.bin（σ_k 处的含噪 x，解码出来必然是带噪/半清画面，属正常）
+        let lowOutLat = toNCDHW(H3TensorOps.unpatchifyVideo(handoffState, gridH: gHl, gridW: gWl), c: latC)
+        dumpSelfLift(useCleanEndpoint ? "z0_low.bin" : "x_low_sigmak.bin", lowOutLat)
     }
     let consistencyRows: (MLXArray, MLXArray) -> MLXArray = { zLat, zPix in
         let a = toNCDHW(H3TensorOps.unpatchifyVideo(zLat, gridH: gridH, gridW: gridW), c: latC)
@@ -948,8 +1043,8 @@ public func runH3Stage1WithSelfLift(
         let fixed = SelfLiftCore.artifactAwareConsistencyLift(
             zLat: a, zPix: b, rho: cfg.rho, wMin: cfg.wMin, wMax: cfg.wMax, channelAxis: 1,
             keepAlive: keepAlive)
-        if ProcessInfo.processInfo.environment["NA_DUMP_SELFLIFT"] == "1" {
-            dumpSelfLift("z_lat.bin", a)
+        if selfLiftDumpEnabled {
+            // z_lat 已在 4.1 升频器出口落盘（唯一真源），此处只补 z_pix / z0_high
             dumpSelfLift("z_pix.bin", b)
             dumpSelfLift("z0_high.bin", fixed)
         }
@@ -976,7 +1071,7 @@ public func runH3Stage1WithSelfLift(
     videoX = SelfLiftTransition.run(
         split: split,
         cfg: cfg,
-        lowCleanX0: x0Low,
+        lowState: handoffState,
         noise: transitionNoise,
         liftLatent: liftLatentRows,
         liftPixelAnchor: cfg.needsPixelAnchor ? liftPixelRows : nil,
@@ -1004,7 +1099,8 @@ public func runH3Stage1WithSelfLift(
     slMem("过渡块后 · 像素锚点 VAE 提前释放")
     // 过渡块（零 NFE）：日志格式与原生 stage1 逐字同款（H3Pipeline.swift 行 553），
     // dsigma = σ_next − σ_k（等深调度下 = 0）；方括号槽位放提升前后尺寸。
-    log("SelfLift lift sigma \(String(format: "%.4f", split.sigmaK)) dsigma \(String(format: "%.4f", split.sigmaNext - split.sigmaK)) [lift \(latWl)×\(latHl)→\(latW)×\(latH)]（\(Int(-Date().timeIntervalSince(liftT)))s）")
+    let liftModeMark = useCleanEndpoint ? "clean→重加噪" : "带噪直通·不重加噪"
+    log("SelfLift lift sigma \(String(format: "%.4f", split.sigmaK)) dsigma \(String(format: "%.4f", split.sigmaNext - split.sigmaK)) [lift \(latWl)×\(latHl)→\(latW)×\(latH) \(liftModeMark)]（\(Int(-Date().timeIntervalSince(liftT)))s）")
 
     // ── 5. 高分上下文重建（分辨率/序列长度变了，必须整表重算）──────────────
     // 同上：续接前置尾段 keyframe 锚点无条件进 keyframes（ref2va 也注入）。
@@ -1022,7 +1118,8 @@ public func runH3Stage1WithSelfLift(
                                   keyframeGrids: keyframeGridsHigh)
     layoutHigh.textTags = textTags
     let tsHigh = collectScheduleTs(layout: layoutHigh, sigmas: split.highSigmas,
-                                   shiftV: shiftV, shiftA: shiftA, aug: CondNoiseAug())
+                                   shiftV: shiftV, shiftA: shiftA, aug: CondNoiseAug(),
+                                   audioSigmas: audioSigmasHigh)
     dit.precomputeAdaln(ts: tsHigh)
     let ropeHigh = buildRope(layout: layoutHigh, invFreq: dit.invFreq)
     // ★ 修复①（本轮，主体）：高分段的 PAB 广播缓存只在「确实存在复用步」时才建。
@@ -1060,7 +1157,8 @@ public func runH3Stage1WithSelfLift(
 
         let plan = buildTimestepPlanGlobal(layout: layoutHigh, sigmaV: sigma,
                                            shiftV: shiftV, shiftA: shiftA,
-                                           aug: CondNoiseAug(), globalTs: dit.adalnTables!.ts)
+                                           aug: CondNoiseAug(), globalTs: dit.adalnTables!.ts,
+                                           audioSigma: audioSigmasHigh[i])
         let videoIn = concatenated([condRowsHigh, videoX], axis: 0)
         let refresh = pab == nil ? false : attnBroadcastRefresh(i, steps: UInt32(split.highNFE), k: pabK)
         slMem("高分 \(i + 1)/\(split.highNFE) forward 前（PAB \(highPabEnabled ? "开" : "关")，refresh=\(refresh)）")
@@ -1081,9 +1179,9 @@ public func runH3Stage1WithSelfLift(
             out = H3DiTOutput(video: outPos.video, audio: outPos.audio)
         }
 
+        // ★ 音频调度解耦（2026-10-16）：delta_sigma_a 取音频自身调度的相邻差（同低清段说明）。
         let slopeAF = timeShiftSlope(sigma, fromShift: shiftV, toShift: shiftA)
-        let da = (timeShiftSigma(sigmaNext, fromShift: shiftV, toShift: shiftA)
-                - timeShiftSigma(sigma, fromShift: shiftV, toShift: shiftA)) / slopeAF
+        let da = (audioSigmasHigh[i + 1] - audioSigmasHigh[i]) / slopeAF
         // 与低分循环同一纪律：步内标量张量（4 字节小 buffer）先挂池，eval 之后再放。
         let vScale = H3TensorOps.scalarLike(Float(sigmaNext - sigma), out.video)
         let aScale = H3TensorOps.scalarLike(Float(da), out.audio)
