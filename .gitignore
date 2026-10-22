@@ -32,3 +32,6 @@ temp_h3_408_frames/
 !Packages/z-image-swift/Tests/goldens/
 **/*.ckpt
 **/*.gguf
+
+# 本地代码备份目录（回滚用，不入库）
+备份_*/

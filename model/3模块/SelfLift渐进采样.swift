@@ -258,8 +258,9 @@ public struct SelfLiftScheduleSplit: Sendable {
     //     N=11/12 自动推导后残留 ≤12.7%（N=11→ts=7 0.8727、N=12→ts=7 0.8955），无需再提阈值；
     //   - 换 sigma 调度风格（如 betaRefined）时 σ_next 分布不同，需重新核对落点；
     //   - 本问题与提示词/内容无关，纯调度层问题，换提示词同样受约束保护。
-    //   ※ 该兜底方案已废弃移除（2026-10-08）：固定最后一步等深设计（低清 N-1 步线性到 0.75 +
-    //     高清 1 步 0.75→0，等深连续）取代自动 75% 推导，不再需要 σ_next 下限/前移兜底，直接跑。
+    //   ※ 该兜底方案已废弃移除（2026-10-08）：固定最后一步设计（低清 N-1 步线性到 σ_k +
+    //     高清 1 步 σ_k→0，当前 σ_k=0.75，见 makeFixedFinalStep）取代自动 75% 推导，
+    //     不再需要 σ_next 下限/前移兜底，直接跑。
     // ══════════════════════════════════════════════════════════════════════
 
     /// 按官方 75% 比例由总步数 N 推导切换点：`ts = clamp(floor(0.75 · N), 1, N-1)`。
@@ -311,21 +312,22 @@ public struct SelfLiftScheduleSplit: Sendable {
 
     // ──────────────────────────────────────────────────────────────────────
     // 固定最后一步高清（M=1）等深调度（用户原始设计，2026-10-09 移除补 Euler）：
-    //   低清 L = N-1 步，线性等距跑到 σ_k（默认 0.6）；升频后按 σ_ren 重加噪接高清，
+    //   低清 L = N-1 步，线性等距跑到 σ_k（默认 0.75；2026-10-22 曾试 0.5 已回滚）；升频后按 σ_ren 重加噪接高清，
     //   不补 Euler，高清固定 1 步 σ_k → 0（等深连续，与旧版 decouple 行为一致）。
-    //   默认交接状态为 clean 端点：末步 Eq.3 预测 x0 → 升频 → 按 σ_next=σ_k 重加噪；
+    //   默认交接状态为 clean 端点：末步 Eq.3 预测 x0 → 升频 → 按 σ_ren 重加噪（默认 0.75）；
     //   带噪直通（末步 Euler 落在 σ_k、升频后不重加噪）由 cleanEndpoint=false 选择。
     // ──────────────────────────────────────────────────────────────────────
     /// - Parameter totalSteps: 面板第一阶段总步数 N（总 NFE = 低清 N-1 + 高清 1 = N）
-    /// - Parameter sigmaK: 低清终点 / 交接深度，默认 0.6（2026-10-19 用户逐档微调 0.86→0.92→0.90→0.95→0.8→0.7→0.6，clean 端点交高清）
+    /// - Parameter sigmaK: 低清终点 / 交接深度，默认 0.75（2026-10-20 用户定档；2026-10-22 曾下调至 0.5，同日已回滚 0.75；σ_k 历史 0.86→0.95→0.7→0.6→0.8→0.7→0.8→0.75→0.5→0.75；σ_ren 历史 0.8→0.5→0.55→0.75）
     /// - Parameter cleanEndpoint: true=末步 Eq.3 预测 clean x0 并重加噪（默认）；false=末步正常 Euler 落在 σ_k、交出含噪 x（带噪直通）
-    public static func makeFixedFinalStep(totalSteps: Int, sigmaK: Double = 0.6,
+    public static func makeFixedFinalStep(totalSteps: Int, sigmaK: Double = 0.75,
                                          renoiseSigma: Double? = nil,
                                          cleanEndpoint: Bool = true) throws -> SelfLiftScheduleSplit {
         let n = totalSteps
         guard n >= 3 else { throw SelfLiftScheduleError.tooFewSteps(n) }
         let l = n - 1                              // 低清 NFE
-        // ★ 2026-10-19 用户设计（当前默认）：低清止于 σ_k=0.6，clean 端点交高清（重加噪回 σ_ren=0.65）。
+        // ★ 2026-10-20 用户定档：低清止于 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚），
+        //   clean 端点交高清（重加噪回 σ_ren=0.75，与止点等深）。
         //   步长口径：
         //    · sigmaK ≈ 0（跑满）：dLow = 1/l —— 低清 l 步线性 1→0；末步（σ=1/l）的 Eq.3 x0
         //      与「Euler 到 0」完全等价（x - σ·v），因此两种 cleanEndpoint 取值结果一致，不多跑空转步。
@@ -341,9 +343,10 @@ public struct SelfLiftScheduleSplit: Sendable {
         // 低清出口深度：跑满时是 0，否则是 σ_k。
         let lowExit = lowToZero ? 0.0 : sigmaK
         // 高清起点：
-        //  · clean 端点（默认）→ σ_ren 默认 0.65：用户指定档位，高清认领 35% 升频内容、65% 重画。
-        //  · 带噪直通 → σ_next = σ_k（等深连续，不重加噪；跑满时 0.65）。
-        let ren = renoiseSigma ?? (cleanEndpoint ? 0.65 : (lowToZero ? 0.65 : sigmaK))
+        //  · clean 端点（默认）→ σ_ren 默认 0.75：用户 2026-10-20 定档（σ_k=0.75、σ_ren=0.75，接手与止点等深，
+        //    高清重画 55%、保留 45% 升频内容，比等深档更轻手）。
+        //  · 带噪直通 → σ_next = σ_k（等深连续，不重加噪；跑满时 0.75）。
+        let ren = renoiseSigma ?? (cleanEndpoint ? 0.75 : (lowToZero ? 0.75 : sigmaK))
         let sigmaNext = ren
         var lowSigmas = (0..<l).map { 1.0 - dLow * Double($0) }   // [1 … lowExit]（l 项）
         lowSigmas.append(lowExit)                  // 低清末步占位（clean 模式末步 Eq.3 用，Euler 丢弃）

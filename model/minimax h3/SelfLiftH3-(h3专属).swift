@@ -160,6 +160,28 @@ private func fromNCDHW(_ ncdhw: MLXArray, c: Int) -> MLXArray {
     return noBatch.transposed(1, 2, 3, 0)
 }
 
+/// 3 抽头 [1,2,1]/4 一维模糊（边界复制），供低频锚定的频带分离使用。
+private func slBlur1D(_ x: MLXArray, axis: Int) -> MLXArray {
+    let n = x.shape[axis]
+    let prev = MLXArray((0..<n).map { Int32(max($0 - 1, 0)) }, [n])
+    let next = MLXArray((0..<n).map { Int32(min($0 + 1, n - 1)) }, [n])
+    let a = x.take(prev, axis: axis)
+    let b = x.take(next, axis: axis)
+    return (a + x * 2 + b) * 0.25
+}
+
+/// 只沿 H/W（axis 3/4）跑两趟 3 抽头模糊 ≈ 高斯 σ≈1.1 latent px（= 8.8 输出像素）的低通。
+/// 时间轴刻意不动：时间维低通会给运动加拖影，低频锚定要的是「逐帧的空间低频」。
+private func slLowBandBlur(_ x: MLXArray) -> MLXArray {
+    var y = x
+    for _ in 0..<2 {
+        y = slBlur1D(y, axis: 3)
+        y = slBlur1D(y, axis: 4)
+    }
+    return y
+}
+
+
 // MARK: - 官方重采样内核（照抄 selflift.py / nodes.py 的插值调用）
 
 /// PyTorch `F.interpolate` 的表驱动等价实现。
@@ -453,7 +475,7 @@ public func runH3Stage1WithSelfLift(
     //   总步数 N → 低清 N-1 步线性等距跑到 σ_k（默认 0.5，可经
     //   NA_H3_SELFLIFT_DECOUPLE_LOW_K 覆盖；无反推、无 HIGH_STEPS 独立高清步数），
     //   高清固定最后 1 步 σ_next → 0（等深 σ_next=σ_k，不补 Euler 直接接高清 1 步）。
-    //   ★ 2026-10-19（用户需求）：σ_k 由 0.95 改 0.5 —— 低清只跑到半清（细节尚未成型），
+    //   ★ 2026-10-19（用户需求）：σ_k 定档 0.8 —— 低清跑到八成清（粗骨架 + 少量细节），
     //     剩下的交给高清单步收；交接状态改为带噪直通（见 cfg.cleanEndpointHandoff）。
     //   语义即 SelfLiftScheduleSplit.makeFixedFinalStep(totalSteps:sigmaK:)。
     //   ★ 交接状态类型（2026-10-19）：默认「带噪直通」——低清末步不做 Eq.3 clean 预测，正常 Euler
@@ -464,7 +486,8 @@ public func runH3Stage1WithSelfLift(
     let useCleanEndpoint = cfg.cleanEndpointHandoff || lowOnly
     split = try SelfLiftScheduleSplit.makeFixedFinalStep(
         totalSteps: sigmas.count - 1,
-        sigmaK: cfg.decoupleSigmaK ?? 0.6,
+        // ★ 2026-10-20 定档：低清止点 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚）。
+        sigmaK: cfg.decoupleSigmaK ?? 0.75,
         renoiseSigma: cfg.renoiseSigma,
         cleanEndpoint: useCleanEndpoint)
     // ★ 音频调度解耦（2026-10-16）：音频行改用 H3 原生音频调度 sigmaSchedule(总NFE, shiftA)，
@@ -753,18 +776,27 @@ public func runH3Stage1WithSelfLift(
 
     // ★ 2026-10-03 fresh-noise 路线：续接初值恒 nil（前置尾段只走 contKeyAnchors 条件行锚/
     //   参考块，不拼进采样初值），videoX 恒为本节点新段纯噪声起步（latT 行）。
-    var videoX = MLXRandom.normal([Int(latT) * gHl * gWl, vpatch], key: MLXRandom.key(seed))
+    // ★ 2026-10-22 噪声口径统一（对齐官方 H3 的单 seed 顺序抽取）：
+    //   官方 diffusers 集成里一个请求的所有噪声都从同一个 generator 依序抽（条件噪声 → video → audio），
+    //   顺序本身参与可复现性，不存在 seed+1 / seed+7 这种多路独立派生。本 Runner 用同一 seed
+    //   split 出的有序 key 槽位复刻该结构：
+    //     槽位 0 = 生成视频初值 · 槽位 1 = 音频初值 · 槽位 2 = lift 过渡重加噪
+    //   三处共用一条序列，抽取顺序即下标顺序；以后新增噪声一律往后追加槽位，
+    //   禁止再写 seed &+ N（旧口径 +0 / +1 / +7 已废弃）。
+    let noiseKeys = MLXRandom.split(key: MLXRandom.key(seed), into: 3)
+    MLX.eval(noiseKeys)
+    var videoX = MLXRandom.normal([Int(latT) * gHl * gWl, vpatch], key: noiseKeys[0])
     var audioX: MLXArray
     if contAudioRows > 0, let preAudio = audioContinuationRows {
         // ★ 音频续接：audioX = [前置真实尾段 | 本节点噪声]，前置行经 refAudio 段注入注意力，
         //   永远不被更新（never-denoised），本节点行从纯噪声采样。
         let preF32 = preAudio.asType(.float32)
-        let newNoise = MLXRandom.normal([Int(audioT) * 2, 32], key: MLXRandom.key(seed &+ 1))
+        let newNoise = MLXRandom.normal([Int(audioT) * 2, 32], key: noiseKeys[1])
         audioX = concatenated([preF32, newNoise], axis: 0)
         keepAlive.hold([preF32])
         log("SelfLift 音频续接：前置尾段 \(contAudioRows) 行（refAudio 锚点，never-denoised）+ 本节点 \(Int(audioT) * 2) 行纯噪声起步")
     } else {
-        audioX = MLXRandom.normal([Int(audioT) * 2, 32], key: MLXRandom.key(seed &+ 1))
+        audioX = MLXRandom.normal([Int(audioT) * 2, 32], key: noiseKeys[1])
     }
     MLX.eval(videoX, audioX)
 
@@ -774,7 +806,7 @@ public func runH3Stage1WithSelfLift(
     //   （N=6 → 0.2，是旧值的 16 倍），把 Δσ=0.2 前的 attention/MLP 输出直接套到当前步，
     //   等于把上一个噪声深度的内容叠进来 → 鬼影 / 细节污染 / 步间闪烁。
     //   这里按实际 σ 步长自动禁用低清段复用（k 视作 1 = 每步重算），只多花算力、不改数值语义。
-    //   NA_H3_SELFLIFT_PAB_MAX_DSIGMA 可覆盖阈值（默认 0.04，按 k 步累计 Δσ 判定，σ_k=0.6 档 Δσ=0.1333×2=0.267 超线（阈值 0.02，维持每步重算）→低清不复用；
+    //   NA_H3_SELFLIFT_PAB_MAX_DSIGMA 可覆盖阈值（默认 0.04，按 k 步累计 Δσ 判定，σ_k=0.8 档 Δσ=0.10×2=0.20 超线（阈值 0.02，维持每步重算）→低清不复用；
     //   设成很大的值即恢复旧行为）。
     let sigmaGapMax = zip(split.lowSigmas.dropFirst(), split.lowSigmas).map { $0 - $1 }.max() ?? 0
     let pabGapLimit = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_PAB_MAX_DSIGMA"].flatMap(Double.init) ?? 0.02
@@ -977,6 +1009,9 @@ public func runH3Stage1WithSelfLift(
     // 4.1 直接 latent 提升：官方 learned upscaler（H3LatentUpscaler，时间维感知，
     //     实测 1344×768 高分辨率下显著消除帧间双像/面部重影，见 h3_scene_ab 自检结论）。
     //     2026-09-22 起 nearest 回退分支已移除：learned 不可用即显式终止，绝不静默降级。
+    // ★ 2026-10-20 低频锚定（方案 A）：升频器出口 latent 的 NCDHW 视图，零拷贝引用缓存下来，
+    //   只在高分收尾后用于「低频带替换」，不参与过渡块噪声（噪声仍是纯白噪）。
+    var liftedLatNCDHW: MLXArray? = nil
     let liftLatentRows: (MLXArray) -> MLXArray = { rows in
         let lat = H3TensorOps.unpatchifyVideo(rows, gridH: gHl, gridW: gWl)      // [latT,latHl,latWl,C]
         let up: MLXArray
@@ -988,7 +1023,9 @@ public func runH3Stage1WithSelfLift(
         }
         // ★ 2026-10-19 升频器出口 latent（高清之前，rho=0 时这是唯一能拿到 z_lat 的点：
         //   旧实现只在 consistencyRows 里 dump，rho=0 该闭包不执行 → z_lat 永远落不了盘）
-        dumpSelfLift("z_lat.bin", toNCDHW(up, c: latC))
+        let upNCDHW = toNCDHW(up, c: latC)
+        dumpSelfLift("z_lat.bin", upNCDHW)
+        liftedLatNCDHW = upNCDHW
         let rowsOut = H3TensorOps.patchifyVideo(up, gridH: gridH, gridW: gridW)
         keepAlive.hold([lat, up, rowsOut])
         return rowsOut
@@ -1057,7 +1094,7 @@ public func runH3Stage1WithSelfLift(
     //   2026-10-03 起 fresh-noise 路线 layoutLatT=latT（视频段只含本节点新段），
     //   过渡噪声按 layoutLatT 走（与布局/rope/videoX 同一口径）。
     let transitionNoise = MLXRandom.normal([Int(layoutLatT) * gridH * gridW, vpatch],
-                                           key: MLXRandom.key(seed &+ 7))
+                                           key: noiseKeys[2])
     // ★ 物化点 D：过渡噪声先物化，别把随机数 kernel 也挤进过渡块的分配浪里。
     MLX.eval(transitionNoise)
     slDiag("D 过渡噪声完成")
@@ -1201,6 +1238,46 @@ public func runH3Stage1WithSelfLift(
     }
 
     log("SelfLift 一采完成（总 NFE=\(split.totalNFE)，与原调度一致）")
+
+    // ── 6.5 低频锚定（方案 A，默认开启）────────────────────────────────
+    // ★ 2026-10-20 用户定档。动机：σ_ren 那一趟是「纯白噪重画」，低清已经定下的粗骨架/整体色彩
+    //   会被高清 1 步一起重画掉 → 表现为低频漂移 + 帧间闪烁；但直接改噪声频谱会变成 DiT 没见过的
+    //   OOD 输入（NA_H3_SELFLIFT_BANDLIMIT_NOISE 已实测：低通噪声 → 满屏彩色斑块，已回退）。
+    //   所以这里**完全不动噪声、不动 schedule、不动步数**，只在高分收尾后做一次频带分离：
+    //       x_out = x_high + (1−α)·( LPF(anchor) − LPF(x_high) )
+    //   等价于「低频带按 α 混向升频后的低清 latent，高频带原样保留高清」。LPF 只在 H/W 上做，
+    //   时间轴不动（否则给运动加拖影）。
+    //   α 语义：低频带里保留高清的比例。0.25=默认（低频 75% 用低清锚，2026-10-20 由 0.5 加强），
+    //   1=关闭（旧行为）、0=低频全部取低清锚。
+    //   覆盖：NA_H3_SELFLIFT_LOWANCHOR=0 / 0.1 / 0.25 / 0.5 / 1（1 即关闭）。
+    let lowAnchorAlpha = Float(ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_LOWANCHOR"]
+                               .flatMap(Double.init) ?? 0.25)
+    if lowAnchorAlpha < 0.999, let anchorNCDHW = liftedLatNCDHW {
+        let highNCDHW = toNCDHW(H3TensorOps.unpatchifyVideo(videoX, gridH: gridH, gridW: gridW), c: latC)
+        if highNCDHW.shape == anchorNCDHW.shape {
+            let hf = highNCDHW.asType(.float32)
+            let af = anchorNCDHW.asType(.float32)
+            let lowDiff = slLowBandBlur(af) - slLowBandBlur(hf)
+            let merged = (hf + lowDiff * (1.0 - lowAnchorAlpha)).asType(videoX.dtype)
+            MLX.eval(merged)
+            let rmsDiff = (lowDiff * lowDiff).mean().sqrt().item(Float.self)
+            let rmsHigh = (hf * hf).mean().sqrt().item(Float.self)
+            videoX = H3TensorOps.patchifyVideo(fromNCDHW(merged, c: latC), gridH: gridH, gridW: gridW)
+            MLX.eval(videoX)
+            keepAlive.hold([merged, videoX])
+            if selfLiftDumpEnabled { dumpSelfLift("z_lowanchor.bin", merged) }
+            log("SelfLift 低频锚定：开启 α_low=\(String(format: "%.2f", lowAnchorAlpha))"
+                + "（低频带 \(Int((1 - lowAnchorAlpha) * 100))% 混向升频低清，高频带不动；"
+                + "低频修正量 rms=\(String(format: "%.4f", rmsDiff))/画面 rms=\(String(format: "%.4f", rmsHigh))"
+                + "，噪声与 schedule 未改）")
+        } else {
+            log("SelfLift 低频锚定：跳过（形状不符 high=\(highNCDHW.shape) anchor=\(anchorNCDHW.shape)）")
+        }
+    } else if lowAnchorAlpha >= 0.999 {
+        log("SelfLift 低频锚定：关闭（NA_H3_SELFLIFT_LOWANCHOR=\(lowAnchorAlpha) ≥ 1）")
+    } else {
+        log("SelfLift 低频锚定：跳过（未取到升频器出口 latent；rho>0 走像素锚点路径时为预期）")
+    }
     // 返回前裁掉前置 refAudio 行：audioX 契约 = 本节点音频行 [audioT*2, 32]（与无续接行为一致）
     let outAudioX = contAudioRows > 0 ? audioX[contAudioRows..<audioX.shape[0], 0..<32] : audioX
     return (videoX, outAudioX)

@@ -107,9 +107,11 @@ public enum H3FL2VAPipeline {
         steps: UInt32 = 6,
         latentT: UInt32 = 5,
         seed: UInt64 = 42,
-        sparsePolicy: SparsePolicy = .mix,
+        sparsePolicy: SparsePolicy = .off,
         scheduleStyle: H3SigmaScheduleStyle = .official,
-        // 分阶段门控已取消：默认 nil，stage1 去噪全程按 sparsePolicy 走 SOL 稀疏注意力，
+        // ★ 2026-10-22 SOL 已关闭：sparsePolicy 默认 .off（50 层全稠密 SDPA）；
+        //   如需对照实验显式传 .mix / .spatial / .temporal。
+        // 分阶段门控已取消：默认 nil，stage1 去噪全程按 sparsePolicy 走（关闭时恒为 dense），
         // 不再在首尾段整步回退稠密（SDPA）。【已取消实验参数】全工程无调用点，恒不生效，
         // 保留该参数仅供显式对照实验：
         // 传 (start, end) 时 progress = step/total ∈ (start, end) 才稀疏，两端全 dense
@@ -1133,8 +1135,14 @@ public enum H3FL2VAPipeline {
         var audioX: MLXArray
         // ★ 2026-10-03 续接初值恒 nil（fresh-noise 路线）：新段纯噪声起步，前置画面由
         //   contKeyAnchors 条件行锚 + contRefBlocks/continuationHistoryRows 参考块约束。
-        videoX = MLXRandom.normal([nVideoRows, vpatch], key: MLXRandom.key(seed))
-        audioX = MLXRandom.normal([nAudioRows, 32], key: MLXRandom.key(seed &+ 1))
+        // ★ 2026-10-22 噪声口径统一（与 SelfLift Runner 同一规则）：一个 seed 一条有序 key 流，
+        //   下标即抽取顺序：槽位 0 = 生成视频初值 · 槽位 1 = 音频初值。
+        //   视觉条件的 aug 噪声（condRows 的 0.999/0.001 混合）属条件侧、排在生成行之前，
+        //   仍走 seed 原始 key，不占本序列槽位。禁止再写 seed &+ N。
+        let noiseKeys = MLXRandom.split(key: MLXRandom.key(seed), into: 2)
+        MLX.eval(noiseKeys)
+        videoX = MLXRandom.normal([nVideoRows, vpatch], key: noiseKeys[0])
+        audioX = MLXRandom.normal([nAudioRows, 32], key: noiseKeys[1])
         MLX.eval(videoX, audioX)
         log("初始 latent：video \(videoX.shape)，audio \(audioX.shape)")
         // ★ 2026-09-20 零行保护：文本生成/纯续接空图的 condRows 可能为 0 行，mean/std 跳过防崩
@@ -1221,10 +1229,11 @@ public enum H3FL2VAPipeline {
             let decoupleEnv = ProcessInfo.processInfo.environment
             if let lowK = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_LOW_K"].flatMap(Double.init) {
                 slCfg.decoupleSigmaK = lowK
-                log("SelfLift σ_k 覆盖：NA_H3_SELFLIFT_DECOUPLE_LOW_K=\(lowK)（默认 0.6：低清止于 σ=0.6）")
+                log("SelfLift σ_k 覆盖：NA_H3_SELFLIFT_DECOUPLE_LOW_K=\(lowK)（默认 0.75：低清止于 σ=0.75）")
             }
-            // ★ 2026-10-19 用户设计：低清止于 σ_k=0.6 → clean 端点升频 → 高清按 σ_ren=0.65 重加噪接手。
-            //   显式覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA；未设时 clean 端点默认 0.65（高清重画 65%），
+            // ★ 2026-10-20 用户定档：低清止于 σ_k=0.75 → clean 端点升频 → 高清按 σ_ren=0.75 重加噪接手（与止点等深）。
+            //   2026-10-22 曾下调至 0.5 做对照，同日已回滚 0.75（改动点为下方 slSigmaK / SelfLiftH3 / makeFixedFinalStep）。
+            //   显式覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA；未设时 clean 端点默认 0.75（高清重画 75%），
             //   带噪直通档跟随 σ_k（等深，不重加噪）。等深 clean（σ_ren=σ_k）历史已证鬼影，不作默认。
             let envRen = decoupleEnv["NA_H3_SELFLIFT_RENOISE_SIGMA"].flatMap(Double.init)
             if let r = envRen {
@@ -1232,20 +1241,21 @@ public enum H3FL2VAPipeline {
                 log("SelfLift σ_ren 覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA=\(r)")
             }
             // ★ 交接状态类型（2026-10-19 用户需求）：默认「clean 端点」——低清末步 Eq.3 预测
-            //   clean x0，升频后按 σ_next=σ_k 重加噪交高清，高清 1 步 σ_k→0。
+            //   clean x0，升频后按 σ_ren=0.75 重加噪交高清，高清 1 步 0.75→0。
             //   带噪直通（末步 Euler 落在 σ_k、升频后不重加噪）保留作 A/B 对照：
             //   NA_H3_SELFLIFT_CLEAN_HANDOFF=0 可切到带噪直通。
             let cleanHandoffEnv = (decoupleEnv["NA_H3_SELFLIFT_CLEAN_HANDOFF"] ?? "1") != "0"
             slCfg.cleanEndpointHandoff = cleanHandoffEnv
-            log("SelfLift 交接模式：\(cleanHandoffEnv ? "clean 端点（默认：Eq.3 x0 → 升频 → 按 σ_next=σ_k 重加噪）" : "带噪直通（σ_k 含噪 x → 升频 → 不重加噪，高清接手续跑）")")
+            log("SelfLift 交接模式：\(cleanHandoffEnv ? "clean 端点（默认：Eq.3 x0 → 升频 → 按 σ_ren=0.75 重加噪）" : "带噪直通（σ_k 含噪 x → 升频 → 不重加噪，高清接手续跑）")")
             slCfg.cfgScale = envCfgScale
             if envCfgScale > 0 {
                 log("SelfLift CFG：cfg=\(envCfgScale)（每步 positive+negative 双 forward；注意 turbo LoRA 蒸馏模型 cfg 过大会过冲）")
             } else {
                 log("SelfLift CFG：关闭（cfg=0，仅 positive 单路；NA_H3_SELFLIFT_CFG=1.5~3.0 可显式实验）")
             }
-            let slSigmaK = slCfg.decoupleSigmaK ?? 0.6
-            let slRen = slCfg.renoiseSigma ?? (cleanHandoffEnv ? 0.65 : (slSigmaK <= 1e-9 ? 0.65 : slSigmaK))
+            // ★ 2026-10-20 定档：低清止点 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚）。
+            let slSigmaK = slCfg.decoupleSigmaK ?? 0.75
+            let slRen = slCfg.renoiseSigma ?? (cleanHandoffEnv ? 0.75 : (slSigmaK <= 1e-9 ? 0.75 : slSigmaK))
             log("SelfLift 第三分支：开启（低清 N-1=\(stage1SegmentCount - 1) 步线性到 σ_k=\(slSigmaK)\(slSigmaK <= 1e-9 ? "（跑满完整流程）" : "")，"
                 + "升频后按 σ_ren=\(slRen) 重加噪，高清固定 1 步 σ_ren→0，总 NFE=\(stage1SegmentCount)；"
                 + "低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
@@ -1518,13 +1528,18 @@ public enum H3FL2VAPipeline {
                                   dtype: PrecisionPolicy.defaultMainDType)
 
             // ④ 加噪：clean 行 → σ0 起点（flow：x = σ0·ε + (1-σ0)·x_clean，ε 派生种子）
+            // ★ 2026-10-22 噪声口径统一：二采（Stage2 refine）属于独立阶段，自身也从一条
+            //   seed 流顺序抽取（槽位 0 = 视频 · 槽位 1 = 音频），不再写 rSeed &+ 1。
+            //   rSeed 仍是二采独立种子（默认 seed &+ 777 只用来隔离二采与主链，不参与主链槽位）。
             let rSeed = s2cfg.refineSeed ?? (seed &+ 777)
+            let refineKeys = MLXRandom.split(key: MLXRandom.key(rSeed), into: 2)
+            MLX.eval(refineKeys)
             let s0 = sigmas2[0]
-            let epsV = MLXRandom.normal([nVideoRows2, vpatch], key: MLXRandom.key(rSeed)).asType(videoX2.dtype)
+            let epsV = MLXRandom.normal([nVideoRows2, vpatch], key: refineKeys[0]).asType(videoX2.dtype)
             var vx2 = videoX2 * H3TensorOps.scalarLike(Float(1.0 - s0), videoX2)
             vx2 = vx2 + epsV * H3TensorOps.scalarLike(Float(s0), videoX2)
             let sa0 = timeShiftSigma(s0, fromShift: sv, toShift: sa)
-            let epsA = MLXRandom.normal(audioX.shape, key: MLXRandom.key(rSeed &+ 1)).asType(audioX.dtype)
+            let epsA = MLXRandom.normal(audioX.shape, key: refineKeys[1]).asType(audioX.dtype)
             var ax2 = audioX * H3TensorOps.scalarLike(Float(1.0 - sa0), audioX)
             ax2 = ax2 + epsA * H3TensorOps.scalarLike(Float(sa0), audioX)
             MLX.eval(vx2, ax2)
