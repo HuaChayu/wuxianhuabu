@@ -29,38 +29,26 @@ func loadSafetensors(_ path: String) -> [String: MLXArray]? {
 /// per_channel_statistics（2×128 标量）的场景——避免整读 vae_decoder（777MB），
 /// 完整权重留给 ⑦ VAE 解码阶段只读一次盘。
 func readSafetensorsFloatArrays(path: String, keys: [String]) -> [String: MLXArray]? {
-    guard let fh = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
-    defer { try? fh.close() }
-    let hdrLenData = fh.readData(ofLength: 8)
-    guard hdrLenData.count == 8 else { return nil }
-    let hdrLen = hdrLenData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
-    guard hdrLen > 0, hdrLen < (1 << 30) else { return nil }
-    guard let hdrData = try? fh.read(upToCount: Int(hdrLen)),
-          let json = try? JSONSerialization.jsonObject(with: hdrData) as? [String: Any] else { return nil }
+    // 映射读取：只指向需要的那几段字节，不再 seek+read 出中间 Data 副本
+    guard let file = try? MappedSafetensors(url: URL(fileURLWithPath: path)) else { return nil }
     var out: [String: MLXArray] = [:]
     for key in keys {
-        guard let info = json[key] as? [String: Any],
-              let dtype = info["dtype"] as? String,
-              let shape = info["shape"] as? [Int],
-              let offsets = info["data_offsets"] as? [Int], offsets.count == 2 else { continue }
-        let len = offsets[1] - offsets[0]
-        guard len > 0 else { continue }
-        try? fh.seek(toOffset: UInt64(8 + Int(hdrLen) + offsets[0]))
-        guard let data = try? fh.read(upToCount: len), data.count == len else { continue }
-        if dtype == "F32" {
-            var floats = [Float](repeating: 0, count: len / 4)
-            _ = floats.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-            out[key] = MLXArray(floats, shape)
-        } else if dtype == "BF16" {
-            var floats = [Float](repeating: 0, count: len / 2)
-            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-                let b = raw.bindMemory(to: UInt16.self)
-                for i in 0 ..< floats.count {
-                    let u32 = UInt32(b[i].littleEndian) << 16
-                    floats[i] = Float(bitPattern: u32)
-                }
+        guard let e = file.entries[key], e.nbytes > 0, let p = file.pointer(key) else { continue }
+        switch e.dtype {
+        case "F32":
+            let n = e.nbytes / 4
+            let buf = UnsafeRawBufferPointer(start: p, count: n * 4)
+            out[key] = MLXArray(Array(buf.bindMemory(to: Float.self)), e.shape)
+        case "BF16":
+            let n = e.nbytes / 2
+            let b = UnsafeRawBufferPointer(start: p, count: n * 2).bindMemory(to: UInt16.self)
+            var floats = [Float](repeating: 0, count: n)
+            for i in 0 ..< n {
+                floats[i] = Float(bitPattern: UInt32(b[i].littleEndian) << 16)
             }
-            out[key] = MLXArray(floats, shape)
+            out[key] = MLXArray(floats, e.shape)
+        default:
+            continue
         }
     }
     return out.isEmpty ? nil : out
@@ -113,64 +101,61 @@ func loadModelWeights(
 
 /// 读取 npy 文件为 MLXArray（f32；支持 v1/v2 header，LE/BE 长度回退）。
 func loadNpy(_ path: String) -> MLXArray? {
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+    // 映射读取，不再 Data → [UInt8] → [Float] 连拷三份
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else {
         print("❌ 无法读取 \(path)"); return nil
     }
-    let bytes = [UInt8](data)
-    guard bytes.count > 10,
-          bytes[0] == 0x93, bytes[1] == 0x4E, bytes[2] == 0x55, bytes[3] == 0x4D,
-          bytes[4] == 0x50, bytes[5] == 0x59 else {
-        print("❌ 非 npy 文件"); return nil
-    }
-    let version = bytes[6]
-    var headerStart: Int
-    if version == 1 {
-        headerStart = 10
-    } else {
-        headerStart = 12
-    }
-    // header 长度字段：version 后 2 字节（little-endian，Python numpy 写入；
-    // MLX 某些版本写 big-endian，若越界则回退）。
-    let headerLenLE = (Int(bytes[headerStart - 1]) << 8) | Int(bytes[headerStart - 2])
-    let headerLenBE = (Int(bytes[headerStart - 2]) << 8) | Int(bytes[headerStart - 1])
-    // 以第一个 '\n' 截取 header 文本用于解析 dict（不含 padding）
-    guard let newlineIdx = bytes[headerStart...].firstIndex(of: 0x0A) else {
-        print("❌ 找不到 header 结尾"); return nil
-    }
-    guard let header = String(data: data[headerStart ..< newlineIdx], encoding: .utf8) else {
-        print("❌ header 解析失败"); return nil
-    }
-    // 解析 dict: {'descr': '<f4', 'fortran_order': False, 'shape': (1, 15, 16, 16, 128), }
-    guard let descrRange = header.range(of: #"'descr':\s*'([^']+)'"#, options: .regularExpression),
-          let descr = header[descrRange].split(separator: "'", omittingEmptySubsequences: false).dropLast().last else {
-        print("❌ 找不到 descr；header=[\(header)] 长度=\(header.count) 字节=\(bytes[headerStart..<min(newlineIdx, headerStart+120)].prefix(40))")
-        return nil
-    }
-    guard let shapeRange = header.range(of: #"'shape':\s*\(([^)]*)\)"#, options: .regularExpression) else {
-        print("❌ 找不到 shape"); return nil
-    }
-    let shapeStr = header[shapeRange].split(separator: "(").last!.split(separator: ")").first!
-    let shape = shapeStr.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-    guard !shape.isEmpty else { print("❌ shape 解析失败"); return nil }
+    return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> MLXArray? in
+        let bytes = raw.bindMemory(to: UInt8.self)
+        guard bytes.count > 10,
+              bytes[0] == 0x93, bytes[1] == 0x4E, bytes[2] == 0x55, bytes[3] == 0x4D,
+              bytes[4] == 0x50, bytes[5] == 0x59 else {
+            print("❌ 非 npy 文件"); return nil
+        }
+        let version = bytes[6]
+        let headerStart = version == 1 ? 10 : 12
+        guard bytes.count > headerStart else { print("❌ npy header 越界"); return nil }
+        // header 长度字段：version 后 2 字节（little-endian，Python numpy 写入；
+        // MLX 某些版本写 big-endian，若越界则回退）。
+        let headerLenLE = (Int(bytes[headerStart - 1]) << 8) | Int(bytes[headerStart - 2])
+        let headerLenBE = (Int(bytes[headerStart - 2]) << 8) | Int(bytes[headerStart - 1])
+        guard let newlineIdx = bytes[headerStart...].firstIndex(of: 0x0A) else {
+            print("❌ 找不到 header 结尾"); return nil
+        }
+        guard let header = String(bytes: bytes[headerStart ..< newlineIdx], encoding: .utf8) else {
+            print("❌ header 解析失败"); return nil
+        }
+        // 解析 dict: {'descr': '<f4', 'fortran_order': False, 'shape': (1, 15, 16, 16, 128), }
+        guard let descrRange = header.range(of: #"'descr':\s*'([^']+)'"#, options: .regularExpression),
+              let descr = header[descrRange].split(separator: "'", omittingEmptySubsequences: false).dropLast().last else {
+            print("❌ 找不到 descr；header=[\(header)] 长度=\(header.count)")
+            return nil
+        }
+        guard let shapeRange = header.range(of: #"'shape':\s*\(([^)]*)\)"#, options: .regularExpression) else {
+            print("❌ 找不到 shape"); return nil
+        }
+        let shapeStr = header[shapeRange].split(separator: "(").last!.split(separator: ")").first!
+        let shape = shapeStr.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard !shape.isEmpty else { print("❌ shape 解析失败"); return nil }
 
-    let count = shape.reduce(1, *)
-    // 数据起点 = headerStart + header 长度字段；little-endian 越界则试 big-endian
-    var dataStart = headerStart + headerLenLE
-    if dataStart + count * 4 > bytes.count {
-        dataStart = headerStart + headerLenBE
+        let count = shape.reduce(1, *)
+        var dataStart = headerStart + headerLenLE
+        if dataStart + count * 4 > bytes.count {
+            dataStart = headerStart + headerLenBE
+        }
+        guard descr == "<f4" || descr == "|f4" else {
+            print("❌ 暂不支持 dtype descr=[\(descr)] header=[\(header)]")
+            return nil
+        }
+        guard dataStart >= 0, dataStart + count * 4 <= bytes.count else {
+            print("❌ 数据越界 dataStart=\(dataStart) need=\(count * 4) have=\(bytes.count - dataStart)"); return nil
+        }
+        print("npy: descr=\(descr) shape=\(shape) count=\(count)")
+        // 直接把映射区这段喂给 MLX，物化一次即止
+        let slice = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress! + dataStart),
+                         count: count * 4, deallocator: .none)
+        return MLXArray(slice, shape, dtype: .float32)
     }
-    guard descr == "<f4" || descr == "|f4" else {
-        print("❌ 暂不支持 dtype descr=[\(descr)] count=\(descr.count) unicode=\(descr.unicodeScalars.map { $0.value }) header=[\(header)]")
-        return nil
-    }
-    guard dataStart + count * 4 <= bytes.count else {
-        print("❌ 数据越界 dataStart=\(dataStart) need=\(count * 4) have=\(bytes.count - dataStart)"); return nil
-    }
-    let floats = bytes[dataStart ..< (dataStart + count * 4)].withUnsafeBytes {
-        Array($0.bindMemory(to: Float.self))
-    }
-    print("npy: descr=\(descr) shape=\(shape) count=\(count)")
-    return MLXArray(floats, shape)
 }
 
 // MARK: - 量化参数动态推断（safetensors header）

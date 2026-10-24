@@ -1,0 +1,15 @@
+{
+  "originHash" : "1e8341dffffb97af449068d0c4b455c2ede800b756f8d1cbcabf572d3e57fe1f",
+  "pins" : [
+    {
+      "identity" : "designscaffold",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/xocialize/DesignScaffold",
+      "state" : {
+        "revision" : "510e8fda8e68e42edb3d808d5f721d799547786f",
+        "version" : "0.25.0"
+      }
+    }
+  ],
+  "version" : 3
+}

@@ -190,8 +190,8 @@ public final class H3Weights {
         public let count: Int
     }
 
-    private let handle: FileHandle
-    private let dataStart: UInt64
+    /// 底层只读映射：文件页不落匿名副本，取 tensor 时零拷贝指向映射区。
+    private let file: MappedSafetensors
     public private(set) var meta: [String: TensorMeta] = [:]
     private var cache: [String: MLXArray] = [:]
     /// 一次性读取阶段（DiT/VAE/text_encoder 全量加载）关闭缓存，
@@ -199,65 +199,47 @@ public final class H3Weights {
     public var cacheEnabled: Bool = true
 
     public init(url: URL) throws {
-        let fh = try FileHandle(forReadingFrom: url)
-        self.handle = fh
-        guard let lenData = try fh.read(upToCount: 8), lenData.count == 8 else {
-            throw H3Error.badFile("cannot read header length")
+        let mapped: MappedSafetensors
+        do {
+            mapped = try MappedSafetensors(url: url)
+        } catch {
+            throw H3Error.badFile("\(url.lastPathComponent): \(error.localizedDescription)")
         }
-        let headerLen = lenData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
-        self.dataStart = 8 + headerLen
-        guard let headerData = try fh.read(upToCount: Int(headerLen)) else {
-            throw H3Error.badFile("cannot read header")
+        self.file = mapped
+        meta.reserveCapacity(mapped.entries.count)
+        for (key, e) in mapped.entries {
+            guard let dt = H3DType(safetensorsName: e.dtype) else { continue }
+            meta[key] = TensorMeta(
+                dtype: dt,
+                shape: e.shape,
+                start: UInt64(e.offset),
+                count: e.nbytes
+            )
         }
-        guard let obj = try? JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
-            throw H3Error.badFile("header is not JSON")
-        }
-        for (key, value) in obj {
-            guard key != "__metadata__", let t = value as? [String: Any],
-                  let dtypeName = t["dtype"] as? String,
-                  let dt = H3DType(safetensorsName: dtypeName),
-                  let shape = t["shape"] as? [NSNumber],
-                  let offs = t["data_offsets"] as? [NSNumber], offs.count == 2 else { continue }
-            let start = UInt64(truncating: offs[0])
-            let end = UInt64(truncating: offs[1])
-            let count = Int(end - start)
-            meta[key] = TensorMeta(dtype: dt, shape: shape.map { $0.intValue }, start: start, count: count)
-        }
-    }
-
-    deinit {
-        try? handle.close()
     }
 
     public var keys: [String] { Array(meta.keys) }
 
     public func contains(_ key: String) -> Bool { meta[key] != nil }
 
+    /// 就地取 tensor：不再经过 FileHandle.read 的整块 Data 副本，
+    /// 只保留 MLXArray 物化进 unified memory 的那一份（GPU 计算必需）。
+    private func load(_ key: String) -> MLXArray? {
+        guard let m = meta[key] else { return nil }
+        return file.mlxArray(key, dtype: m.dtype.mlx)
+    }
+
     /// Fetch a tensor (cached). Returns nil when the key is absent.
     public func get(_ key: String) -> MLXArray? {
         if cacheEnabled, let cached = cache[key] { return cached }
-        guard let m = meta[key] else { return nil }
-        do {
-            try handle.seek(toOffset: dataStart + m.start)
-            guard let data = try handle.read(upToCount: m.count) else { return nil }
-            let arr = MLXArray(data, m.shape, dtype: m.dtype.mlx)
-            if cacheEnabled { cache[key] = arr }
-            return arr
-        } catch {
-            return nil
-        }
+        guard let arr = load(key) else { return nil }
+        if cacheEnabled { cache[key] = arr }
+        return arr
     }
 
     /// Fetch without caching (for one-shot tensors like LoRA pairs).
     public func getUncached(_ key: String) -> MLXArray? {
-        guard let m = meta[key] else { return nil }
-        do {
-            try handle.seek(toOffset: dataStart + m.start)
-            guard let data = try handle.read(upToCount: m.count) else { return nil }
-            return MLXArray(data, m.shape, dtype: m.dtype.mlx)
-        } catch {
-            return nil
-        }
+        load(key)
     }
 
     /// Quantized triple fetch: "prefix.weight" (U32 packed) + scales + biases.

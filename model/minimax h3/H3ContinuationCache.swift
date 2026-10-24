@@ -410,7 +410,8 @@ public enum H3ContinuationCache {
                             shapeCheck: (latH: Int, latW: Int, latC: Int, gridH: Int, gridW: Int, videoPatchDim: Int)? = nil,
                             recovery: Recovery = Recovery()) -> Loaded? {
         let url = cacheURL(nodeID: nodeID, branchID: branchID, rootDir: rootDir)
-        guard let payload = try? Data(contentsOf: url), payload.count >= magicByteCount + headerLenByteCount else {
+        guard let payload = try? Data(contentsOf: url, options: .mappedIfSafe),
+              payload.count >= magicByteCount + headerLenByteCount else {
             return nil
         }
         // magic
