@@ -472,9 +472,11 @@ public func runH3Stage1WithSelfLift(
     //   （总 NFE 5 < 官方 N=6，不浪费算力）。
     let split: SelfLiftScheduleSplit
     // ★ 用户既定设计（2026-10-09 收敛为唯一调度，不再有官方 75% 档/解耦 A/B 档）：
-    //   总步数 N → 低清 N-1 步线性等距跑到 σ_k（默认 0.5，可经
-    //   NA_H3_SELFLIFT_DECOUPLE_LOW_K 覆盖；无反推、无 HIGH_STEPS 独立高清步数），
-    //   高清固定最后 1 步 σ_next → 0（等深 σ_next=σ_k，不补 Euler 直接接高清 1 步）。
+    //   总步数 N → 低清跑到 σ_k（默认 0.75，可经 NA_H3_SELFLIFT_DECOUPLE_LOW_K 覆盖；
+    //   无反推、无 HIGH_STEPS 独立高清步数），高清固定最后 1 步 σ_next → 0。
+    //   ★ 2026-10-25（用户需求）：低清段的「线性等距」设计已移除 —— 低清网格改由直出同款
+    //     shift 公式生成（σ=shift·b/(1+(shift-1)·b)，b 等距），用户输入的 σ_k / σ_ren
+    //     先吸附到公式网格上最近的 σ 档再落调度。实现见 makeFixedFinalStep(shift:)。
     //   ★ 2026-10-19（用户需求）：σ_k 定档 0.8 —— 低清跑到八成清（粗骨架 + 少量细节），
     //     剩下的交给高清单步收；交接状态改为带噪直通（见 cfg.cleanEndpointHandoff）。
     //   语义即 SelfLiftScheduleSplit.makeFixedFinalStep(totalSteps:sigmaK:)。
@@ -489,7 +491,9 @@ public func runH3Stage1WithSelfLift(
         // ★ 2026-10-20 定档：低清止点 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚）。
         sigmaK: cfg.decoupleSigmaK ?? 0.75,
         renoiseSigma: cfg.renoiseSigma,
-        cleanEndpoint: useCleanEndpoint)
+        cleanEndpoint: useCleanEndpoint,
+        // ★ 2026-10-25：低清网格改为公式生成，shift 必须与直出路径同一档（视频 shiftV）。
+        shift: shiftV)
     // ★ 音频调度解耦（2026-10-16）：音频行改用 H3 原生音频调度 sigmaSchedule(总NFE, shiftA)，
     //   与视频侧提升点 sigma_k 解耦。低清段取前 lowNFE+1 项、高分段取自 lowNFE 起的 highNFE+1 项，
     //   逐位喂给 buildTimestepPlan(audioSigma:) 与 da 的 delta_sigma_a 计算。
@@ -502,6 +506,12 @@ public func runH3Stage1WithSelfLift(
         + "低清 sigma_a \(String(format: "%.4f", audioSigmasLow[0]))→\(String(format: "%.4f", audioSigmasLow[split.lowNFE]))，"
         + "高分 \(String(format: "%.4f", audioSigmasHigh[0]))→\(String(format: "%.4f", audioSigmasHigh[split.highNFE]))")
     let lowRunsToZero = split.sigmaK <= 1e-9
+    let sigmaKInput = cfg.decoupleSigmaK ?? 0.75
+    let sigmaRenInput = cfg.renoiseSigma ?? (useCleanEndpoint ? 0.75 : (lowRunsToZero ? 0.75 : sigmaKInput))
+    log("SelfLift 公式网格（shift=\(String(format: "%.1f", shiftV))）："
+        + "σ_k 输入 \(String(format: "%.4f", sigmaKInput)) → 公式最近档 \(String(format: "%.4f", split.sigmaK))；"
+        + "σ_ren 输入 \(String(format: "%.4f", sigmaRenInput)) → 公式最近档 \(String(format: "%.4f", split.sigmaNext))")
+    log("SelfLift 低清公式网格：L=\(split.lowNFE) 步 \(split.lowSigmas.map { String(format: "%.4f", $0) }.joined(separator: " → "))")
     log("SelfLift 用户设计调度：低清 L=\(split.lowNFE)（终点 σ_k=\(String(format: "%.4f", split.sigmaK))\(lowRunsToZero ? "，跑满完整流程" : "")）"
         + "→ 提升 → \(abs(split.sigmaNext - split.sigmaK) > 1e-9 ? "按 σ_ren=\(String(format: "%.4f", split.sigmaNext)) 重加噪" : "等深交接（σ_next=σ_k，不重加噪）")"
         + " → 高清固定 1 步 → 0；原调度 N=\(sigmas.count - 1) 已绕开")
@@ -675,6 +685,13 @@ public func runH3Stage1WithSelfLift(
     if let nativeLowCond {
         condRowsLow = nativeLowCond
         log("SelfLift 低清条件行：原生半清直通（rows \(nativeLowCond.shape[0])，跳过 latent 域降采样）")
+    } else if condSegs.isEmpty {
+        // ★ 2026-10-25 空条件行兜底（修 `[concatenate] No arrays provided` fatal）：
+        //   纯文生 / 无锚点 keyframe / 无参考块时 condSegs 为空，原来直接进 concatenated([])，
+        //   MLX 在 ops.cpp:677 处 fatalError（ErrorHandler.swift:345）整段进程崩掉。
+        //   此处改为构造 0 行条件张量：layout 侧 budgetLow 此时同样为 0，两者仍严格一致。
+        condRowsLow = condRowsFull[0..<0]
+        log("SelfLift 低清条件行：无锚点/参考块（纯文生），0 行（已跳过 empty concatenate）")
     } else {
         condRowsLow = condSegs.count == 1 ? condSegs[0] : concatenated(condSegs, axis: 0)
     }
@@ -685,9 +702,17 @@ public func runH3Stage1WithSelfLift(
     //   （2026-09-22 起 learned 不可用即显式终止，绝不静默回退 nearest。）
     let condRowsHigh: MLXArray
     if condSegsHigh.isEmpty {
-        preconditionFailure("SelfLift: 高清条件行缺失（condSegsHigh 为空，低清/高清同构注入未构建）")
+        // ★ 2026-10-25：纯文生（无锚点、无参考块）时高清条件行同为 0 行，原本次处
+        //   preconditionFailure 会直接终止；现在与低清侧同口径兜底 0 行，
+        //   budgetHigh 此时也为 0，断言仍成立。非纯文生仍视为结构错误、照旧终止。
+        guard contKeyAnchors.isEmpty, allRefBlocks.isEmpty else {
+            preconditionFailure("SelfLift: 高清条件行缺失（condSegsHigh 为空，低清/高清同构注入未构建）")
+        }
+        condRowsHigh = condRowsFull[0..<0]
+        log("SelfLift 高清条件行：无锚点/参考块（纯文生），0 行")
+    } else {
+        condRowsHigh = condSegsHigh.count == 1 ? condSegsHigh[0] : concatenated(condSegsHigh, axis: 0)
     }
-    condRowsHigh = condSegsHigh.count == 1 ? condSegsHigh[0] : concatenated(condSegsHigh, axis: 0)
     keepAlive.hold([condRowsHigh])
     MLX.eval(condRowsHigh)
 

@@ -1254,10 +1254,12 @@ public enum H3FL2VAPipeline {
                 log("SelfLift CFG：关闭（cfg=0，仅 positive 单路；NA_H3_SELFLIFT_CFG=1.5~3.0 可显式实验）")
             }
             // ★ 2026-10-20 定档：低清止点 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚）。
+            // ★ 2026-10-25：低清段不再线性等距，改由直出同款 shift 公式生成；σ_k / σ_ren 会在
+            //   Runner 里吸附到公式网格最近档（0.75 → 0.7491、0.5 → 0.5042），此处打的是输入值。
             let slSigmaK = slCfg.decoupleSigmaK ?? 0.75
             let slRen = slCfg.renoiseSigma ?? (cleanHandoffEnv ? 0.75 : (slSigmaK <= 1e-9 ? 0.75 : slSigmaK))
-            log("SelfLift 第三分支：开启（低清 N-1=\(stage1SegmentCount - 1) 步线性到 σ_k=\(slSigmaK)\(slSigmaK <= 1e-9 ? "（跑满完整流程）" : "")，"
-                + "升频后按 σ_ren=\(slRen) 重加噪，高清固定 1 步 σ_ren→0，总 NFE=\(stage1SegmentCount)；"
+            log("SelfLift 第三分支：开启（低清按 shift 公式跑到 σ_k=\(slSigmaK)\(slSigmaK <= 1e-9 ? "（跑满完整流程）" : "")（吸附最近档见 Runner 日志），"
+                + "升频后按 σ_ren=\(slRen) 重加噪，高清固定 1 步 σ_ren→0；"
                 + "低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
             // 像素锚点 VAE（decoder + encoder，bf16 实测 ≈5.3GB）只服务过渡块的
             // decode→encode 往返；rho=0（needsPixelAnchor=false）时 liftPixelAnchor 为

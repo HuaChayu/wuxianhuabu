@@ -104,7 +104,7 @@ public struct SelfLiftConfig: Sendable {
     /// CFG 引导给 keyframe 结构裁决力，压制低清残留。
     public var cfgScale: Double
 
-    /// σ_k 覆盖入口（低清终点 / 交接深度）：nil 时用 `makeFixedFinalStep` 默认 0.5；
+    /// σ_k 覆盖入口（低清终点 / 交接深度）：nil 时用 `makeFixedFinalStep` 默认 0.75（落调度前吸附公式档）；
     /// 环境变量 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖（命名沿用旧解耦 A/B 时代）。
     public var decoupleSigmaK: Double?
 
@@ -217,6 +217,10 @@ public struct SelfLiftScheduleSplit: Sendable {
     /// 官方 75% 比例系数：官方两个论文实例 FLUX.2-Klein（3/4）、Z-Image-Turbo（6/8）均为 0.75；
     /// 本工程 H3 一采 N = 6 → ts = 4 与之一致。
     public static let officialTransitionRatio: Double = 0.75
+
+    /// 用户输入 σ 吸附到公式曲线时的采样分辨率（档数）。256 档时 0.75→0.7491、0.5→0.5042，
+    /// 既保证「值是公式真实产出的档位」，又不会像按 N 步网格吸附那样把 0.5 吸到 0.7。
+    public static let snapResolution: Int = 256
     // ══════════════════════════════════════════════════════════════════════
     // 【踩坑记录 · SelfLift 重影根因与修复】2026-09-17
     //
@@ -311,52 +315,96 @@ public struct SelfLiftScheduleSplit: Sendable {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // 固定最后一步高清（M=1）等深调度（用户原始设计，2026-10-09 移除补 Euler）：
-    //   低清 L = N-1 步，线性等距跑到 σ_k（默认 0.75；2026-10-22 曾试 0.5 已回滚）；升频后按 σ_ren 重加噪接高清，
-    //   不补 Euler，高清固定 1 步 σ_k → 0（等深连续，与旧版 decouple 行为一致）。
-    //   默认交接状态为 clean 端点：末步 Eq.3 预测 x0 → 升频 → 按 σ_ren 重加噪（默认 0.75）；
-    //   带噪直通（末步 Euler 落在 σ_k、升频后不重加噪）由 cleanEndpoint=false 选择。
+    // 固定最后一步高清（M=1）· 公式网格调度（2026-10-25 用户需求改版）
+    //
+    //   旧版（已移除）：低清 L 步「线性等距」跑到 σ_k —— 每步 Δσ 恒为 (1-σ_k)/L。
+    //   为什么移除：直出路径全程 σ 走 shift 曲线 σ(b)=shift·b/(1+(shift-1)·b)，等距 σ 只是
+    //   另一条轨迹（shift=12、5 步时前几步 Δσ 只有公式的约 1/4，末步又远大于公式），
+    //   低清段的评估点与直出路径对不上，两段口径不一致。
+    //
+    //   新口径：
+    //     · 低清网格 = 公式曲线（与直出 `sigmaSchedule(steps:shift:)` 逐点同式），b 空间等距；
+    //     · 用户输入的 σ_k（低清跑到哪）/ σ_ren（重加噪深度）先**吸附到公式网格上最近的 σ 档**，
+    //       把 0.75 这种「线性口径的值」换成公式真实存在的档位；
+    //     · 低清终点精确落在吸附后的 σ_k（b 端点反解，不靠反推取整），高清固定 1 步 σ_ren → 0。
+    //   N=6、shift=12、σ_k=σ_ren=0.75 → 吸附到公式档 σ≈0.7491；低清 5 步（clean 为 4 个间隔 +
+    //   末步 Eq.3 占位）、高清 1 步，总 NFE 与旧版一致仍为 N=6。
     // ──────────────────────────────────────────────────────────────────────
-    /// - Parameter totalSteps: 面板第一阶段总步数 N（总 NFE = 低清 N-1 + 高清 1 = N）
-    /// - Parameter sigmaK: 低清终点 / 交接深度，默认 0.75（2026-10-20 用户定档；2026-10-22 曾下调至 0.5，同日已回滚 0.75；σ_k 历史 0.86→0.95→0.7→0.6→0.8→0.7→0.8→0.75→0.5→0.75；σ_ren 历史 0.8→0.5→0.55→0.75）
+    /// - Parameter totalSteps: 面板第一阶段总步数 N（总 NFE = 低清步数 + 高清固定 1 步）
+    /// - Parameter sigmaK: 用户输入的低清终点 / 交接深度（默认 0.75），内部吸附到公式最近档
+    ///   （σ_k 历史 0.86→0.95→0.7→0.6→0.8→0.7→0.8→0.75→0.5→0.75；σ_ren 历史 0.8→0.5→0.55→0.75）
     /// - Parameter cleanEndpoint: true=末步 Eq.3 预测 clean x0 并重加噪（默认）；false=末步正常 Euler 落在 σ_k、交出含噪 x（带噪直通）
+    /// - Parameter shift: 视频侧 shift（与直出路径同一个 shift，H3 默认 12.0）
     public static func makeFixedFinalStep(totalSteps: Int, sigmaK: Double = 0.75,
                                          renoiseSigma: Double? = nil,
-                                         cleanEndpoint: Bool = true) throws -> SelfLiftScheduleSplit {
+                                         cleanEndpoint: Bool = true,
+                                         shift: Double = 12.0) throws -> SelfLiftScheduleSplit {
         let n = totalSteps
         guard n >= 3 else { throw SelfLiftScheduleError.tooFewSteps(n) }
-        let l = n - 1                              // 低清 NFE
-        // ★ 2026-10-20 用户定档：低清止于 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚），
-        //   clean 端点交高清（重加噪回 σ_ren=0.75，与止点等深）。
-        //   步长口径：
-        //    · sigmaK ≈ 0（跑满）：dLow = 1/l —— 低清 l 步线性 1→0；末步（σ=1/l）的 Eq.3 x0
-        //      与「Euler 到 0」完全等价（x - σ·v），因此两种 cleanEndpoint 取值结果一致，不多跑空转步。
-        //    · sigmaK > 0（中途交接）：沿用旧口径 —— cleanEndpoint=true 时前 l-1 段等距、末步停在 σ_k
-        //      做 Eq.3（Euler 丢弃）；false 时 l 段等距、末步 Euler 真正落在 σ_k。
+        // 吸附网格：公式曲线按 snapResolution 档采样（0.75 → 0.7491、0.5 → 0.5042 量级误差），
+        // 用来把用户输入的 σ 换成公式曲线上真实存在的档位 —— 不再让 0.75 这种按线性口径取的
+        // 值直接落进公式调度，也不用「反推 L 再取整」（那会带来终点漂移）。
+        let snap = SelfLiftScheduleSplit.snapResolution
+        let snapGrid = formulaGrid(intervals: snap, shift: shift)
+        // ① 低清终点 σ_k：吸附到最近公式档（σ_k ≈ 0 表示低清跑满，终点取曲线末档 0）。
         let lowToZero = sigmaK <= 1e-9
-        let dLow: Double
-        if lowToZero {
-            dLow = 1.0 / Double(l)
-        } else {
-            dLow = (1.0 - sigmaK) / Double(cleanEndpoint ? (l - 1) : l)
-        }
-        // 低清出口深度：跑满时是 0，否则是 σ_k。
-        let lowExit = lowToZero ? 0.0 : sigmaK
-        // 高清起点：
-        //  · clean 端点（默认）→ σ_ren 默认 0.75：用户 2026-10-20 定档（σ_k=0.75、σ_ren=0.75，接手与止点等深，
-        //    高清重画 55%、保留 45% 升频内容，比等深档更轻手）。
-        //  · 带噪直通 → σ_next = σ_k（等深连续，不重加噪；跑满时 0.75）。
-        let ren = renoiseSigma ?? (cleanEndpoint ? 0.75 : (lowToZero ? 0.75 : sigmaK))
-        let sigmaNext = ren
-        var lowSigmas = (0..<l).map { 1.0 - dLow * Double($0) }   // [1 … lowExit]（l 项）
-        lowSigmas.append(lowExit)                  // 低清末步占位（clean 模式末步 Eq.3 用，Euler 丢弃）
+        let sigmaKSnapped = lowToZero ? 0.0 : nearestGridValue(to: sigmaK, grid: snapGrid, range: 0...snap)
+        // ② 重加噪深度 σ_ren：clean 端点默认 0.75（用户定档「与止点等深」），带噪直通跟随 σ_k；
+        //    用户显式给了 renoiseSigma 就用它，统一吸附到同一张公式网格的最近档。
+        let renTarget = renoiseSigma ?? (cleanEndpoint ? 0.75 : (lowToZero ? 0.75 : sigmaK))
+        let sigmaNext = nearestGridValue(to: renTarget, grid: snapGrid, range: 1...snap)
+        // ③ 低清网格：b 空间等距 → 公式 σ，末项精确等于吸附后的 σ_k（不按档截断，避免终点漂移）。
+        //    步数与旧版完全一致（总 NFE 仍是 N）：
+        //    · 带噪直通：N-1 个间隔，末步 Euler 真正落在 σ_k；
+        //    · clean 端点：N-2 个间隔 + 末尾 σ_k 占位 —— 末步只做 Eq.3（Euler 丢弃）。
+        let intervals = max(1, cleanEndpoint ? n - 2 : n - 1)
+        var lowSigmas = formulaLadder(intervals: intervals, endSigma: sigmaKSnapped, shift: shift)
+        if cleanEndpoint { lowSigmas.append(sigmaKSnapped) }
         let highSigmas = [sigmaNext, 0.0]          // 高清固定 1 步 σ_ren → 0
         return SelfLiftScheduleSplit(
             lowSigmas: lowSigmas,
             highSigmas: highSigmas,
-            transitionStep: l,
-            sigmaK: lowExit,
+            transitionStep: lowSigmas.count - 1,
+            sigmaK: sigmaKSnapped,
             sigmaNext: sigmaNext)
+    }
+
+    // ── 公式网格三件套（与直出路径 sigmaSchedule 同式，供吸附与低清序列生成）──────────────
+
+    /// 公式曲线：`σ_i = shift·b/(1+(shift-1)·b)`，`b = 1 - i/intervals`。
+    /// 与 `sigmaSchedule(steps:shift:)` 逐点等价（intervals 即 steps）。
+    public static func formulaGrid(intervals: Int, shift: Double) -> [Double] {
+        let l = max(1, intervals)
+        return (0...l).map { i in
+            let b = 1.0 - Double(i) / Double(l)
+            return shift * b / (1.0 + (shift - 1.0) * b)
+        }
+    }
+
+    /// 公式曲线的一段：b 从 1 等距走到 b_end（由 endSigma 经 shiftToBase 反解），
+    /// 因此序列每一项都在公式曲线上，且末项精确等于 endSigma（无截断取整漂移）。
+    public static func formulaLadder(intervals: Int, endSigma: Double, shift: Double) -> [Double] {
+        let l = max(1, intervals)
+        let bEnd = endSigma / (shift + endSigma * (1.0 - shift))   // shiftToBase(endSigma, shift)
+        return (0...l).map { i in
+            let b = 1.0 - (1.0 - bEnd) * Double(i) / Double(l)
+            return shift * b / (1.0 + (shift - 1.0) * b)
+        }
+    }
+
+    /// 在 grid 的 range 档位里找与 target 最近的 σ 下标（等距时取下标小的 = 较大 σ，给低清留步）。
+    public static func nearestGridIndex(to target: Double, grid: [Double], range: ClosedRange<Int>) -> Int {
+        var best = range.lowerBound
+        var bestD = Double.infinity
+        for i in range where i < grid.count {
+            let d = abs(grid[i] - target)
+            if d < bestD - 1e-12 { bestD = d; best = i }
+        }
+        return best
+    }
+
+    public static func nearestGridValue(to target: Double, grid: [Double], range: ClosedRange<Int>) -> Double {
+        grid[nearestGridIndex(to: target, grid: grid, range: range)]
     }
 
 }
