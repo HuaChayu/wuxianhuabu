@@ -342,11 +342,9 @@ final class GenerationQueue: ObservableObject {
         } else {
             condSummary = "首/尾帧 \(task.imagePaths[0]) / \(task.imagePaths[1])（fl2va→软参考重构：首尾帧作参考图 ×2）"
         }
-        // ★ H3 一采第一阶段总步数 N：单一取自偏好设置「模型管理 → H3 一采设置」滑杆（4–12，默认 6）。
-        // 该值经 generateVideo(steps:) → sigmaSchedule(steps:) → N = sigmas.count - 1 进入一采链路；
-        // SelfLift 第三分支的 transition_step 不写死，由官方 75% 规则随 N 推导（ts = clamp(floor(0.75N),1,N-1)）。
+        // ★ H3 一采第一阶段总步数 N：取自偏好设置「模型管理 → H3 一采设置」滑杆（4–12，默认 6），
+        //   经 generateVideo(steps:) → sigmaSchedule(steps:) → N = sigmas.count - 1 进入一采链路。
         let h3Stage1Steps = AppSettings.shared.h3Stage1Steps
-        let h3Stage1Ts = SelfLiftScheduleSplit.transitionStep(forTotalSteps: h3Stage1Steps)
         // ★ SelfLift 第三分支开关：同一偏好设置页「H3 一采设置」的开关，透传给管线（不改管线默认行为）
         let h3SelfLiftOn = AppSettings.shared.h3SelfLiftEnabled
         // ★ IC 链路 lowOnly（2026-09-18 架构纠正）：「H3 低分 + LTX 高分」两个模型组成 lift——
@@ -380,7 +378,7 @@ final class GenerationQueue: ObservableObject {
         //   （低清已近成品、细节错位）出现，0.5 档低清无成型细节，不触发。仍置 0 可实验性回退。
         setenv("NA_H3_SELFLIFT_CLEAN_HANDOFF", "1", 1)
         // 日志描述：用户设计调度（低清 N-1 + 高清固定 1 步）
-        let h3SlDesc = "SelfLift 用户设计调度：低清 \(h3Stage1Steps - 1) 步(σ_k=0.5) + 高清固定 1 步"
+        let h3SlDesc = "SelfLift 用户设计调度：低清 \(h3Stage1Steps - 1) 步(σ_k=0.75) + 高清固定 1 步"
         if stage2On {
             pipelineLog("H3 视频生成：目标直出 \(genW)×\(genH)（SelfLift 内部×0.5 除2，外部不再÷2）\(h3Stage1Steps) 步 turbo（\(h3SlDesc)），再接 Stage2 refine（第二阶段开，\(h3LowOnly ? "lowOnly 分工：H3 只出低分半清，LTX 二采升频×2 + 高清精修" : "全清 latent 直通、不再升频×2")；Apple 超分\(appleSROn ? "开" : "关")）@ \(alignedFrames) 帧（latentT=\(latentT)），条件：\(condSummary)")
         } else if appleSROn {

@@ -17,43 +17,18 @@
 //  过渡块用提升后的 x0 重建切换点状态：按 σ_next=σ_k 重加噪（等深，不补 Euler），直接进高清首步。
 //  低分 NFE = ts，高分 NFE = N-ts，总和不变。
 //
-//  ── ts 不写死：随面板第一阶段总步数 N 按官方 75% 规则联动 ────────────────
-//  N 取自面板「第一阶段总步数」滑杆（范围 4–12），ts 不写死、由官方 75% 比例推导：
-//      ts = clamp(floor(0.75 · N), 1, N-1)
-//  依据＝官方两个论文实例的比例均为 75%（FLUX.2-Klein 3/4、Z-Image-Turbo 6/8）；
-//  本工程 H3 一采 N = 6 → ts = 4（低分 4 次 NFE + 高分 2 次），与原写死值一致。
-//  滑杆各档：4→3（测试档）、5→3、6→4、7→5、8→6、9→6、10→7、11→8、12→9
-//  （实现见 SelfLiftScheduleSplit.transitionStep(forTotalSteps:)，SelfLiftConfig.transitionStep > 0 可显式覆盖）。
-//  官方 SelfLift 硬约束 1 ≤ ts ≤ N-1（nodes.py 行 98 `_validate_schedule`，上界 = sigmas.numel()-2），
-//  由 clamp 的上界自动满足；官方节点默认值 ts = 6 在 N = 6 下越界，禁止使用。
-//  其余参数对齐官方 SelfLiftH3Sampler 默认：rho = 0.0（learned upscaler 纯 z_lat 提升，
-//  像素锚点默认关闭；NA_H3TEST=26 实测 rho>0 注入 VAE 往返伪影）、w_min = w_max = 1.0、
-//  lowres_scale = 0.5（官方默认值）。README 行 29/61 的 rho=0.6 仅针对无升频器（none）路径。
+//  ── 调度 ─────────────────────────────────────────────────────────────
+//  唯一入口 makeFixedFinalStep(totalSteps:sigmaK:renoiseSigma:cleanEndpoint:shift:)：
+//  低清按公式网格跑到 σ_k，高清固定最后 1 步 σ_ren → 0，总 NFE 恒为 N。
+//  其余参数对齐官方 SelfLiftH3Sampler 默认：rho=0.0、w_min=w_max=1.0、lowres_scale=0.5。
 //
 //  ── 插值口径（照抄官方，禁止自创）──────────────────────────────────────
-//  低分条件行降采样：官方 `_resize_keyframes`（nodes.py 行 174-208）= 逐帧 bilinear、
-//      align_corners=False（3D keyframe latent 按 (B,T,C,h,w) 折成批次逐帧插值），
-//      再做逐 (帧, 通道) 的**加性**均值对齐 `resized + (source_mean - resized_mean)`。
-//  直接 latent 提升：官方 H3 路径硬编码 nearest（selflift.py 行 18 默认值 + nodes.py 行 509 实参）。
-//      ★ 2026-09-22 弃用：nearest 升频算法无效，本工程不再走该回退/提升路径，统一用官方
-//        learned upscaler（时间维感知，×2）；learned 不可用时显式报错终止，绝不静默降级。
-//  像素锚点重建：官方 `_pixel_anchor_video_single`（selflift.py 行 87-98）= decode →
-//      `F.interpolate(size=(H·ratio, W·ratio), mode="bicubic", antialias=True)` → encode，
-//      ratio = frames.shape[1] // z0_low.shape[-2]（本工程为 16）。
-//  以上三处都由本文件内的 `SelfLiftResample` 表驱动实现（构造表已与 PyTorch 逐点对拍：
-//  bicubic antialias 与 bilinear 非 antialias 均 max|diff| ≈ 1e-7）。
+//  低分条件行降采样：官方 `_resize_keyframes` = 逐帧 bilinear（align_corners=False）
+//      + 逐 (帧, 通道) 加性均值对齐。
+//  直接 latent 提升：learned upscaler（时间维感知 ×2），不可用即报错终止。
+//  像素锚点重建：官方 `_pixel_anchor_video_single` = decode → bicubic(antialias) → encode。
+//  以上三处均由本文件内 SelfLiftResample 表驱动实现（构造表已与 PyTorch 逐点对拍）。
 //
-//  ── 落地前请按你工程当前签名复核（本文件按盘点到的签名书写）─────────────
-//  1. SparsePolicy（定义于 H3Layout.swift）的实际类型名（本文件按此名引用）。
-//  2. H3AttnBroadcast 的重建/复位方式（本文件用「重建新实例」，若已有 reset() 可换）。
-//  3. 本文件只依赖 mlx-swift 的 `MLXArray.take(_:axis:)` / `sorted` / `sum` / `item` /
-//     `expandedDimensions` / `concatenated`（均已在工程依赖的 mlx-swift 版本中确认存在）。
-//  4. hooks 的两个闭包由 H3Pipeline 侧注入 —— 这样 Runner 不依赖 H3VAE 内部字段。
-//     · decodeToPixels / encodeToLatent 直接包 H3VAEDecoder.decode / H3VAEEncoder.encodeVideo
-//     · 不再需要「latent ×2 上采样」注入：官方 learned upscaler（2026-09-22 起替代
-//       nearest）已在文件内实现（slLearnedLiftLatent / SelfLiftResample）
-//
-//  ⚠️ 本文件未改动 H3Pipeline.swift；接线方式见文件末尾注释。
 //
 
 import Foundation
@@ -103,9 +78,8 @@ public struct SelfLiftH3Hooks {
 }
 
 // 官方 learned latent upscaler（时间维感知）的按需加载：以 NA_H3_UPSCALER 环境变量当前值为键缓存。
-// 2026-09-22 起 nearest 回退分支已移除：learned 权重不可用时直接抛错终止，绝不静默降级。
-// 默认（不设 / 空 / learned）→ H3LatentUpscaler（官方 learned upscaler，已在 1344×768 实测显著消除面部重影）；
-// NA_H3_UPSCALER=nearest 已于 2026-09-22 弃用（该回退算法无效），不再识别。
+// 默认 → H3LatentUpscaler（官方 learned upscaler，1344×768 实测显著消除面部重影）；
+// 权重不可用时直接抛错终止，不降级。
 private var h3LearnedUpscalerCache: (key: String, up: H3LatentUpscaler)? = nil
 private func h3LearnedUpscalerForCurrentEnv() throws -> H3LatentUpscaler {
     let key = ProcessInfo.processInfo.environment["NA_H3_UPSCALER"] ?? ""
@@ -120,16 +94,15 @@ private func h3LearnedUpscalerForCurrentEnv() throws -> H3LatentUpscaler {
     let path = ProcessInfo.processInfo.environment["NA_H3_UPSCALER_PATH"]
         ?? wURL("minimax_h3_latent_upscaler_3d_bf16.safetensors").path
     guard let w = try? H3Weights(url: URL(fileURLWithPath: path)) else {
-        // 2026-09-22：nearest 回退已移除，learned 不可用即显式报错终止。
         throw NSError(domain: "H3SelfLift", code: 41, userInfo: [NSLocalizedDescriptionKey:
-            "learned upscaler 不可用（权重加载失败：\(path)）；nearest 回退已于 2026-09-22 移除，SelfLift 终止"])
+            "learned upscaler 不可用（权重加载失败：\(path)），SelfLift 终止"])
     }
     let up: H3LatentUpscaler
     do {
         up = try H3LatentUpscaler(weights: w)
     } catch {
         throw NSError(domain: "H3SelfLift", code: 42, userInfo: [NSLocalizedDescriptionKey:
-            "learned upscaler 权重解析失败（\(path)）：\(error.localizedDescription)；nearest 回退已于 2026-09-22 移除，SelfLift 终止"])
+            "learned upscaler 权重解析失败（\(path)）：\(error.localizedDescription)，SelfLift 终止"])
     }
     h3LearnedUpscalerCache = (key, up)
     return up
@@ -187,8 +160,7 @@ private func slLowBandBlur(_ x: MLXArray) -> MLXArray {
 /// PyTorch `F.interpolate` 的表驱动等价实现。
 ///
 /// 官方四处调用里，本工程 H3 一采用到其中三处，逐条照抄、不换自创插值：
-///   · 直接 latent 提升        `mode="nearest"`                      — selflift.py 行 18 / 54，H3 硬编码
-///     ★ 2026-09-22 弃用：本工程不再走 nearest 提升/回退，统一用 learned upscaler（见 slLearnedLiftLatent）。
+///   · 直接 latent 提升        learned upscaler（时间维感知 ×2）      — 见 slLearnedLiftLatent
 ///   · 像素锚点重建            `mode="bicubic", antialias=True`       — selflift.py 行 95
 ///   · 条件行（keyframe）降采样 `mode="bilinear", align_corners=False` — nodes.py 行 191-198
 ///
@@ -313,7 +285,6 @@ private func slLowResSize(_ target: Int, scale: Double) -> Int {
 /// [T,H,W,C] → [T,outH,outW,C]：官方 learned upscaler 直接 latent 提升
 /// （时间维感知 ×2，已在 1344×768 实测显著消除面部重影；目标半尺寸为奇数时 ×2 后与
 /// 目标不一致，补一次最近邻 resize 对齐，与官方 old 路径同口径）。
-/// 2026-09-22：nearest 回退分支已移除，learned 权重不可用时直接抛错终止，绝不静默降级。
 private func slLearnedLiftLatent(_ x: MLXArray, outH: Int, outW: Int,
                                  keepAlive: SelfLiftTensorKeepAlive? = nil) throws -> MLXArray {
     let us = try h3LearnedUpscalerForCurrentEnv()
@@ -463,32 +434,15 @@ public func runH3Stage1WithSelfLift(
     keyframeGridsHigh: [(h: [Double], w: [Double])?]? = nil
 ) throws -> (videoX: MLXArray, audioX: MLXArray) {
 
-    // 解耦模式（本工程调试扩展，A/B 用；默认关闭，不触碰任何默认值）：
-    //   开关在调用方（H3Pipeline）按环境变量注入 cfg.decoupleSigmaK
-    //   本 Runner 只消费，不读取环境（保持只读参数、便于单测）。
-    //   动机（2026-09-17 重影根因）：低清 σ 大时运动位置量化歧义 → x0 预测为多层均值（双层影）；
-    //   原路径被迫提 σ_next 阈值让低清变浅（残留少），但源头歧义还在。解耦 = 低清浅跑 + 浅残留
-    //   重加噪 + 高清等距收细节：UI 默认 σ_k=0.9（L=2、σ_k≈0.9231）、σ_next=σ_k、高清 3 步
-    //   （总 NFE 5 < 官方 N=6，不浪费算力）。
-    let split: SelfLiftScheduleSplit
-    // ★ 用户既定设计（2026-10-09 收敛为唯一调度，不再有官方 75% 档/解耦 A/B 档）：
-    //   总步数 N → 低清跑到 σ_k（默认 0.75，可经 NA_H3_SELFLIFT_DECOUPLE_LOW_K 覆盖；
-    //   无反推、无 HIGH_STEPS 独立高清步数），高清固定最后 1 步 σ_next → 0。
-    //   ★ 2026-10-25（用户需求）：低清段的「线性等距」设计已移除 —— 低清网格改由直出同款
-    //     shift 公式生成（σ=shift·b/(1+(shift-1)·b)，b 等距），用户输入的 σ_k / σ_ren
-    //     先吸附到公式网格上最近的 σ 档再落调度。实现见 makeFixedFinalStep(shift:)。
-    //   ★ 2026-10-19（用户需求）：σ_k 定档 0.8 —— 低清跑到八成清（粗骨架 + 少量细节），
-    //     剩下的交给高清单步收；交接状态改为带噪直通（见 cfg.cleanEndpointHandoff）。
-    //   语义即 SelfLiftScheduleSplit.makeFixedFinalStep(totalSteps:sigmaK:)。
-    //   ★ 交接状态类型（2026-10-19）：默认「带噪直通」——低清末步不做 Eq.3 clean 预测，正常 Euler
-    //     走到 σ_k，交出去的就是 σ_k 处的含噪 x（高清需要噪点状态继续处理）。
-    //     · cfg.cleanEndpointHandoff=true → 恢复旧路径（Eq.3 x0 → 升频 → 重加噪）；仅关闭不移除，代码保留。
-    //     · lowOnly（H3 一采只出低分半清 latent 给 LTX 二采）仍需要 clean 端点作为下游输入，强制保留。
-    //     lowOnly 是入参，故此处即可定档（下方低清循环共用同一变量）。
+    // 唯一调度：低清按公式网格跑到 σ_k → 高清固定最后 1 步 σ_ren → 0（总 NFE 恒为 N）。
+    //   σ_k 默认 0.75（NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖）；σ_ren 缺省 clean 端点 0.75（与止点等深）。
+    //   cleanEndpoint：默认交 clean x0（升频后按 σ_ren 重加噪）；带噪直通档跳过 Eq.3、交 σ_k 处含噪 x。
+    //   lowOnly（一采只出半清 latent 给 LTX 二采）需要 clean 端点作为下游输入，强制保留。
     let useCleanEndpoint = cfg.cleanEndpointHandoff || lowOnly
+    let split: SelfLiftScheduleSplit
     split = try SelfLiftScheduleSplit.makeFixedFinalStep(
         totalSteps: sigmas.count - 1,
-        // ★ 2026-10-20 定档：低清止点 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚）。
+        // ★ 用户定档：低清止点 σ_k = 重加噪 σ_ren = 0.75（两者等深）。
         sigmaK: cfg.decoupleSigmaK ?? 0.75,
         renoiseSigma: cfg.renoiseSigma,
         cleanEndpoint: useCleanEndpoint,
@@ -507,7 +461,7 @@ public func runH3Stage1WithSelfLift(
         + "高分 \(String(format: "%.4f", audioSigmasHigh[0]))→\(String(format: "%.4f", audioSigmasHigh[split.highNFE]))")
     let lowRunsToZero = split.sigmaK <= 1e-9
     let sigmaKInput = cfg.decoupleSigmaK ?? 0.75
-    let sigmaRenInput = cfg.renoiseSigma ?? (useCleanEndpoint ? 0.75 : (lowRunsToZero ? 0.75 : sigmaKInput))
+    let sigmaRenInput = cfg.renoiseSigma ?? (useCleanEndpoint ? 0.75 : (lowRunsToZero ? 0.5 : sigmaKInput))
     log("SelfLift 公式网格（shift=\(String(format: "%.1f", shiftV))）："
         + "σ_k 输入 \(String(format: "%.4f", sigmaKInput)) → 公式最近档 \(String(format: "%.4f", split.sigmaK))；"
         + "σ_ren 输入 \(String(format: "%.4f", sigmaRenInput)) → 公式最近档 \(String(format: "%.4f", split.sigmaNext))")
@@ -699,7 +653,7 @@ public func runH3Stage1WithSelfLift(
     //   高分段（condRowsHigh）= 原生 full-res 行直通（fl2va 无参考块用低清→提升版除外，
     //   那是官方 keyframe encodeImage 语义；ref2va 的 boundary/history 均为去噪完成的
     //   干净 full-res latent，原生直通不降画面再提升）；低分段内部自行重采样处理。
-    //   （2026-09-22 起 learned 不可用即显式终止，绝不静默回退 nearest。）
+    //   （learned 不可用即显式终止。）
     let condRowsHigh: MLXArray
     if condSegsHigh.isEmpty {
         // ★ 2026-10-25：纯文生（无锚点、无参考块）时高清条件行同为 0 行，原本次处
@@ -1033,9 +987,10 @@ public func runH3Stage1WithSelfLift(
     // ── 4. 过渡块（零 NFE）──────────────────────────────────────────────
     // 4.1 直接 latent 提升：官方 learned upscaler（H3LatentUpscaler，时间维感知，
     //     实测 1344×768 高分辨率下显著消除帧间双像/面部重影，见 h3_scene_ab 自检结论）。
-    //     2026-09-22 起 nearest 回退分支已移除：learned 不可用即显式终止，绝不静默降级。
+    //     learned 不可用即显式终止，不降级。
     // ★ 2026-10-20 低频锚定（方案 A）：升频器出口 latent 的 NCDHW 视图，零拷贝引用缓存下来，
     //   只在高分收尾后用于「低频带替换」，不参与过渡块噪声（噪声仍是纯白噪）。
+    //   ★ 默认关闭（α_low = 1.0）；该引用仅剩 dump 用途，设 NA_H3_SELFLIFT_LOWANCHOR<1 重新开启。
     var liftedLatNCDHW: MLXArray? = nil
     let liftLatentRows: (MLXArray) -> MLXArray = { rows in
         let lat = H3TensorOps.unpatchifyVideo(rows, gridH: gHl, gridW: gWl)      // [latT,latHl,latWl,C]
@@ -1044,7 +999,7 @@ public func runH3Stage1WithSelfLift(
             up = try slLearnedLiftLatent(lat, outH: latH, outW: latW,
                                          keepAlive: keepAlive)                   // [latT,latH,latW,C]
         } catch {
-            preconditionFailure("learned upscaler 不可用，SelfLift 终止（nearest 回退已于 2026-09-22 移除）：\(error.localizedDescription)")
+            preconditionFailure("learned upscaler 不可用，SelfLift 终止：\(error.localizedDescription)")
         }
         // ★ 2026-10-19 升频器出口 latent（高清之前，rho=0 时这是唯一能拿到 z_lat 的点：
         //   旧实现只在 consistencyRows 里 dump，rho=0 该闭包不执行 → z_lat 永远落不了盘）
@@ -1264,19 +1219,15 @@ public func runH3Stage1WithSelfLift(
 
     log("SelfLift 一采完成（总 NFE=\(split.totalNFE)，与原调度一致）")
 
-    // ── 6.5 低频锚定（方案 A，默认开启）────────────────────────────────
-    // ★ 2026-10-20 用户定档。动机：σ_ren 那一趟是「纯白噪重画」，低清已经定下的粗骨架/整体色彩
-    //   会被高清 1 步一起重画掉 → 表现为低频漂移 + 帧间闪烁；但直接改噪声频谱会变成 DiT 没见过的
-    //   OOD 输入（NA_H3_SELFLIFT_BANDLIMIT_NOISE 已实测：低通噪声 → 满屏彩色斑块，已回退）。
-    //   所以这里**完全不动噪声、不动 schedule、不动步数**，只在高分收尾后做一次频带分离：
+    // ── 6.5 低频锚定（方案 A，用户定档：默认关闭 α_low = 1.0）──────────
+    // 默认关闭：α_low ≥ 0.999 时整段不执行，高清出口 latent 原样返回，不做频带替换。
+    //   开启后高分收尾做一次频带分离（不动噪声 / schedule / 步数）：
     //       x_out = x_high + (1−α)·( LPF(anchor) − LPF(x_high) )
-    //   等价于「低频带按 α 混向升频后的低清 latent，高频带原样保留高清」。LPF 只在 H/W 上做，
-    //   时间轴不动（否则给运动加拖影）。
-    //   α 语义：低频带里保留高清的比例。0.25=默认（低频 75% 用低清锚，2026-10-20 由 0.5 加强），
-    //   1=关闭（旧行为）、0=低频全部取低清锚。
-    //   覆盖：NA_H3_SELFLIFT_LOWANCHOR=0 / 0.1 / 0.25 / 0.5 / 1（1 即关闭）。
+    //   即低频带按 α 混向升频后的低清 latent，高频带保留高清；LPF 只在 H/W 上做，时间轴不动。
+    //   α：低频带里保留高清的比例。1.0=关闭（默认）、0.25=低频 75% 取低清锚、0=低频全取低清。
+    //   覆盖：NA_H3_SELFLIFT_LOWANCHOR；<1 即重新开启。
     let lowAnchorAlpha = Float(ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_LOWANCHOR"]
-                               .flatMap(Double.init) ?? 0.25)
+                               .flatMap(Double.init) ?? 1.0)
     if lowAnchorAlpha < 0.999, let anchorNCDHW = liftedLatNCDHW {
         let highNCDHW = toNCDHW(H3TensorOps.unpatchifyVideo(videoX, gridH: gridH, gridW: gridW), c: latC)
         if highNCDHW.shape == anchorNCDHW.shape {
@@ -1299,7 +1250,8 @@ public func runH3Stage1WithSelfLift(
             log("SelfLift 低频锚定：跳过（形状不符 high=\(highNCDHW.shape) anchor=\(anchorNCDHW.shape)）")
         }
     } else if lowAnchorAlpha >= 0.999 {
-        log("SelfLift 低频锚定：关闭（NA_H3_SELFLIFT_LOWANCHOR=\(lowAnchorAlpha) ≥ 1）")
+        log("SelfLift 低频锚定：关闭（α_low=\(String(format: "%.2f", lowAnchorAlpha))；"
+            + "高清出口 latent 原样返回，未做频带替换）")
     } else {
         log("SelfLift 低频锚定：跳过（未取到升频器出口 latent；rho>0 走像素锚点路径时为预期）")
     }
@@ -1308,50 +1260,9 @@ public func runH3Stage1WithSelfLift(
     return (videoX, outAudioX)
 }
 
-// MARK: - 接线方式（不改 H3Pipeline.swift 的其它部分）
+// MARK: - 接线方式
 //
-//  在 H3Pipeline.generateVideo 的 stage1 段（当前为 `for i in 0..<stage1SegmentCount { ... }`，约行 456–496）：
-//
-//      // ts 不写死：transitionStep 传 0 → 由面板「第一阶段总步数」滑杆 N 按官方 75% 规则自动推导
-//      //   ts = clamp(floor(0.75 · N), 1, N-1)   滑杆各档：N=4→3（测试档）、6→4、8→6、12→9
-//      //   N = stage1SegmentCount；官方硬约束 1 ≤ ts ≤ N-1 由 clamp 自动满足
-//      let selfLift = SelfLiftConfig(enabled: <开关>,
-//                                    transitionStep: 0,        // 0 / 不传 = 按 N 自动推导；> 0 = 显式覆盖
-//                                    lowResScale: 0.5,
-//                                    rho: 0.0, wMin: 1.0, wMax: 1.0)   // rho=0 官方默认：纯 z_lat 提升，跳过 VAE 往返
-//      if selfLift.enabled, stage1SegmentCount >= 4 {          // 滑杆 4–12 均可用；ts 随 N 自动变化，不再判 N == 6
-//          let hooks = SelfLiftH3Hooks(
-//              decodeToPixels:   { decoder!.decode($0) },
-//              encodeToLatent:   { vaeEncoder!.encodeVideo($0) },
-//              // 过渡块出口屏障后放掉像素锚点 VAE 权重（≈5.3GB），高分段不必背它
-//              releasePixelVAE:  { slVae = nil; slVaeWeights = nil })
-//          let r = try runH3Stage1WithSelfLift(
-//              dit: dit!, textStates: refined, condRowsFull: condRows,
-//              // ref2va 必须把原生 layout 的同一份参考块与文本模态标签透传进来（fl2va 传空即可）：
-//              //   refBlocks 决定 layout 的 cond 行预算（= condRows 的行数），漏传会把视频段起点前移
-//              //   textTags 决定文本行里各视觉块的 AdaLN 模态，漏传视觉块会按 text 模态调制
-//              refBlocks: refBlocks, textTags: textTagsForLayout,
-//              latT: Int(latentT), latH: latH, latW: latW, latC: latC,
-//              audioT: audioT, textLen: UInt32(textHidden.shape[0]), frameCount: frameCount,
-//              sigmas: sigmas, shiftV: sv, shiftA: sa, seed: seed,
-//              sparsePolicy: sparsePolicy, attentionBroadcastK: attentionBroadcastK,
-//              cfg: selfLift, hooks: hooks, log: log)
-//          videoX = r.videoX
-//          audioX = r.audioX
-//      } else {
-//          <原 stage1 循环原样保留>
-//      }
-//
-//  注意：
+//  接线已完成（H3Pipeline stage1 段调用 runH3Stage1WithSelfLift）。注意：
 //  · `refined` 必须传 stage1 实际使用的 textStates（不是原始 textHidden）。
 //  · `sigmas` 若走 .betaRefined 分支，需确认其非增且仅末项为 0（本 Runner 会校验并抛错）。
-//  · 低分条件行不用平均池化：走官方 `_resize_keyframes`（逐帧 bilinear + 加性均值对齐），
-//    尺寸一致时（lowResScale = 1）原样返回，与官方 `if kf.latent.shape == ...` 的早退一致。
-//  · 过渡块里的三种插值（nearest / bicubic-antialias / bilinear）都在文件内实现，hooks 不再需要注入放大函数。
-//    ★ 2026-09-22：直接 latent 提升不再走 nearest（算法无效，已弃用），统一用 learned upscaler；
-//       nearestTable 仅保留为 learned ×2 与目标尺寸不一致时的对齐 resize 工具。
-//  · 结束后 `dit.adalnTables` 已被重算回高分（原分辨率）的 ts 表，后续 stage2/直出无需额外处理。
-//  · 过渡块会多跑一次 VAE decode+encode（rho>0 时）；如需最省算力可设 rho=0 走纯 latent 提升。
-//  · ts 不写死：Runner 内部按 `cfg.transitionStep`（0 = 自动）解析，N = sigmas.count - 1
-//    （= 面板第一阶段总步数滑杆），故滑杆 4–12 各档自动得到 3/3/4/5/6/6/7/8/9；
-//    日志首行会打印实际的 ts 与低分/高分 NFE 数，便于核对当前档位。
+//  · 结束后 `dit.adalnTables` 已重算回原分辨率的 ts 表，后续 stage2/直出无需处理。

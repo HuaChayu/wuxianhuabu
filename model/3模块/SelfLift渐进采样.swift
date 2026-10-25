@@ -14,37 +14,23 @@
 //
 //  切换点处做一次「零 NFE 过渡块」：
 //      Eq.3    x0 = x - σ_k · v                 （复用低分最后一次前向；该步 Euler 更新被丢弃）
-//      Eq.4-5  z_lat = interp(x0)               （直接 latent 提升；官方 H3 路径固定 nearest）
+//      Eq.4-5  z_lat = upscale(x0)              （learned upscaler 直接提升低分 x0）
 //              z_pix = VAE⁻¹( ↑(VAE(x0)) )      （VAE 像素往返，作为伪影度量锚点）
 //      Eq.6-9  δ = z_pix - z_lat；按 |δ| 取风险最高的 ρ 比例位置、强度线性映射 w ∈ [w_min, w_max]
 //              z0_high = z_lat + w·δ
 //      Eq.10   x_k = (1-σ_k)·z0_high + σ_k·ε    （重加噪，官方 noise_scaling 公式）
-//              再手工补一次 (σ_k → σ_next) 的 Euler
+//              （不补 Euler：重加噪后直接进高清首步）
 //
 //  不变量：低分 NFE = ts，高分 NFE = N - ts，合计恒等于原总步数 N（过渡块零 NFE）。
 //  加速来源：前 ts 次前向跑在 lowResScale 的低空间分辨率上，单步算力按面积下降。
 //
 //  ── 参数对齐（唯一参考：comfyui-SelfLift 官方实现，禁止自创）─────────────
-//  H3 一采 = 6 步（N = 6，本工程 H3Pipeline 默认 steps = 6）。官方 H3 走 SelfLift-zero 本体，
-//  其建议起点为「upscaler_model = none + rho > 0：rho = 0.6、w_min = w_max = 1」（README 行 29 / 61）：
-//      transitionStep  = 不写死，按官方 75% 比例随总步数 N 联动推导：
-//                          ts = clamp(floor(0.75 · N), 1, N-1)
-//                        依据＝官方两个论文实例的比例均为 75%（FLUX.2-Klein 3/4、Z-Image-Turbo 6/8）；
-//                        本工程 H3 一采 N = 6 → ts = 4，与原写死值一致。N 取自面板第一阶段总步数滑杆
-//                        （4–12），ts 因此随滑杆自动变化；clamp 上界同时满足官方硬约束 ts ≤ N-1。
-//                        调用方仍可显式覆盖（transitionStep > 0 时优先于推导值）。
-//      lowResScale    = 0.5    官方节点默认值，也是官方诊断表的固定值（nodes.py 行 481 / README 行 54）
-//      rho            = 0.0    官方 SelfLiftH3Sampler 默认值（learned upscaler 时纯 z_lat 提升，
-//                              像素锚点为默认关闭的可选增强；NA_H3TEST=26 实测 rho>0 注入 z_pix
-//                              VAE 往返伪影——运动后段背景角色双轮廓，learned+rho=0 前后段全干净）
-//                              README 行 29/61 的「rho=0.6」仅针对 upscaler_model=none（无升频器）建议
-//      wMin = wMax    = 1.0    官方 H3 建议起点（README 行 29 / 61）
-//      提升插值        = nearest 官方 H3 路径硬编码，不作为可选项（nodes.py 行 509 传入 "nearest"）
-//      采样器          = 标准 euler 且 s_churn = 0（README 行 79：Only standard Euler with s_churn=0）
-//      cfg            = 5.0    官方 H3 节点默认值（nodes.py 行 480）。本工程一采循环无 CFG 分支，
-//                              故仅作对齐记录（见 SelfLiftConfig.officialH3Cfg），不新增参数
-//  官方硬约束：1 ≤ ts ≤ N-1（nodes.py 行 98 `_validate_schedule`，上界即 sigmas.numel()-2）。
-//  官方节点默认值 ts = 6 在 N = 6 下越界，本工程禁止使用。
+//  lowResScale  = 0.5   官方节点默认值（nodes.py 行 481 / README 行 54）
+//  rho          = 0.0   官方 SelfLiftH3Sampler 默认值：learned upscaler 下纯 z_lat 提升，
+//                       像素锚点（rho>0）为可选增强，本工程默认关闭
+//  wMin = wMax  = 1.0   官方 H3 建议起点（README 行 29 / 61）
+//  提升          = 官方 learned upscaler（时间维感知 ×2）；不可用即显式报错，不降级
+//  采样器        = 标准 euler 且 s_churn = 0（README 行 79）
 //
 //  ── 与模型解耦 ──────────────────────────────────────────────────────────
 //  本文件不做任何模型相关动作（不碰 layout / rope / VAE / packed rows / VAE 归一化）。
@@ -60,29 +46,11 @@
 import Foundation
 import MLX
 
-// MARK: - 提升方式
-
-// 官方 comfyui-SelfLift 在 H3 节点里把「直接 latent 提升」的插值方式硬编码为 nearest：
-//   · selflift.py 行 18 `paired_lifts(..., latent_mode="nearest", ...)` 的默认值
-//   · nodes.py 行 509 H3 节点调用 progressive_sample 时实参写死 "nearest"
-// 官方 H3 路径不暴露该选项（Image 节点才有 nearest/bilinear 开关），
-// 因此本核心不再提供插值开关，统一固定 nearest——由各模型 Runner 照抄官方实现。
-
 // MARK: - 配置
 
 public struct SelfLiftConfig: Sendable {
     /// 总开关
     public var enabled: Bool
-    /// ts：低分辨率前向次数（同时是 sigma 数组上的切换下标），有效范围 [1, N-1]
-    ///
-    /// **显式覆盖值**：
-    ///   · > 0 → 直接用该值（需自行满足 1 ≤ ts ≤ N-1，否则 SelfLiftScheduleSplit.make 抛错）；
-    ///   · = 0（默认）→ 视为「不传」，由总步数 N 按官方 75% 比例联动推导，
-    ///                  取 `SelfLiftScheduleSplit.transitionStep(forTotalSteps: N)`。
-    /// 推导依据：官方两个论文实例的比例均为 75%（FLUX.2-Klein 3/4、Z-Image-Turbo 6/8），
-    /// 本工程 H3 一采 N = 6 → ts = 4。N 即面板第一阶段总步数滑杆（4–12）。
-    /// 注意官方节点默认值 6 在 N = 6 下越界（nodes.py 行 98 硬约束 ts ≤ N-1 = sigmas.numel()-2），禁止使用。
-    public var transitionStep: Int
     /// 低分辨率倍率（相对目标分辨率），0.5 = 半分辨率起步
     /// 官方节点默认值 + 官方诊断表固定值（nodes.py 行 481 / README 行 54）
     public var lowResScale: Double
@@ -95,40 +63,25 @@ public struct SelfLiftConfig: Sendable {
     public var wMin: Float
     public var wMax: Float
 
-    /// CFG 引导强度（官方 SelfLiftH3Sampler 默认 cfg=5.0：低清段+高清段全程
-    /// positive/negative 双路引导）。0 = 关闭 CFG（工程旧行为，仅 positive 单路）；
-    /// >0 时每步 v = v_neg + cfg·(v_pos − v_neg)，negative 条件行由调用方注入
-    /// （见 runH3Stage1WithSelfLift 的 textStatesNeg 参数）。
-    /// 动机（2026-09-18 重影根因）：低清网格空间量化使背景边缘与 keyframe 原版错位，
-    /// 无 CFG 时高清段对「低清错位背景 + keyframe 精确背景」折中 → 背景双像；
-    /// CFG 引导给 keyframe 结构裁决力，压制低清残留。
+    /// CFG 引导强度：0 = 关闭（仅 positive 单路，torbo LoRA 适用）；
+    /// >0 时每步 v = v_neg + cfg·(v_pos − v_neg)，negative 条件行由调用方注入。
     public var cfgScale: Double
 
     /// σ_k 覆盖入口（低清终点 / 交接深度）：nil 时用 `makeFixedFinalStep` 默认 0.75（落调度前吸附公式档）；
     /// 环境变量 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖（命名沿用旧解耦 A/B 时代）。
     public var decoupleSigmaK: Double?
 
-    /// 交接状态类型开关（2026-10-19 用户需求，默认 false = 带噪直通）：
-    ///   · false（默认）：低清末步不做 Eq.3 clean 预测，正常 Euler 走到 σ_k，交接的是 σ_k 处的
-    ///     **带噪 x**；升频后不重加噪、不补 Euler，高清直接接手这份含噪态继续跑到 0。
-    ///     动机：重影根因正是「σ_k 处预测的半成品 clean x0（内容权重仅约 7.7%）升频后被重加噪，
-    ///     与高清重画的内容叠加成鬼影」；高清需要的是噪点状态而不是 clean 内容。
-    ///   · true：恢复旧路径（Eq.3 clean x0 → 升频 → 按 σ_next 重加噪）。
-    ///     **该路径仅关闭、不从代码移除**，供 A/B 对比与 lowOnly 二采链路使用。
-    /// 环境变量 NA_H3_SELFLIFT_CLEAN_HANDOFF=1 可显式恢复旧路径。
+    /// 交接状态：true（默认）= 末步 Eq.3 预测 clean x0 → 升频 → 按 σ_ren 重加噪交高清；
+    /// false = 末步正常 Euler 落到 σ_k，交出含噪 x（升频后不重加噪，高清直接接手）。
+    /// 环境变量 NA_H3_SELFLIFT_CLEAN_HANDOFF 可覆盖。
     public var cleanEndpointHandoff: Bool
 
-    /// 重加噪深度 σ_ren（2026-10-19 用户设计）：低清跑满到 σ=0 后，clean x0 升频到高清，
-    /// 再按 σ_ren 重加噪（Eq.10 新噪声）交给高清收尾。nil = 跟随 sigmaK（等深连续，旧语义）；
-    /// σ_k=0 时默认取 0.3（环境变量 NA_H3_SELFLIFT_RENOISE_SIGMA 可覆盖）。
-    /// 动机：σ_k=0.5 等深交接时高清要从 50% 噪声里一次重建全部细节，单步跨度过大 →
-    /// 纹理/色彩先验接管（风格大变）+ 每帧噪声残差不同步（闪烁）；改成「低清跑满出干净结构，
-    /// 高清只从 0.3 的浅噪声里做一次细化」。
+    /// 重加噪深度 σ_ren：clean x0 升频到高清后按该 σ 重加噪（Eq.10）再交高清收尾。
+    /// nil = 跟随 makeFixedFinalStep 默认（clean 端点 0.75，与 σ_k 等深）。
+    /// 环境变量 NA_H3_SELFLIFT_RENOISE_SIGMA 可覆盖。
     public var renoiseSigma: Double?
 
-    /// - Parameter transitionStep: ts 显式覆盖值；传 0（默认）表示不写死，按总步数 N 自动推导
     public init(enabled: Bool = true,
-                transitionStep: Int = 0,
                 lowResScale: Double = 0.5,
                 rho: Double = 0.0,
                 wMin: Float = 1.0,
@@ -138,7 +91,6 @@ public struct SelfLiftConfig: Sendable {
                 cleanEndpointHandoff: Bool = true,
                 renoiseSigma: Double? = nil) {
         self.enabled = enabled
-        self.transitionStep = transitionStep
         self.lowResScale = lowResScale
         self.rho = rho
         self.wMin = wMin
@@ -149,13 +101,6 @@ public struct SelfLiftConfig: Sendable {
         self.renoiseSigma = renoiseSigma
     }
 
-    /// 解析出本次调度实际使用的 ts：
-    ///   · transitionStep > 0 → 该显式值；
-    ///   · transitionStep = 0 → 官方 75% 规则按总步数推导（`SelfLiftScheduleSplit.transitionStep(forTotalSteps:)`）。
-    /// - Parameter totalSteps: 第一阶段总步数 N（面板滑杆 4–12）
-    public func resolvedTransitionStep(totalSteps n: Int) -> Int {
-        transitionStep > 0 ? transitionStep : SelfLiftScheduleSplit.transitionStep(forTotalSteps: n)
-    }
 
     /// 是否走 VAE 像素锚点（rho>0 且 wMax>0）——为真时过渡块会多一趟 decode→encode
     /// 与官方 `need_pix = rho > 0.0 and w_max > 0.0` 一致（selflift.py 行 26-28）
@@ -164,36 +109,17 @@ public struct SelfLiftConfig: Sendable {
     /// 与官方 `need_lat = not (rho >= 1.0 and w_min >= 1.0 and w_max >= 1.0)` 一致
     public var needsLatentLift: Bool { !(rho >= 1 && wMin >= 1 && wMax >= 1) }
 
-    /// 官方 H3 节点默认 cfg = 5.0（nodes.py 行 480）。本工程一采循环没有 CFG 分支，此值仅作对齐记录。
-    public static let officialH3Cfg: Float = 5.0
-    /// 官方 H3 路径硬编码的「直接 latent 提升」插值方式（nodes.py 行 509 / selflift.py 行 18）
-    public static let officialLatentUpsampleMode: String = "nearest"
 }
 
 // MARK: - 调度切分
 
 public enum SelfLiftScheduleError: Error, CustomStringConvertible {
     case tooFewSteps(Int)
-    case transitionOutOfRange(ts: Int, n: Int)
-    case sigmasNotMonotonic(index: Int, prev: Double, cur: Double)
-    case sigmasNonPositiveBeforeEnd(index: Int, value: Double)
-    case lastSigmaNegative(Double)
-    case transitionSigmaNotBelowOne(Double)
 
     public var description: String {
         switch self {
         case .tooFewSteps(let n):
             return "SelfLift: 总步数不足（N=\(n)），至少需要 2 步"
-        case .transitionOutOfRange(let ts, let n):
-            return "SelfLift: transitionStep=\(ts) 越界，有效范围 [1, \(max(1, n - 1))]"
-        case .sigmasNotMonotonic(let i, let p, let c):
-            return "SelfLift: sigma 非单调非增（i=\(i), \(p) → \(c)）"
-        case .sigmasNonPositiveBeforeEnd(let i, let v):
-            return "SelfLift: 非末项 sigma ≤ 0（i=\(i), σ=\(v)）"
-        case .lastSigmaNegative(let v):
-            return "SelfLift: 末项 sigma 为负（\(v)）"
-        case .transitionSigmaNotBelowOne(let v):
-            return "SelfLift: 切换点起采 σ 必须 < 1（σ[ts]=\(v)）"
         }
     }
 }
@@ -214,125 +140,27 @@ public struct SelfLiftScheduleSplit: Sendable {
     public var highNFE: Int { highSigmas.count - 1 }
     public var totalNFE: Int { lowNFE + highNFE }
 
-    /// 官方 75% 比例系数：官方两个论文实例 FLUX.2-Klein（3/4）、Z-Image-Turbo（6/8）均为 0.75；
-    /// 本工程 H3 一采 N = 6 → ts = 4 与之一致。
-    public static let officialTransitionRatio: Double = 0.75
-
     /// 用户输入 σ 吸附到公式曲线时的采样分辨率（档数）。256 档时 0.75→0.7491、0.5→0.5042，
     /// 既保证「值是公式真实产出的档位」，又不会像按 N 步网格吸附那样把 0.5 吸到 0.7。
     public static let snapResolution: Int = 256
+    // 生产调度走 makeFixedFinalStep（固定高清最后 1 步），不用 75% 推导。
     // ══════════════════════════════════════════════════════════════════════
-    // 【踩坑记录 · SelfLift 重影根因与修复】2026-09-17
-    //
-    // 现象：短场景（39 帧，seed=42，learned upscaler + rho=0）N 扫描中，
-    //   N=8 成片出现明显重影（双像/残影），N=6/7/9 干净；
-    //   用户 UI 观察确认：短9还行、短8明显重影。
-    //
-    // 根因（非随机，是 75% 规则自动推导的调度遗漏）：
-    //   1) ts = floor(0.75·N) 推导后，σ_next = sigmas[ts] 随 N 落点不同；
-    //   2) 过渡块重加噪时，高分起点 = (1-σ_next)·z0_high + σ_next·噪声，
-    //      (1-σ_next) 即「低分内容残留进高分的权重」；
-    //   3) N=8 时 ts=6、σ_next=0.8000，残留 20% 为全档最高，且高分仅 2 步、
-    //      首步 dσ=0.168 最大，修正不足 → 低分时间维双像伪影残留成片。
-    //
-    // 各档位数值（sigmaShift=12, shift=12.0）：
-    //   N=6: ts=4, σ_next=0.8571, 残留14.3%, 高分2步 ✅ 干净
-    //   N=7: ts=5, σ_next=0.8276, 残留17.2%, 高分2步 ✅ 干净
-    //   N=8: ts=6, σ_next=0.8000, 残留20.0%, 高分2步 ❌ 重影
-    //   N=9: ts=6, σ_next=0.8571, 残留14.3%, 高分3步 ✅ 干净
-    //
-    // 解决方案：自动推导路径加 σ_next 下限约束（下方 minTransitionSigma = 0.86），
-    //   σ_next < 0.86 时 ts 前移（低分少跑、高分多跑、过渡起点变浅）。
-    //   第一版 0.85 只覆盖 N=8/10；h3_56（124 帧长视频、UI 默认 N=6）仍重影，
-    //   故提到 0.86，让 N=6/7/9 也触发（0.8571/0.8276/0.8571 < 0.86）：
-    //   修复后 N=6: ts=3, σ_next=0.9231, 残留7.7%,  高分3步
-    //   修复后 N=7: ts=4, σ_next=0.9000, 残留10.0%, 高分3步
-    //   修复后 N=8: ts=5, σ_next=0.8780, 残留12.2%, 高分3步，用户确认干净
-    //   修复后 N=9: ts=5, σ_next=0.9057, 残留9.4%,  高分4步
-    //   修复后 N=10: ts=6, σ_next=0.8889, 残留11.1%, 高分4步
-    //
-    // 大白话：高分起点 = 高清新画面 + 低清旧画面混合；低清旧画面里带着时间维重影，
-    //   叠得越重（残留越大）、清洗次数越少（高分步数越少），重影越洗不掉。
-    //   N=8 恰是叠最重(20%)又给最少(2步)的一档。
-    //
-    // 注意：
-    //   - 仅约束自动推导路径（config.transitionStep == 0），显式指定 ts 不覆盖；
-    //   - 0.86 为经验安全值，方向保守（只会让 ts 前移，不引入新风险）；
-    //     长视频（124 帧）对时间维残留更敏感：残留 > 13% 的档位建议一律前移；
-    //     N=11/12 自动推导后残留 ≤12.7%（N=11→ts=7 0.8727、N=12→ts=7 0.8955），无需再提阈值；
-    //   - 换 sigma 调度风格（如 betaRefined）时 σ_next 分布不同，需重新核对落点；
-    //   - 本问题与提示词/内容无关，纯调度层问题，换提示词同样受约束保护。
-    //   ※ 该兜底方案已废弃移除（2026-10-08）：固定最后一步设计（低清 N-1 步线性到 σ_k +
-    //     高清 1 步 σ_k→0，当前 σ_k=0.75，见 makeFixedFinalStep）取代自动 75% 推导，
-    //     不再需要 σ_next 下限/前移兜底，直接跑。
-    // ══════════════════════════════════════════════════════════════════════
-
-    /// 按官方 75% 比例由总步数 N 推导切换点：`ts = clamp(floor(0.75 · N), 1, N-1)`。
-    ///
-    /// 上界取 N-1 即官方硬约束（nodes.py 行 98 `_validate_schedule`，上界 = sigmas.numel()-2）；
-    /// 下界取 1 保证低分段至少 1 次 NFE。
-    /// 面板滑杆 N ∈ 4–12 的推导值：4→3（测试档）、5→3、6→4（与本工程原写死值一致）、7→5、
-    /// 8→6、9→6、10→7、11→8、12→9。
-    /// - Parameter n: 第一阶段总步数 N（面板第一阶段总步数滑杆，4–12）
-    public static func transitionStep(forTotalSteps n: Int) -> Int {
-        guard n >= 2 else { return 1 }
-        let derived = Int((officialTransitionRatio * Double(n)).rounded(.down))
-        return min(max(derived, 1), n - 1)
-    }
-
-    /// 便捷入口：ts 由 `config` 解析（显式覆盖优先），其余校验与 `make(sigmas:transitionStep:)` 一致。
-    /// - Parameter config: SelfLift 配置；`transitionStep = 0` 表示不写死
-    public static func make(sigmas: [Double], config: SelfLiftConfig) throws -> SelfLiftScheduleSplit {
-        try make(sigmas: sigmas, transitionStep: config.resolvedTransitionStep(totalSteps: sigmas.count - 1))
-    }
-
-    /// - Parameters:
-    ///   - sigmas: 原始调度（严格非增、只有最后一项可为 0、rectified-flow 约定）
-    ///   - ts: 低分辨率前向次数，且 1 ≤ ts ≤ N-1
-    public static func make(sigmas: [Double], transitionStep ts: Int) throws -> SelfLiftScheduleSplit {
-        let n = sigmas.count - 1
-        guard n >= 2 else { throw SelfLiftScheduleError.tooFewSteps(n) }
-        guard ts >= 1, ts <= n - 1 else {
-            throw SelfLiftScheduleError.transitionOutOfRange(ts: ts, n: n)
-        }
-        for i in 0..<n where sigmas[i + 1] > sigmas[i] + 1e-9 {
-            throw SelfLiftScheduleError.sigmasNotMonotonic(index: i + 1, prev: sigmas[i], cur: sigmas[i + 1])
-        }
-        for i in 0..<n where sigmas[i] <= 0 {
-            throw SelfLiftScheduleError.sigmasNonPositiveBeforeEnd(index: i, value: sigmas[i])
-        }
-        guard sigmas[n] >= 0 else { throw SelfLiftScheduleError.lastSigmaNegative(sigmas[n]) }
-        guard sigmas[ts] < 1.0 else {
-            throw SelfLiftScheduleError.transitionSigmaNotBelowOne(sigmas[ts])
-        }
-
-        return SelfLiftScheduleSplit(
-            lowSigmas: Array(sigmas[0...ts]),
-            highSigmas: Array(sigmas[ts...n]),
-            transitionStep: ts,
-            sigmaK: sigmas[ts - 1],
-            sigmaNext: sigmas[ts])
-    }
 
     // ──────────────────────────────────────────────────────────────────────
     // 固定最后一步高清（M=1）· 公式网格调度（2026-10-25 用户需求改版）
     //
-    //   旧版（已移除）：低清 L 步「线性等距」跑到 σ_k —— 每步 Δσ 恒为 (1-σ_k)/L。
-    //   为什么移除：直出路径全程 σ 走 shift 曲线 σ(b)=shift·b/(1+(shift-1)·b)，等距 σ 只是
-    //   另一条轨迹（shift=12、5 步时前几步 Δσ 只有公式的约 1/4，末步又远大于公式），
-    //   低清段的评估点与直出路径对不上，两段口径不一致。
-    //
     //   新口径：
     //     · 低清网格 = 公式曲线（与直出 `sigmaSchedule(steps:shift:)` 逐点同式），b 空间等距；
     //     · 用户输入的 σ_k（低清跑到哪）/ σ_ren（重加噪深度）先**吸附到公式网格上最近的 σ 档**，
-    //       把 0.75 这种「线性口径的值」换成公式真实存在的档位；
+    //       把 0.5 这种「线性口径的值」换成公式真实存在的档位；
     //     · 低清终点精确落在吸附后的 σ_k（b 端点反解，不靠反推取整），高清固定 1 步 σ_ren → 0。
     //   N=6、shift=12、σ_k=σ_ren=0.75 → 吸附到公式档 σ≈0.7491；低清 5 步（clean 为 4 个间隔 +
-    //   末步 Eq.3 占位）、高清 1 步，总 NFE 与旧版一致仍为 N=6。
+    //   末步 Eq.3 占位）、高清 1 步，总 NFE 仍为 N=6。
     // ──────────────────────────────────────────────────────────────────────
     /// - Parameter totalSteps: 面板第一阶段总步数 N（总 NFE = 低清步数 + 高清固定 1 步）
     /// - Parameter sigmaK: 用户输入的低清终点 / 交接深度（默认 0.75），内部吸附到公式最近档
-    ///   （σ_k 历史 0.86→0.95→0.7→0.6→0.8→0.7→0.8→0.75→0.5→0.75；σ_ren 历史 0.8→0.5→0.55→0.75）
+    /// - Parameter renoiseSigma: 用户输入的重加噪深度（默认与 sigmaK 等深 0.75）
+    /// - Note: 0.75/0.75 为当前定档；若低清残影过重，可把 sigmaK 与 renoiseSigma 一起降回 0.5。
     /// - Parameter cleanEndpoint: true=末步 Eq.3 预测 clean x0 并重加噪（默认）；false=末步正常 Euler 落在 σ_k、交出含噪 x（带噪直通）
     /// - Parameter shift: 视频侧 shift（与直出路径同一个 shift，H3 默认 12.0）
     public static func makeFixedFinalStep(totalSteps: Int, sigmaK: Double = 0.75,
@@ -351,10 +179,10 @@ public struct SelfLiftScheduleSplit: Sendable {
         let sigmaKSnapped = lowToZero ? 0.0 : nearestGridValue(to: sigmaK, grid: snapGrid, range: 0...snap)
         // ② 重加噪深度 σ_ren：clean 端点默认 0.75（用户定档「与止点等深」），带噪直通跟随 σ_k；
         //    用户显式给了 renoiseSigma 就用它，统一吸附到同一张公式网格的最近档。
-        let renTarget = renoiseSigma ?? (cleanEndpoint ? 0.75 : (lowToZero ? 0.75 : sigmaK))
+        let renTarget = renoiseSigma ?? (cleanEndpoint ? 0.75 : (lowToZero ? 0.5 : sigmaK))
         let sigmaNext = nearestGridValue(to: renTarget, grid: snapGrid, range: 1...snap)
         // ③ 低清网格：b 空间等距 → 公式 σ，末项精确等于吸附后的 σ_k（不按档截断，避免终点漂移）。
-        //    步数与旧版完全一致（总 NFE 仍是 N）：
+        //    总 NFE 恒为 N：
         //    · 带噪直通：N-1 个间隔，末步 Euler 真正落在 σ_k；
         //    · clean 端点：N-2 个间隔 + 末尾 σ_k 占位 —— 末步只做 Eq.3（Euler 丢弃）。
         let intervals = max(1, cleanEndpoint ? n - 2 : n - 1)
@@ -614,8 +442,7 @@ public enum SelfLiftTransition {
         }
         holdIntermediate?(z0High)
         // 用户设计（2026-10-09 收敛为等深）：σ_next == σ_k，按 σ_next 重加噪后直接进高清首步，
-        // 不补 Euler。旧版官方档补 Euler 条件恒 false（漏补）、decouple 等深不补，两个成功分支
-        // 均无补步；新版曾补 (σ_k → σ_next) 把状态推到更浅起点，试跑仍失败，已移除。
+        // 不补 Euler（该步并入高清首步）。
         let renSigma = split.sigmaNext
         let xK = noiseScaling(z0High, renSigma, noise)
         holdIntermediate?(xK)

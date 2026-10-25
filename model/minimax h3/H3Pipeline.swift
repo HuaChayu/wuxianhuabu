@@ -107,17 +107,12 @@ public enum H3FL2VAPipeline {
         steps: UInt32 = 6,
         latentT: UInt32 = 5,
         seed: UInt64 = 42,
-        sparsePolicy: SparsePolicy = .off,
+        sparsePolicy: SparsePolicy = .mix,
         scheduleStyle: H3SigmaScheduleStyle = .official,
-        // ★ 2026-10-22 SOL 已关闭：sparsePolicy 默认 .off（50 层全稠密 SDPA）；
-        //   如需对照实验显式传 .mix / .spatial / .temporal。
-        // 分阶段门控已取消：默认 nil，stage1 去噪全程按 sparsePolicy 走（关闭时恒为 dense），
-        // 不再在首尾段整步回退稠密（SDPA）。【已取消实验参数】全工程无调用点，恒不生效，
-        // 保留该参数仅供显式对照实验：
-        // 传 (start, end) 时 progress = step/total ∈ (start, end) 才稀疏，两端全 dense
-        //（对齐 kijai Sol-Attn 的 percent_to_sigma：start=0.2 / end=0.9）；
-        // 环境变量 NA_H3_SPARSE_GATE=0 仍可强制关闭门控做对照。
-        sparseGatePercent: (start: Float, end: Float)? = nil,
+        // ★ 2026-10-25 SOL 重新开启：sparsePolicy 默认 .mix（首2/中2/末2 层保持 dense，其余 44 层
+        //   走 SOL tau 路由；.mix 下 spatial/temporal 分支在 SOL 内核中同样走 tau 路由）。
+        //   2026-10-22 曾默认 .off（50 层全稠密 SDPA）做画质对照，现按用户要求恢复开启；
+        //   对照实验可显式传 .off。
         // PAB 跨步 attention 缓存：全程接入，按 attnBroadcastRefresh 调度执行——
         // warmup/tail 强制重算，中间步按 k 间隔刷新，其余步复用上一步 attention 输出。
         // k<=1 等价禁用；环境变量 NA_H3_PAB=0 可强制关闭做对照，NA_H3_PAB_K 可覆盖间隔扫描。
@@ -262,8 +257,7 @@ public enum H3FL2VAPipeline {
         var refVisionBlocks: [H3VisionBlock] = []
         var refVisionLabels: [String] = []
 
-        // ★ 2026-10-04 曾统一 fl/ref 软参考编码（首尾帧图以与 ref 相同方式进入 refImg 段），
-        //   但 2026-10-07 已恢复 fl 双端硬锚分支（见下方 flSoftPair）——软参考仅剩历史注释。
+        // fl 首尾帧走 keyframe 硬锚（见下方 flSoftPair）。
         //   参考图源 = useRef2VA 时全部多参考图；否则本节点首尾帧两张。
         let refImageSourcePaths = useRef2VA ? referenceImagePaths : [firstImagePath, lastImagePath]
         // ★ 2026-10-07 fl 硬锚 + 视觉块（社区口径）：fl 首尾帧走 keyframe 硬锚
@@ -1122,11 +1116,6 @@ public enum H3FL2VAPipeline {
         case .temporal: policyDesc = "temporal（全部层跨帧时间注意力）"
         }
         log("稀疏注意力策略：\(policyDesc)")
-        if let gp = sparseGatePercent {
-            log("稀疏门控：progress ∈ (\(gp.start), \(gp.end)) 中段稀疏，两端整步 dense（\(gp.start * 100)% 前 / \(gp.end * 100)% 后）")
-        } else {
-            log("稀疏门控：关闭（全程按稀疏策略执行）")
-        }
 
         let nVideoRows = Int(latentT) * gridH * gridW
         let vpatch = cfg.videoPatchDim
@@ -1214,7 +1203,6 @@ public enum H3FL2VAPipeline {
             let envWMin = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_WMIN"].flatMap(Float.init)
             let envWMax = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_WMAX"].flatMap(Float.init)
             let slCfgBase = SelfLiftConfig(enabled: true,
-                                           transitionStep: 0,
                                            rho: envRho ?? 0.0,
                                            wMin: envWMin ?? 1.0,
                                            wMax: envWMax ?? 1.0)
@@ -1224,26 +1212,21 @@ public enum H3FL2VAPipeline {
             //   官方 cfg=5.0 面向原版 H3（非 turbo）。保留机制供显式实验（小值 1.5~3.0 可试）。
             let envCfgScale = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_CFG"].flatMap(Double.init) ?? 0.0
             var slCfg = slCfgBase
-            // Runner 已收敛为唯一调度（makeFixedFinalStep），历史解耦 A/B 实验开关（LOW_STEPS /
-            // HIGH_STEPS / HIGH_START）不再被消费；仅 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖 σ_k（默认 0.6）。
+            // Runner 已收敛为唯一调度（makeFixedFinalStep）；仅 NA_H3_SELFLIFT_DECOUPLE_LOW_K 可覆盖 σ_k（默认 0.75）。
             let decoupleEnv = ProcessInfo.processInfo.environment
             if let lowK = decoupleEnv["NA_H3_SELFLIFT_DECOUPLE_LOW_K"].flatMap(Double.init) {
                 slCfg.decoupleSigmaK = lowK
                 log("SelfLift σ_k 覆盖：NA_H3_SELFLIFT_DECOUPLE_LOW_K=\(lowK)（默认 0.75：低清止于 σ=0.75）")
             }
-            // ★ 2026-10-20 用户定档：低清止于 σ_k=0.75 → clean 端点升频 → 高清按 σ_ren=0.75 重加噪接手（与止点等深）。
-            //   2026-10-22 曾下调至 0.5 做对照，同日已回滚 0.75（改动点为下方 slSigmaK / SelfLiftH3 / makeFixedFinalStep）。
-            //   显式覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA；未设时 clean 端点默认 0.75（高清重画 75%），
-            //   带噪直通档跟随 σ_k（等深，不重加噪）。等深 clean（σ_ren=σ_k）历史已证鬼影，不作默认。
+            // ★ σ_ren：NA_H3_SELFLIFT_RENOISE_SIGMA 可覆盖；未设时 clean 端点 0.75（与 σ_k 等深），
+            //   带噪直通档跟随 σ_k（不重加噪）。
             let envRen = decoupleEnv["NA_H3_SELFLIFT_RENOISE_SIGMA"].flatMap(Double.init)
             if let r = envRen {
                 slCfg.renoiseSigma = r
                 log("SelfLift σ_ren 覆盖：NA_H3_SELFLIFT_RENOISE_SIGMA=\(r)")
             }
-            // ★ 交接状态类型（2026-10-19 用户需求）：默认「clean 端点」——低清末步 Eq.3 预测
-            //   clean x0，升频后按 σ_ren=0.75 重加噪交高清，高清 1 步 0.75→0。
-            //   带噪直通（末步 Euler 落在 σ_k、升频后不重加噪）保留作 A/B 对照：
-            //   NA_H3_SELFLIFT_CLEAN_HANDOFF=0 可切到带噪直通。
+            // ★ 交接状态：默认 clean 端点（末步 Eq.3 预测 clean x0 → 升频 → 按 σ_ren 重加噪，高清 1 步到 0）；
+            //   NA_H3_SELFLIFT_CLEAN_HANDOFF=0 切到带噪直通（Euler 落在 σ_k、升频后不重加噪）。
             let cleanHandoffEnv = (decoupleEnv["NA_H3_SELFLIFT_CLEAN_HANDOFF"] ?? "1") != "0"
             slCfg.cleanEndpointHandoff = cleanHandoffEnv
             log("SelfLift 交接模式：\(cleanHandoffEnv ? "clean 端点（默认：Eq.3 x0 → 升频 → 按 σ_ren=0.75 重加噪）" : "带噪直通（σ_k 含噪 x → 升频 → 不重加噪，高清接手续跑）")")
@@ -1253,11 +1236,11 @@ public enum H3FL2VAPipeline {
             } else {
                 log("SelfLift CFG：关闭（cfg=0，仅 positive 单路；NA_H3_SELFLIFT_CFG=1.5~3.0 可显式实验）")
             }
-            // ★ 2026-10-20 定档：低清止点 σ_k=0.75（2026-10-22 曾试 0.5，同日回滚）。
-            // ★ 2026-10-25：低清段不再线性等距，改由直出同款 shift 公式生成；σ_k / σ_ren 会在
-            //   Runner 里吸附到公式网格最近档（0.75 → 0.7491、0.5 → 0.5042），此处打的是输入值。
+            // ★ 用户定档：低清止点 σ_k = 重加噪 σ_ren = 0.75（等深）。
+            //   低清段由直出同款 shift 公式生成；σ_k / σ_ren 在 Runner 里吸附到公式网格最近档
+            //   （0.75 → 0.7491），此处打的是输入值。
             let slSigmaK = slCfg.decoupleSigmaK ?? 0.75
-            let slRen = slCfg.renoiseSigma ?? (cleanHandoffEnv ? 0.75 : (slSigmaK <= 1e-9 ? 0.75 : slSigmaK))
+            let slRen = slCfg.renoiseSigma ?? (cleanHandoffEnv ? 0.75 : (slSigmaK <= 1e-9 ? 0.5 : slSigmaK))
             log("SelfLift 第三分支：开启（低清按 shift 公式跑到 σ_k=\(slSigmaK)\(slSigmaK <= 1e-9 ? "（跑满完整流程）" : "")（吸附最近档见 Runner 日志），"
                 + "升频后按 σ_ren=\(slRen) 重加噪，高清固定 1 步 σ_ren→0；"
                 + "低分倍率 \(slCfg.lowResScale)、ρ=\(slCfg.rho)、wMin=\(slCfg.wMin)/wMax=\(slCfg.wMax)）")
@@ -1355,22 +1338,8 @@ public enum H3FL2VAPipeline {
             }
         for i in 0..<stage1SegmentCount {
             let stepT = Date()
-            // 分阶段门控（默认已取消）：sparseGatePercent 为 nil 时走 else 分支 —— 全程
-            // sparsePolicy，不做任何整步 dense 回退；【已取消实验参数】全工程无调用点，
-            // 恒不生效，此处 gateOn 恒 false；仅当调用方显式传入 (start, end) 时才启用
-            // ComfyUI 式 sigma 门控（progress = i/steps 与 percent_to_sigma 阈值同构，
-            // 0~start% 与 end~100% 整步回退全 dense SDPA，中间段才走稀疏 tau 路由）。
-            var gateMode = "sol"
-            var gateOn = sparseGatePercent != nil
-            if let e = ProcessInfo.processInfo.environment["NA_H3_SPARSE_GATE"], e == "0" { gateOn = false }
-            if gateOn, let gp = sparseGatePercent {
-                let progress = Float(i) / Float(stage1SegmentCount)
-                let denseStep = progress < gp.start || progress > gp.end
-                dit!.sparsePolicy = denseStep ? .off : sparsePolicy
-                gateMode = (denseStep || sparsePolicy == .off) ? "dense" : "sparse"
-            } else {
-                dit!.sparsePolicy = sparsePolicy
-            }
+            dit!.sparsePolicy = sparsePolicy
+            let gateMode = sparsePolicy == .off ? "dense" : "sparse"
             let sigma = sigmas[i]
             let dsigma = sigmas[i + 1] - sigmas[i]
             let plan = buildTimestepPlanGlobal(layout: layout, sigmaV: sigma, shiftV: sv, shiftA: sa,

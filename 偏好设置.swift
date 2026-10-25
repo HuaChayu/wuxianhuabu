@@ -87,9 +87,7 @@ final class AppSettings: ObservableObject {
     // ★ H3 一采第一阶段总步数 N（面板滑杆 4–12，默认 6）：
     // 该值就是「H3 一采总步数 N」——队列把它作为 steps 传给 H3FL2VAPipeline.generateVideo，
     // 管线内部 N = sigmas.count - 1（见 H3Pipeline stage1SegmentCount）。
-    // SelfLift 第三分支的 transition_step（ts）不写死，由官方 75% 规则随 N 自动推导：
-    //     ts = clamp(floor(0.75 · N), 1, N-1)（SelfLiftScheduleSplit.transitionStep(forTotalSteps:)）
-    // 各档：4→3（测试档）、5→3、6→4、7→5、8→6、9→6、10→7、11→8、12→9。
+    // SelfLift 第三分支走 makeFixedFinalStep（低清按公式网格到 σ_k + 高清固定 1 步），总 NFE = N。
     // 默认 6 与 turbo LoRA（6 步版）标定一致；4 步档仅用于 SelfLift 联动测试，画质不作保证。
     @Published var h3Stage1Steps: Int {
         didSet { defaults.set(h3Stage1Steps, forKey: "h3Stage1Steps") }
