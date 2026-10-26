@@ -77,6 +77,11 @@ struct CanvasNode: Identifiable, Codable {
     var imageQuality: ImageQuality = .p720  // 图像/角色/场景节点尺寸档位（默认 720 档；Codable 自动 decodeIfPresent，旧档兼容）
     /// 节点用过的历史内容（替换/生成新内容时旧内容入列，右下角徽标可展开恢复；Codable 自动 decodeIfPresent，旧档兼容）
     var history: [NodeContentHistory]? = nil
+    /// 带 U+FFFC 占位符的提示词原文（prompt 字段仍是剥掉占位符的纯文本，供生成端使用；
+    /// nil = 该节点提示词里没有引用块。Codable 自动 decodeIfPresent，旧档兼容）
+    var promptRich: String? = nil
+    /// 引用块持久化快照（与 promptRich 占位符顺序一一对应；Codable 自动 decodeIfPresent，旧档兼容）
+    var promptMentionRefs: [PromptMentionRef]? = nil
 }
 
 /// CanvasNode 全字段 Equatable：供 NodeView/ConnectionLine 做 .equatable() 剪枝。
@@ -101,7 +106,9 @@ extension CanvasNode: Equatable {
         lhs.quality == rhs.quality &&
         lhs.imageModel == rhs.imageModel &&
         lhs.imageQuality == rhs.imageQuality &&
-        lhs.history == rhs.history
+        lhs.history == rhs.history &&
+        lhs.promptRich == rhs.promptRich &&
+        lhs.promptMentionRefs == rhs.promptMentionRefs
     }
 }
 
@@ -212,6 +219,182 @@ struct NodeConnection: Identifiable, Codable {
     var id: UUID = UUID()   // var：解码时从 JSON 恢复原 id
     let fromID: UUID
     let toID: UUID
+}
+
+// 提示词面板顶部的「前置条件缩略图」条目（由 CanvasStore.promptInputThumbnails 计算）
+/// 打开面板时收集本节点所有入边源节点：有视觉内容的取资产缩略图（图片/视频首帧），
+/// 无视觉内容的（文本/音频/空节点）退回类型图标；无效连线（超限/空节点）以半透明 + 红框提示。
+struct PromptInputThumbnail: Identifiable {
+    /// 源节点 id（同一源节点多线去重后仍唯一）
+    let id: UUID
+    /// 源节点标题（悬停提示用）
+    let title: String
+    /// 源节点类型（图标/角标用）
+    let kind: NodeType
+    /// 缩略图（nil = 无视觉内容，显示 kind.placeholderIcon）
+    let image: NSImage?
+    /// 该连线是否被输入合规性判定为无效（超限 / 空节点）
+    let isInvalid: Bool
+}
+
+/// 输入框手打 @ 时的候选节点（@ 提及面板里的一行）
+struct PromptMentionCandidate: Identifiable {
+    /// 被引用节点 id
+    let id: UUID
+    /// 节点名字
+    let title: String
+    /// 节点类型（分类图标/角标）
+    let kind: NodeType
+    /// 缩略图（nil = 无可视内容，退回类型图标）
+    let image: NSImage?
+}
+
+/// @ 提及面板里的一个分类（角色/场景/图片…）
+struct PromptMentionGroup: Identifiable {
+    var kind: NodeType
+    var items: [PromptMentionCandidate]
+    var id: NodeType { kind }
+}
+
+/// @ 提及面板里可被键盘高亮/切换的一行：候选节点 或 分类行
+enum PromptMentionRow: Identifiable {
+    /// 可插入的候选节点
+    case candidate(PromptMentionCandidate)
+    /// 分类行（→ / 回车进入，展开并在右栏逐项浏览）
+    case group(PromptMentionGroup)
+
+    var id: String {
+        switch self {
+        case .candidate(let item): return "c-\(item.id.uuidString)"
+        case .group(let group): return "g-\(group.kind.rawValue)"
+        }
+    }
+
+    /// 候选节点（分类行返回 nil）
+    var candidate: PromptMentionCandidate? {
+        if case .candidate(let item) = self { return item }
+        return nil
+    }
+
+    /// 分类（候选行返回 nil）
+    var group: PromptMentionGroup? {
+        if case .group(let group) = self { return group }
+        return nil
+    }
+}
+
+/// @ 提及面板的数据源：上游连线节点优先 + 本项目全部节点（按类型分类展开）
+struct PromptMentionCatalog {
+    /// 本节点入边源节点（面板顶部「素材引用」区优先展示）
+    var upstream: [PromptMentionCandidate] = []
+    /// 本项目全部节点（不含本节点；面板下方按类型分组展开）
+    var all: [PromptMentionCandidate] = []
+
+    static let empty = PromptMentionCatalog()
+
+    /// 按分类顺序分组，只保留有内容的分类
+    var grouped: [PromptMentionGroup] {
+        let order: [NodeType] = [.character, .scene, .image, .video, .text, .audio]
+        var result: [PromptMentionGroup] = []
+        for kind in order {
+            let items = all.filter { $0.kind == kind }
+            if !items.isEmpty { result.append(PromptMentionGroup(kind: kind, items: items)) }
+        }
+        return result
+    }
+
+    /// 名字命中过滤词的候选（空过滤词 = 全量）：上游连线节点在前，随后本项目其它节点，按 id 去重
+    func searchCandidates(keyword: String) -> [PromptMentionCandidate] {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var seen = Set<UUID>()
+        var result: [PromptMentionCandidate] = []
+        for item in upstream + all {
+            guard !seen.contains(item.id) else { continue }
+            seen.insert(item.id)
+            // 与面板里「命中段标强调色」用同一套匹配规则，保证筛出来的行一定带高亮段
+            if item.title.range(of: trimmed, options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]) != nil {
+                result.append(item)
+            }
+        }
+        return result
+    }
+
+    /// 键盘 ↑↓ 的遍历序列（一层层走：左栏候选 + 分类行 → 进入某分类后为右栏该分类的节点）：
+    /// - 搜索模式（过滤词非空）= 过滤结果（不分层）
+    /// - 已进入某分类（focusInCategory 且 enteredKind 非空）= 该分类下的节点（右栏）
+    /// - 其余（浏览根层）= 「素材引用」候选 + 分类行，能一路走到图片/视频等类别
+    func navRows(keyword: String, enteredKind: NodeType?, focusInCategory: Bool) -> [PromptMentionRow] {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return searchCandidates(keyword: trimmed).map { PromptMentionRow.candidate($0) }
+        }
+        if focusInCategory, let enteredKind {
+            let items = all.filter { $0.kind == enteredKind }
+            return items.isEmpty ? [] : items.map { PromptMentionRow.candidate($0) }
+        }
+        var seen = Set<UUID>()
+        var rows: [PromptMentionRow] = []
+        for item in upstream where seen.insert(item.id).inserted {
+            rows.append(.candidate(item))
+        }
+        for group in grouped {
+            rows.append(.group(group))
+        }
+        return rows
+    }
+}
+
+/// 输入框内的引用块（点 @ 前置条件缩略图后插入）：
+/// 记录被引用节点的 id 与名字，界面渲染成"@ + 小图 + 名字"的块；
+/// 后续生成/队列端可按 nodeID 取该节点的实际内容（图/视频首帧/文本），名字与 id 同时保留。
+struct PromptMention: Identifiable, Equatable {
+    /// 块自身 id（同一个被引用节点可以插入多个块，各自独立）
+    let id: UUID
+    /// 被引用节点 id（后续取内容用；同一节点可重复引用，不做去重）
+    let nodeID: UUID
+    /// 被引用节点名字（块上展示）
+    let title: String
+    /// 被引用节点类型（块左侧图标/色点用）
+    let kind: NodeType
+    /// 小头像（nil = 无可视内容，用类型图标）
+    let image: NSImage?
+}
+
+/// 引用块的持久化快照（PromptMention 的可编码版本，不含 NSImage）：
+/// 与 CanvasNode.promptRich 里的 U+FFFC 占位符按出现顺序一一对应，
+/// App 重启后据此把块与文字混排原样还原（缩略图按 nodeID 现取）。
+struct PromptMentionRef: Codable, Equatable {
+    /// 块自身 id（保证同一节点多个块各自可区分）
+    var blockID: UUID = UUID()
+    /// 被引用节点 id
+    var nodeID: UUID
+    /// 被引用节点名字快照（节点已删除时兜底展示）
+    var title: String
+    /// 被引用节点类型快照
+    var kind: NodeType
+}
+
+/// 节点输入框草稿缓存（按节点 id 存放，仅内存态；跨启动由 CanvasNode.promptRich/promptMentionRefs 落盘兜底）：
+/// 节点 prompt 字段只存纯文本（占位符被剥掉），这里额外保留「带 U+FFFC 占位符的原文 + 引用块顺序」，
+/// 用于切换选中 / 重新点击节点后用同一份原文把引用块原样恢复，块与文字的混排关系不丢。
+struct NodePromptDraftCache {
+    /// 带占位符的原文（占位符个数与 mentions 顺序一一对应）
+    var text: String
+    /// 引用块（每个块 id 唯一；title 为展示快照，被引用节点改名时按 nodeID 就地更新）
+    var mentions: [PromptMention]
+}
+
+/// 节点改名事件（画布层 → 输入框层的单向通知）：
+/// 只在改名成功处发布一条，输入框层按 id 精确匹配更新引用块名字，
+/// 不做「全量节点遍历 + 逐节点比对」的轮询式同步（改名低频，但画布节点可能很多）。
+struct NodeTitleChange: Equatable {
+    /// 被改名的节点 id
+    let nodeID: UUID
+    /// 新标题
+    let title: String
+    /// 递增序号：同一标题连续改两次也能触发一次 UI 更新
+    let seq: Int
 }
 
 // 正在拖拽的连线（from 节点 + 当前鼠标画布坐标 + 起始端口方向）

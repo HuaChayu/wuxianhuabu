@@ -305,6 +305,11 @@ final class AssetSelectionNSView: NSView {
     private var currentRect: CGRect?
 
     override func hitTest(_ point: NSPoint) -> NSView? {
+        // 系统滚动条（NSScroller）区域一律穿透。
+        // 本层是 overlay 的 NSView，压在 NSScrollView 之上；若在滚动条上返回 self，
+        // scroller 的 mouseDown 会被本层吞掉 → 滚动条看得见却点不动、拖不动。
+        // 判断放在 assetFrames 判空之前：滚动条与资产上报与否无关，任何时候都不能挡。
+        if isOverScroller(point) { return nil }
         // 资产 frame 尚未上报（为空）时一律不拦截，保证拖拽到画布正常
         guard !assetFrames.isEmpty else { return nil }
         // 命中资产项 → 返回 nil 穿透给下层 draggable（拖拽优先于框选）
@@ -320,6 +325,16 @@ final class AssetSelectionNSView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // 兜底：若宿主层级没把 hitTest 的穿透真正放过去，这里把落在滚动条上的
+        // 按下事件直接交给系统 NSScroller（它内部自带拖动跟踪），
+        // 保证滚动条能像左侧大纲一样悬停、点击翻页、拖动滑块
+        if isOverScroller(windowPoint: event.locationInWindow),
+           let sv = scrollView(atWindowPoint: event.locationInWindow),
+           let scroller = sv.verticalScroller,
+           scroller.bounds.width > 0, scroller.bounds.height > 0 {
+            scroller.mouseDown(with: event)
+            return
+        }
         let p = flippedPoint(event)
         dragStart = p
         currentRect = CGRect(origin: p, size: .zero)
@@ -342,6 +357,70 @@ final class AssetSelectionNSView: NSView {
         currentRect = nil
         let ids = assetFrames.filter { $0.value.intersects(rect) }.map { $0.key }
         onSelectionEnded?(ids)
+    }
+
+    // 滚轮必须转交给下方 SwiftUI 的 NSScrollView：
+    // 本层是 overlay 的 NSView，不在 NSScrollView 的 responder 链上，
+    // 默认实现只能把事件递到 host 层，导致资产库面板滚不动
+    override func scrollWheel(with event: NSEvent) {
+        if let scrollView = targetScrollView(for: event) {
+            scrollView.scrollWheel(with: event)
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+
+    private func targetScrollView(for event: NSEvent) -> NSScrollView? {
+        scrollView(atWindowPoint: event.locationInWindow)
+    }
+
+    /// 光标点是否落在系统滚动条（NSScroller）上。
+    /// point 为「本视图父视图」坐标系（hitTest 入参约定），先转窗口坐标再比对。
+    private func isOverScroller(_ point: NSPoint) -> Bool {
+        isOverScroller(windowPoint: convert(point, to: nil))
+    }
+
+    private func isOverScroller(windowPoint: NSPoint) -> Bool {
+        guard let sv = scrollView(atWindowPoint: windowPoint) else { return false }
+        // 1) 精确判定：直接比对 verticalScroller 的实际 bounds
+        if let scroller = sv.verticalScroller {
+            let local = scroller.convert(windowPoint, from: nil)
+            if scroller.bounds.contains(local) { return true }
+        }
+        // 2) 兜底：overlay 样式的 scroller 在未悬停时可能被隐藏/零尺寸，
+        //    此时用「视口右缘一条滚动条宽度」判定，保证悬停唤醒和点击都能落到 scroller
+        let inScroll = sv.convert(windowPoint, from: nil)
+        if sv.bounds.contains(inScroll) {
+            let scrollerWidth = sv.verticalScroller?.bounds.width ?? 0
+            let inset = max(scrollerWidth, NSScroller.scrollerWidth(for: .regular, scrollerStyle: sv.scrollerStyle))
+            if inScroll.x >= sv.bounds.maxX - inset { return true }
+        }
+        return false
+    }
+
+    /// 在窗口视图树里找光标所在、面积最小的 NSScrollView（排除本层自身）
+    private func scrollView(atWindowPoint windowPoint: NSPoint) -> NSScrollView? {
+        guard let root = window?.contentView else { return nil }
+        var best: NSScrollView?
+        var bestArea = CGFloat.greatestFiniteMagnitude
+        func walk(_ view: NSView) {
+            if view !== self,
+               let sv = view as? NSScrollView,
+               !sv.isHidden,
+               sv.alphaValue > 0.01 {
+                let p = sv.convert(windowPoint, from: nil)
+                if sv.bounds.contains(p) {
+                    let area = sv.bounds.width * sv.bounds.height
+                    if area < bestArea {
+                        bestArea = area
+                        best = sv
+                    }
+                }
+            }
+            for sub in view.subviews { walk(sub) }
+        }
+        walk(root)
+        return best
     }
 }
 

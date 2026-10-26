@@ -1072,6 +1072,10 @@ public final class H3DiT {
             try? data.write(to: URL(fileURLWithPath: "/tmp/h3_h_assembled.bin"))
         }
 
+        // row→modRow 映射表只取决于 (S, plan.runs)，与层号、σ 无关：
+        // 全层循环外构建一次，供每层所有融合 kernel 复用（旧版每次调用都重建，50 层 × 多通道 × 多步）。
+        let rowModMap = H3FusedKernels.buildRowModMap(count: h.shape[0], runs: plan.runs)
+
         for (bi, b) in blocks.enumerated() {
             // Modulations [t·modalities, hidden]; rows addressed by run.modRow.
             let mods: [MLXArray]? = adalnTables?.blocks[bi]
@@ -1101,21 +1105,22 @@ public final class H3DiT {
                 fatalError("H3DiT.forward requires precomputed AdaLN tables; call precomputeAdaln first")
             }
 
-            // Attention + MLP branch (PAB block-level cache: attn out at + mlp out mo)
+            // Attention + MLP branch（PAB **只缓存 attention 分支输出 at**，对齐官方 zig：
+            // 官方只广播 at，MLP 每步重算。旧版额外缓存 mo 会把上一步 σ 的 MLP 非线性输出
+            // 硬套到当步 → 鬼影/运动不连贯，2026-10-26 已移除）
             let at: MLXArray
-            let mo: MLXArray
             let cacheable = attnBcast != nil
-            if cacheable, !attnRefresh, attnBcast?.blocks[bi] != nil, attnBcast?.mlpBlocks[bi] != nil {
-                // 复用步：at/mo 均取自缓存，跳过 norm1+qkv+rope+attn 与 norm2+fc1+fc2 整段
-                at = attnBcast!.blocks[bi]!
-                mo = attnBcast!.mlpBlocks[bi]!
+            if cacheable, !attnRefresh, let cachedAt = attnBcast?.blocks[bi] {
+                // 复用步：只跳过 norm1+qkv+rope+attn 段
+                at = cachedAt
             } else {
-                // 刷新步：正常计算 at 与 mo，并同时写入 blocks[bi] 与 mlpBlocks[bi]
+                // 刷新步：正常计算 at 并写回 blocks[bi]
                 // m1 通路走 P0 融合 kernel rmsNormLast + modScaleShift
                 // （NA_H3_FUSE=0 回退由封装内部内联实现，等价旧 slice+concat）
                 let m1 = H3FusedKernels.fusedNormModscale(h, weight: b.norm1,
                                                           shift: shiftMSA, scale: scaleMSA,
-                                                          runs: plan.runs, eps: cfg.normEps)
+                                                          runs: plan.runs, eps: cfg.normEps,
+                                                          rowMap: rowModMap)
                 if bi == 0 { h3DumpRowStats("m1_b0", m1, limitRows: 0) }
                 let smode = sparseModeForLayer(bi, nLayers: blocks.count, policy: sparsePolicy)
                 let fDim = UInt32((Int(layout.latentH) / Int(H3Const.patchH)) * (Int(layout.latentW) / Int(H3Const.patchH)))
@@ -1130,22 +1135,25 @@ public final class H3DiT {
                 at = b.attn.forward(m1, cfg: cfg, rope: rope, sparse: spec)
                 if cacheable {
                     attnBcast?.blocks[bi] = at
-                }
-                // MLP 段移入缓存分支：先按当步 gateMSA 混合 at（mo 依赖混合后 h，与旧实现一致），
-                // 再计算 norm2+fc1+fc2 并写入 mlpBlocks[bi]；复用步不再重复计算
-                let hAttn = H3FusedKernels.fusedModGate(h, gate: gateMSA, other: at, runs: plan.runs)
-                // m2 通路走同一融合 kernel：norm(hAttn) + modScale（与 m1 一致）
-                let m2 = H3FusedKernels.fusedNormModscale(hAttn, weight: b.norm2,
-                                                          shift: shiftMLP, scale: scaleMLP,
-                                                          runs: plan.runs, eps: cfg.normEps)
-                mo = b.mlp.forward(m2)
-                if cacheable {
-                    attnBcast?.mlpBlocks[bi] = mo
+                    // 记录本次缓存对应的 σ（各层同一步写入同值，只在 bi==0 记一次）
+                    if bi == 0 { attnBcast?.cachedSigma = sigmaV }
                 }
             }
+            // MLP 段每步重算（不缓存）：先按当步 gateMSA 混合 at，再 norm2+fc1+fc2
+            // hAttn 与下方 attention 残差项同参同值（同 h / gateMSA / at），此处只算一次
+            let hAttn = H3FusedKernels.fusedModGate(h, gate: gateMSA, other: at,
+                                                    runs: plan.runs, rowMap: rowModMap)
+            // m2 通路走同一融合 kernel：norm(hAttn) + modScale（与 m1 一致）
+            let m2 = H3FusedKernels.fusedNormModscale(hAttn, weight: b.norm2,
+                                                      shift: shiftMLP, scale: scaleMLP,
+                                                      runs: plan.runs, eps: cfg.normEps,
+                                                      rowMap: rowModMap)
+            let mo = b.mlp.forward(m2)
             // gate 加权：两处均用当步新 gate 照常执行（旧内容 + 新门控，PAB 语义不变）
-            h = H3FusedKernels.fusedModGate(h, gate: gateMSA, other: at, runs: plan.runs)
-            h = H3FusedKernels.fusedModGate(h, gate: gateMLP, other: mo, runs: plan.runs)
+            // attention 残差直接复用 hAttn，不再重复调用 fusedModGate(h, gateMSA, at)
+            h = hAttn
+            h = H3FusedKernels.fusedModGate(h, gate: gateMLP, other: mo,
+                                            runs: plan.runs, rowMap: rowModMap)
             if bi == 0 || bi == 13 || bi == blocks.count - 1 {
                 h3DumpRowStats("h_block\(bi)", h, limitRows: 0)
             }

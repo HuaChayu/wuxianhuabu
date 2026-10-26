@@ -1174,7 +1174,19 @@ public enum H3FL2VAPipeline {
                 + " > 预算 \(String(format: "%.1f", pabBudgetGB))GB（行数 \(pabRows)，层数 \(dit!.blocks.count)），"
                 + "已关闭跨步缓存（每步现算，数值等价）")
         }
-        let pab1: H3AttnBroadcast? = pabAllowed ? H3AttnBroadcast(count: dit!.blocks.count) : nil
+        // ★ 2026-10-26 复用容差：固定 k 调度只决定「什么时候可以复用」，
+        //   能否真的复用还要看缓存里的 σ 与当步 σ 差多少（|Δσ| > 容差 ⇒ 强制重算）。
+        //   低清/少步场景每步 Δσ 大 → 自动退化成每步现算；小步长高分场景照常赚复用。
+        //   NA_H3_PAB_MAX_DSIGMA 可覆盖（默认 0.04）。
+        let pabMaxStale = ProcessInfo.processInfo.environment["NA_H3_PAB_MAX_DSIGMA"].flatMap(Double.init)
+            ?? attnBroadcastDefaultMaxStale()
+        // 干跑整段调度：若一次复用机会都没有，就不建实例（省 count 层 at 常驻，数值等价每步现算）。
+        let pab1HasReuse = attnBroadcastPlan(sigmas: sigmas, k: pabK, maxStale: pabMaxStale).contains(false)
+        if pabAllowed && !pab1HasReuse {
+            log("[PAB] 主链逐步 |Δσ| 均超容差 \(pabMaxStale)，无可用复用步 → 不建缓存（每步现算，省常驻）")
+        }
+        let pab1: H3AttnBroadcast? = (pabAllowed && pab1HasReuse)
+            ? H3AttnBroadcast(count: dit!.blocks.count) : nil
         // ── 3.1 SelfLift 第三分支（H3 一采渐进式采样，实现在 SelfLiftH3-(h3专属).swift）─────
         // ⚠️⚠️ 本机主流链路 = 完整 SelfLift 渐进采样（H3 内部低分×0.5 前缀 + 零 NFE 过渡 +
         // 高分收尾，直出全清），不使用 LTX 二采桥接。任何内存/swap/二采分析必须以
@@ -1355,7 +1367,18 @@ public enum H3FL2VAPipeline {
             } else {
                 audioIn = audioX
             }
-            let attnRefresh = pab1 == nil ? false : attnBroadcastRefresh(i, steps: UInt32(stage1SegmentCount), k: pabK)
+            let attnRefresh: Bool
+            if pab1 == nil {
+                attnRefresh = false
+            } else {
+                let base = attnBroadcastRefresh(i, steps: UInt32(stage1SegmentCount), k: pabK)
+                let stale = pab1!.cachedSigma
+                let mustRefresh = attnBroadcastMustRefresh(cachedSigma: stale, sigma: sigma, maxStale: pabMaxStale)
+                attnRefresh = base || mustRefresh
+                if !base, mustRefresh {
+                    log("[PAB] 过期重算 step \(i)：|Δσ|=\(String(format: "%.4f", abs(sigma - stale))) > \(pabMaxStale)")
+                }
+            }
             let pabMark = pab1 == nil ? "" : (attnRefresh ? " bcastRefresh[blk]" : " bcastReuse[blk]")
             let out = dit!.forward(layout: layout, plan: plan, textStates: refined,
                                    videoRows: videoIn, audioRows: audioIn, rope: rope,
@@ -1518,7 +1541,10 @@ public enum H3FL2VAPipeline {
 
             // ⑤ refine 低步 Euler（循环体与 stage1 一致，σ 走 refineSigmas；同样全程接 PAB，
             // refine 通常仅 3~4 步，调度自然几乎全 refresh——无收益也无画质风险）
-            let pab2: H3AttnBroadcast? = pabK > 1 ? H3AttnBroadcast(count: dit!.blocks.count) : nil
+            // ★ 2026-10-26 同主链口径：refine 段只在「调度允许复用且 σ 过期量未超容差」时复用，
+            //   否则每步现算（refine 步少、Δσ 未必小，靠 k 单判会盲目复用）。
+            let pab2Usable = pabK > 1 && attnBroadcastPlan(sigmas: sigmas2, k: pabK, maxStale: pabMaxStale).contains(false)
+            let pab2: H3AttnBroadcast? = pab2Usable ? H3AttnBroadcast(count: dit!.blocks.count) : nil
             for i in 0 ..< (sigmas2.count - 1) {
                 let stepT = Date()
                 let sigma = sigmas2[i]

@@ -489,6 +489,8 @@ extension CanvasView {
         if let idx = store.nodes.firstIndex(where: { $0.id == node.id }) {
             store.nodes[idx].title = outlineRenameText
             store.save()
+            // 改名成功：通知输入框层把引用该节点的引用块名字同步成新标题
+            store.publishNodeTitleChange(nodeID: node.id, title: outlineRenameText)
             debugLog("大纲视图：重命名节点为「\(outlineRenameText)」")
         }
         outlineRenameNodeID = nil

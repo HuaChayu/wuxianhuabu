@@ -780,23 +780,25 @@ public func runH3Stage1WithSelfLift(
     MLX.eval(videoX, audioX)
 
     let pabK = attentionBroadcastK
-    // ★ 2026-10-19 粗步长守卫：PAB 跨步复用的前提是「相邻步 σ 几乎不变」。
-    //   旧调度（σ_k=0.95、5 步）每步 Δσ≈0.0125，复用安全；低清跑满到 0 时每步 Δσ≈1/l
-    //   （N=6 → 0.2，是旧值的 16 倍），把 Δσ=0.2 前的 attention/MLP 输出直接套到当前步，
-    //   等于把上一个噪声深度的内容叠进来 → 鬼影 / 细节污染 / 步间闪烁。
-    //   这里按实际 σ 步长自动禁用低清段复用（k 视作 1 = 每步重算），只多花算力、不改数值语义。
-    //   NA_H3_SELFLIFT_PAB_MAX_DSIGMA 可覆盖阈值（默认 0.04，按 k 步累计 Δσ 判定，σ_k=0.8 档 Δσ=0.10×2=0.20 超线（阈值 0.02，维持每步重算）→低清不复用；
-    //   设成很大的值即恢复旧行为）。
-    let sigmaGapMax = zip(split.lowSigmas.dropFirst(), split.lowSigmas).map { $0 - $1 }.max() ?? 0
-    let pabGapLimit = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_PAB_MAX_DSIGMA"].flatMap(Double.init) ?? 0.02
-    // ★ 按「一次复用的实际跨度」判定：k 步才刷新一次 ⇒ 过期跨度 = k × Δσ，不能只看单步 Δσ。
-    let pabStaleGap = sigmaGapMax * Double(max(pabK, 1))
-    let lowPabK: UInt32 = (pabK > 1 && pabStaleGap >= pabGapLimit) ? 1 : pabK
-    if lowPabK != pabK {
-        log("SelfLift 低分 PAB 守卫：低分复用跨度 k·Δσ=\(String(format: "%.4f", pabStaleGap))（Δσ=\(String(format: "%.4f", sigmaGapMax))×k\(pabK)）> \(pabGapLimit) → 低分清空跨步复用（k \(pabK)→1，每步重算）")
+    // ★ 2026-10-26 复用守卫重写（旧守卫恒不触发：lowSigmas 为降序，`dropFirst() - self`
+    //   得到的是负值，max() 取到最接近 0 的负最小步长，永远 < 阈值）。
+    //   新判定不看「全局平均跨度」，而是**逐步按缓存里实际的 σ 过期量**：
+    //   只有 |σ_now − 缓存写入时 σ| ≤ 容差才允许复用，超出立即强制重算。
+    //   低清 shift=12 曲线在低 σ 端步长可小到 0.02（可复用）、高 σ 端可大到 0.7（必重算），
+    //   逐级判定后低清只保留极少数安全复用步；高分细步长段照常赚复用 —— 规则统一，不再依赖魔法阈值。
+    //   NA_H3_SELFLIFT_PAB_MAX_DSIGMA 可覆盖容差（默认与主链同一个 attnBroadcastDefaultMaxStale()，当前 0.04）。
+    let pabMaxStale = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_PAB_MAX_DSIGMA"].flatMap(Double.init)
+        ?? attnBroadcastDefaultMaxStale()
+    // 干跑一遍真实调度：整段一次复用机会都没有时就不建缓存实例
+    //（省 count 层 at 常驻，forward 走 cacheable=false，与「每步 refresh」逐位等价）。
+    let lowPlan = attnBroadcastPlan(sigmas: split.lowSigmas, k: pabK, maxStale: pabMaxStale)
+    let lowPabUsable = pabK > 1 && lowPlan.contains(false)
+    if pabK > 1 && !lowPabUsable {
+        let dMax = zip(split.lowSigmas.dropFirst(), split.lowSigmas).map { abs($0 - $1) }.max() ?? 0
+        log("SelfLift 低分 PAB 判定：逐步过期量下无可复用步（Δσ_max=\(String(format: "%.4f", dMax)) > 容差 \(pabMaxStale)）→ 不建跨步缓存（每步重算）")
     }
     let makePab: () -> H3AttnBroadcast? = { pabK > 1 ? H3AttnBroadcast(count: dit.blocks.count) : nil }
-    var pab = makePab()
+    var pab = lowPabUsable ? makePab() : nil
 
     // ── 3. 低分循环（默认逐段 Euler 到 σ_k；clean 端点模式末步改取 Eq.3 预测、丢弃 Euler）──
     slMem("低分段 · 起步（DiT 全权重 + 低分 PAB \(pab == nil ? "关闭" : "开启")）")
@@ -812,7 +814,18 @@ public func runH3Stage1WithSelfLift(
                                            aug: CondNoiseAug(), globalTs: dit.adalnTables!.ts,
                                            audioSigma: audioSigmasLow[i])
         let videoIn = concatenated([condRowsLow, videoX], axis: 0)
-        let refresh = pab == nil ? false : attnBroadcastRefresh(i, steps: UInt32(split.lowNFE), k: lowPabK)
+        let refresh: Bool
+        if pab == nil {
+            refresh = false
+        } else {
+            let base = attnBroadcastRefresh(i, steps: UInt32(split.lowNFE), k: pabK)
+            let stale = pab!.cachedSigma
+            let mustRefresh = attnBroadcastMustRefresh(cachedSigma: stale, sigma: sigma, maxStale: pabMaxStale)
+            refresh = base || mustRefresh
+            if !base, mustRefresh {
+                log("低分 PAB 过期重算 i=\(i)：|Δσ|=\(String(format: "%.4f", abs(sigma - stale))) > \(pabMaxStale)（缓存来自 σ=\(String(format: "%.4f", stale))）")
+            }
+        }
         let outPos = dit.forward(layout: layoutLow, plan: plan, textStates: textStates,
                                  videoRows: videoIn, audioRows: audioX, rope: ropeLow,
                                  sigmaV: sigma, shiftV: shiftV, shiftA: shiftA,
@@ -1154,9 +1167,9 @@ public func runH3Stage1WithSelfLift(
     //   可用环境变量 NA_H3_SELFLIFT_HIGH_PAB=1/0 强制开关做 A/B 复测。
     //   注意：旧实例里的 at 缓存是最近一步 forward 的产物，整批放开必须落在 GPU 已同步的点上；
     //   上面的 MLX.eval(videoX)（物化点 E）+ 出口屏障已把过渡块全图结算完，此处再显式 reset 后重建。
-    let highHasReuse = (0..<split.highNFE).contains {
-        !attnBroadcastRefresh($0, steps: UInt32(split.highNFE), k: pabK)
-    }
+    //   ★ 2026-10-26：判定改用与运行时同一套「逐步过期量」干跑（attnBroadcastPlan），
+    //   含 σ 容差，故高分若步长偏大同样会被判成无可复用步、直接不建实例。
+    let highHasReuse = attnBroadcastPlan(sigmas: split.highSigmas, k: pabK, maxStale: pabMaxStale).contains(false)
     var highPabEnabled = highHasReuse
     if let f = ProcessInfo.processInfo.environment["NA_H3_SELFLIFT_HIGH_PAB"] { highPabEnabled = (f == "1") }
     pab?.reset()
@@ -1177,7 +1190,18 @@ public func runH3Stage1WithSelfLift(
                                            aug: CondNoiseAug(), globalTs: dit.adalnTables!.ts,
                                            audioSigma: audioSigmasHigh[i])
         let videoIn = concatenated([condRowsHigh, videoX], axis: 0)
-        let refresh = pab == nil ? false : attnBroadcastRefresh(i, steps: UInt32(split.highNFE), k: pabK)
+        let refresh: Bool
+        if pab == nil {
+            refresh = false
+        } else {
+            let base = attnBroadcastRefresh(i, steps: UInt32(split.highNFE), k: pabK)
+            let stale = pab!.cachedSigma
+            let mustRefresh = attnBroadcastMustRefresh(cachedSigma: stale, sigma: sigma, maxStale: pabMaxStale)
+            refresh = base || mustRefresh
+            if !base, mustRefresh {
+                log("高分 PAB 过期重算 i=\(i)：|Δσ|=\(String(format: "%.4f", abs(sigma - stale))) > \(pabMaxStale)")
+            }
+        }
         slMem("高分 \(i + 1)/\(split.highNFE) forward 前（PAB \(highPabEnabled ? "开" : "关")，refresh=\(refresh)）")
         let outPos = dit.forward(layout: layoutHigh, plan: plan, textStates: textStates,
                                  videoRows: videoIn, audioRows: audioX, rope: ropeHigh,

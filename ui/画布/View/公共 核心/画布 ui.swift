@@ -103,6 +103,12 @@ struct CanvasView: View {
     
     /// 节点下方输入框：草稿（失焦/发送/展开关闭/离开画布时写回，引用模型下写回资产或节点自身）
     @State var promptDraft = ""
+    /// 输入框内引用块（点缩略图展开里的 @ 插入）：随草稿按节点缓存，切换选中节点时读写缓存恢复；
+    /// 块内保留被引用节点的名字与 id，后续生成时按 id 取该节点内容
+    @State var promptMentions: [PromptMention] = []
+    /// 每个节点的输入框草稿缓存（带 U+FFFC 占位符原文 + 引用块）：
+    /// 切换/重新点击节点时原样恢复上次插入的块；节点提示词被别处改过（生成写回/资产同步）则丢弃缓存
+    @State var promptDraftCache: [UUID: NodePromptDraftCache] = [:]
     /// 节点输入校验错误（视频节点发送时检查直接连线输入；key=节点 id，非空表示要求不对）
     @State var inputValidationErrors: [UUID: String] = [:]
     /// 节点输入框展开聚焦模式：当前展开的节点 id（nil = 未展开）
@@ -427,6 +433,11 @@ struct CanvasView: View {
         // 与播放逻辑同方案：资产管理 Tab 与画布互斥，离开总资产期间 onChange 收不到事件，
         // 依赖视图生命周期（onDisappear 停止播放 / onAppear 同步提示词）完成跨区域通信
         .onAppear {
+            // 兜底：进入画布时若已有选中节点（App 重启后恢复的选中态 onChange 不会触发），
+            // 从节点落盘的富文本快照把引用块装回输入框，避免块在重启后消失
+            if promptDraft.isEmpty, let node = selectedPromptNode() {
+                restorePromptDraft(for: node)
+            }
             if !assetStore.promptEditedAssetIDs.isEmpty {
                 syncNodesFromAssetPrompts(assetStore.promptEditedAssetIDs)
                 assetStore.promptEditedAssetIDs.removeAll()
@@ -464,16 +475,26 @@ struct CanvasView: View {
         // 选中节点变化：写回旧节点草稿，载入新节点草稿（多选/取消选中清空草稿）
         .onChange(of: store.selectedNodeIDs) { oldIDs, newIDs in
             if oldIDs.count == 1, let oldID = oldIDs.first,
-               let oldNode = store.nodes.first(where: { $0.id == oldID }),
-               promptDraft != effectivePrompt(for: oldNode) {
-                commitNodePrompt(promptDraft, nodeID: oldID)
+               let oldNode = store.nodes.first(where: { $0.id == oldID }) {
+                if promptDraftDiffers(from: oldNode) {
+                    commitNodePrompt(promptDraft, nodeID: oldID)
+                }
+                // 切换前把草稿留在内存缓存（带占位符原文 + 引用块），回到该节点时原样恢复
+                cachePromptDraft(for: oldID)
             }
             if newIDs.count == 1, let newID = newIDs.first,
                let newNode = store.nodes.first(where: { $0.id == newID }) {
-                promptDraft = effectivePrompt(for: newNode)
+                restorePromptDraft(for: newNode)
             } else {
+                // 多选/取消选中：输入框不显示，草稿与引用块一并清空（缓存已在上面写好）
                 promptDraft = ""
+                promptMentions = []
             }
+        }
+        // 节点改名成功：只把引用它的块内名字改成新标题（按 id 精确匹配，不遍历画布节点）
+        .onChange(of: store.nodeTitleChange) { _, change in
+            guard let change else { return }
+            syncPromptMentionTitle(nodeID: change.nodeID, title: change.title)
         }
         // 资产面板提示词改动：同步画布中引用该资产的节点输入框
         .onChange(of: assetStore.promptEditedAssetIDs) { _, ids in
@@ -749,7 +770,20 @@ struct CanvasView: View {
     func commitNodePrompt(_ prompt: String, nodeID: UUID) {
         guard let idx = store.nodes.firstIndex(where: { $0.id == nodeID }) else { return }
         // 节点提示词是"引用源头的本地副本"：编辑只写节点自身，不改总资产源头
-        store.nodes[idx].prompt = prompt
+        // 引用块占位符（U+FFFC）不写进 prompt：该字段只存纯文本（生成端按纯文本喂模型）
+        store.nodes[idx].prompt = prompt.strippingMentionPlaceholders
+        // 引用块单独落盘：只有在「传入文本就是当前输入框草稿」且块数与占位符对齐时才认领，
+        // 避免历史内容恢复等传外部文本的场景把别的节点的块误存到本节点
+        let placeholderCount = PromptMentionToken.count(in: prompt)
+        if placeholderCount > 0, prompt == promptDraft, promptMentions.count == placeholderCount {
+            store.nodes[idx].promptRich = prompt
+            store.nodes[idx].promptMentionRefs = promptMentions.map {
+                PromptMentionRef(blockID: $0.id, nodeID: $0.nodeID, title: $0.title, kind: $0.kind)
+            }
+        } else {
+            store.nodes[idx].promptRich = nil
+            store.nodes[idx].promptMentionRefs = nil
+        }
         store.save()
     }
 
@@ -763,17 +797,104 @@ struct CanvasView: View {
         promptDraft = asset.prompt
     }
 
+    /// 把当前输入框草稿存入按节点的内存缓存（含 U+FFFC 占位符原文 + 引用块顺序）。
+    /// 只存原始文本，不解析、不扫描节点，切换选中时 O(块数)。
+    func cachePromptDraft(for nodeID: UUID) {
+        if promptDraft.isEmpty && promptMentions.isEmpty {
+            promptDraftCache.removeValue(forKey: nodeID)
+            return
+        }
+        promptDraftCache[nodeID] = NodePromptDraftCache(text: promptDraft, mentions: promptMentions)
+    }
+
+    /// 恢复节点输入框草稿：
+    /// 缓存里的原文去掉占位符后与节点当前生效提示词一致 → 直接用缓存（块与文字混排原样回来）；
+    /// 不一致说明节点提示词在别处被改过（生成写回 / 资产同步），以节点提示词为准并丢弃旧缓存。
+    func restorePromptDraft(for node: CanvasNode) {
+        if let cached = promptDraftCache[node.id],
+           isPromptAligned(cached.text.strippingMentionPlaceholders, with: node) {
+            promptDraft = cached.text
+            promptMentions = cached.mentions
+            return
+        }
+        promptDraftCache.removeValue(forKey: node.id)
+        // 无内存缓存（典型场景：App 重启后第一次点开该节点）→ 从节点落盘的富文本快照恢复块，
+        // 校验：去占位符后与节点自身 prompt 一致、块数 == 占位符数，否则以纯文本为准（不留孤立块）。
+        // 注意这里比对 node.prompt 而不是 effectivePrompt：纯块无文字的提示词 node.prompt 为空，
+        // effectivePrompt 会回落到资产源头文本而误判不一致，导致「只插块不打字」的编辑重启后丢块。
+        if let rich = node.promptRich, let refs = node.promptMentionRefs, !refs.isEmpty,
+           isPromptAligned(rich.strippingMentionPlaceholders, with: node),
+           refs.count == PromptMentionToken.count(in: rich) {
+            promptDraft = rich
+            promptMentions = refs.map { mention(from: $0) }
+        } else {
+            promptDraft = effectivePrompt(for: node)
+            promptMentions = []
+        }
+    }
+    
+    /// 纯文本是否仍与该节点对齐：优先比节点自身副本，其次比 effectivePrompt（兼容"提示词只存在资产库"的旧数据）。
+    /// 纯块无文字的提示词 stripped 为空串，与 node.prompt 空串相等，不会被误判成"节点已被改过"而丢块。
+    func isPromptAligned(_ stripped: String, with node: CanvasNode) -> Bool {
+        if stripped == node.prompt { return true }
+        return stripped == effectivePrompt(for: node)
+    }
+    
+    /// 持久化快照 → 输入框引用块：名字/类型/缩略图以当前节点为准（改名后自动同步），节点已删除则退回快照值
+    func mention(from ref: PromptMentionRef) -> PromptMention {
+        let target = store.nodes.first(where: { $0.id == ref.nodeID })
+        return PromptMention(
+            id: ref.blockID,
+            nodeID: ref.nodeID,
+            title: target?.title ?? ref.title,
+            kind: target?.type ?? ref.kind,
+            image: target?.imageFileName.flatMap { cachedAssetImage(for: $0) }
+        )
+    }
+
+    /// 被引用节点改名：只改引用它的块内名字（当前输入框 + 各节点缓存草稿），按被引用节点 id 匹配。
+    /// 不做全量节点遍历、不重算缩略图、不重建输入框文本（控件侧就地重绘贴图）。
+    func syncPromptMentionTitle(nodeID: UUID, title: String) {
+        /// 命中（且名字确实变了）才产出新数组，避免无意义的数组重写触发重绘
+        func renamed(_ mentions: [PromptMention]) -> [PromptMention]? {
+            guard mentions.contains(where: { $0.nodeID == nodeID && $0.title != title }) else { return nil }
+            return mentions.map { mention in
+                guard mention.nodeID == nodeID, mention.title != title else { return mention }
+                return PromptMention(id: mention.id, nodeID: mention.nodeID, title: title,
+                                     kind: mention.kind, image: mention.image)
+            }
+        }
+        if let updated = renamed(promptMentions) {
+            promptMentions = updated
+            debugLog("节点输入框：引用块名字同步为「\(title)」")
+        }
+        guard !promptDraftCache.isEmpty else { return }
+        for key in Array(promptDraftCache.keys) {
+            guard let cached = promptDraftCache[key], let updated = renamed(cached.mentions) else { continue }
+            promptDraftCache[key]?.mentions = updated
+        }
+    }
+
     /// 草稿写回节点（失焦/发送/展开关闭时调用；输入过程中不入撤销栈、不落盘，避免打字每帧存盘）
     func commitPromptDraft() {
-        guard let node = selectedPromptNode(), promptDraft != effectivePrompt(for: node) else { return }
+        guard let node = selectedPromptNode() else { return }
+        guard promptDraftDiffers(from: node) else { return }
         commitNodePrompt(promptDraft, nodeID: node.id)
+    }
+    
+    /// 输入框草稿与节点已存内容是否不一致：
+    /// 纯文本相同但引用块增删/挪位（占位符顺序变了）也算改动，否则只改块的编辑永远不会落盘
+    func promptDraftDiffers(from node: CanvasNode) -> Bool {
+        if promptDraft.strippingMentionPlaceholders != effectivePrompt(for: node) { return true }
+        let storedBlockIDs = (node.promptMentionRefs ?? []).map(\.blockID)
+        return storedBlockIDs != promptMentions.map(\.id) || (node.promptRich ?? "") != promptDraft
     }
     
     /// 发送输入框内容：写回 + 视频节点触发生成管线
     func sendPrompt() {
         guard let node = selectedPromptNode() else { return }
         commitPromptDraft()
-        let promptText = promptDraft
+        let promptText = promptDraft.strippingMentionPlaceholders
         debugLog("节点输入框：发送「\(promptText)」，节点 \(node.title)")
         // 发送后保留输入框文本，供用户继续编辑（再次发送视为全新任务，不复用旧提示词/旧文本条件）
         // 落盘由 commitPromptDraft→commitNodePrompt 完成（草稿与生效提示词不同时才写）；此处无需重复 save
@@ -999,6 +1120,8 @@ struct CanvasView: View {
         store.nodes[idx].imageFileName = thumbName
         store.nodes[idx].mediaFileName = mp4Name
         store.save()
+        // 通知输入框层：引用该节点的引用块跟着改名
+        store.publishNodeTitleChange(nodeID: nodeID, title: baseName)
         debugLog("视频生成：完成，节点 \(nodeID) 已替换为 \(mp4Name)")
     }
     
@@ -1081,6 +1204,7 @@ struct CanvasView: View {
         store.nodes[idx].history = history
         // 3) 节点恢复为该条目的内容（标题、提示词、资产引用一并替换）
         store.nodes[idx].title = entry.title
+        store.publishNodeTitleChange(nodeID: nodeID, title: entry.title)
         store.nodes[idx].imageFileName = entry.imageFileName
         store.nodes[idx].mediaFileName = entry.mediaFileName
         // 提示词恢复：历史条目只存源引用，生成必带提示词且已写入源（资产库），恢复直接从源读
@@ -1099,6 +1223,8 @@ struct CanvasView: View {
         // 恢复的是当前选中节点时，同步刷新输入框草稿（否则内容/名字变了但提示词输入框文字不更新）
         if let selected = selectedPromptNode(), selected.id == nodeID {
             promptDraft = effectivePrompt(for: selected)
+            promptMentions = []
+            promptDraftCache.removeValue(forKey: nodeID)
         }
         debugLog("节点历史切换：\(nodeID) → \(entry.title)")
     }
@@ -1215,6 +1341,8 @@ struct CanvasView: View {
         store.nodes[idx].imageFileName = pngName
         store.nodes[idx].mediaFileName = nil
         store.save()
+        // 通知输入框层：引用该节点的引用块跟着改名
+        store.publishNodeTitleChange(nodeID: nodeID, title: baseName)
         debugLog("图像生成：完成，节点 \(nodeID) 已替换为 \(pngName)")
     }
     
@@ -1376,7 +1504,12 @@ struct CanvasView: View {
                     onImageQualityChange: makeNodeFieldUpdater(node.id, keyPath: \.imageQuality) { "节点输入框：写入图像节点档位 \($0.displayName)" },
                     isGenerating: GenerationQueue.shared.isGenerating(nodeID: node.id),
                     isChainSourceGenerating: store.h3ChainSourceID(for: node.id).map { GenerationQueue.shared.isGenerating(nodeID: $0) } ?? false,
-                    validationError: inputValidationErrors[node.id]
+                    validationError: inputValidationErrors[node.id],
+                    // 前置条件缩略图：打开面板时按入边实时计算（无连线返回空 → 不显示缩略图区）
+                    inputThumbnails: store.promptInputThumbnails(for: node.id, version: store.connectionVersion),
+                    mentions: $promptMentions,
+                    // 手打 @ 的提及候选：上游连线节点优先 + 本项目全部节点分类
+                    mentionCatalog: store.promptMentionCatalog(for: node.id, version: store.connectionVersion)
                 )
                 // 背景 GeometryReader 只读尺寸不改布局；position 中心 = 底边 + 10 + 卡片高/2，顶部正好贴底边 + 10
                 .background(
@@ -1423,7 +1556,12 @@ struct CanvasView: View {
                     onImageQualityChange: makeNodeFieldUpdater(node.id, keyPath: \.imageQuality) { "展开输入框：写入图像节点档位 \($0.displayName)" },
                     isGenerating: GenerationQueue.shared.isGenerating(nodeID: node.id),
                     isChainSourceGenerating: store.h3ChainSourceID(for: node.id).map { GenerationQueue.shared.isGenerating(nodeID: $0) } ?? false,
-                    validationError: inputValidationErrors[node.id]
+                    validationError: inputValidationErrors[node.id],
+                    // 前置条件缩略图：展开面板同样按入边实时计算（与节点下方输入框一致）
+                    inputThumbnails: store.promptInputThumbnails(for: node.id, version: store.connectionVersion),
+                    mentions: $promptMentions,
+                    // 手打 @ 的提及候选：上游连线节点优先 + 本项目全部节点分类
+                    mentionCatalog: store.promptMentionCatalog(for: node.id, version: store.connectionVersion)
                 )
             }
         }
@@ -1611,6 +1749,14 @@ struct CanvasView: View {
         if store.selectedNodeIDs == [nodeID],
            let node = store.nodes.first(where: { $0.id == nodeID }) {
             promptDraft = effectivePrompt(for: node)
+            promptMentions = []
+            promptDraftCache.removeValue(forKey: nodeID)
+            // 换成资产内容后提示词已重写，旧的引用块快照作废（否则重启后会把已清空的块又装回来）
+            if let idx = store.nodes.firstIndex(where: { $0.id == nodeID }) {
+                store.nodes[idx].promptRich = nil
+                store.nodes[idx].promptMentionRefs = nil
+                store.save()
+            }
         }
         pickAssetNodeID = nil
     }

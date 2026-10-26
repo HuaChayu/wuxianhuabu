@@ -47,7 +47,7 @@ enum H3PostProcessMode: String, CaseIterable, Identifiable {
         case .none:
             return "啥都不走：H3 一采直出目标尺寸"
         case .selflift:
-            return "恒定最后一步为半尺寸，前面都是半尺寸。（前面跑结构，最后一步补细节。模糊是分辨率不足或运动模糊，脸结构崩溃扭曲是步数不足，5步不行改6步。）"
+            return "恒定最后一步为全尺寸高清处理，前面都是半尺寸。（前面跑结构，最后一步补细节。模糊是分辨率不足或运动模糊，脸结构崩溃扭曲是步数不足，5步不行改6步。）"
         case .apple:
             return "H3 直出目标尺寸后走 Apple 超分（预留位，暂未重点调优）"
         }

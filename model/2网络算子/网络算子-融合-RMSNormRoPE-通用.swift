@@ -256,17 +256,20 @@ public enum H3FusedKernels {
     ///   - shift/scale: [numModRows, hidden]（mods[0]/mods[1] 或 mods[3]/mods[4]）
     ///   - runs: plan.runs（分段取行）
     ///   - eps: norm epsilon
+    ///   - rowMap: 可选，预先构建的 row→modRow 映射表 [S] UInt32；
+    ///            同一 (S, runs) 下跨层跨调用复用时传入，省去每次重建的 Swift 数组分配 + MLXArray 构造
     /// - Returns: [S, hidden] bf16，与 rmsNormLast + modScaleShift 数值一致
     public static func fusedNormModscale(_ x: MLXArray, weight: MLXArray,
                                          shift: MLXArray, scale: MLXArray,
-                                         runs: [ModRun], eps: Float) -> MLXArray {
+                                         runs: [ModRun], eps: Float,
+                                         rowMap: MLXArray? = nil) -> MLXArray {
         guard fuseEnabled else {
             return fallbackNormModscale(x, weight: weight, shift: shift, scale: scale,
                                         runs: runs, eps: eps)
         }
         let S = x.shape[0]
         let hidden = x.shape[1]
-        let map = buildRowModMap(count: S, runs: runs)
+        let map = rowMap ?? buildRowModMap(count: S, runs: runs)
         let params = MLXArray([Float(hidden), eps])
         let out = kernelNormModscale(
             [x, weight, shift, scale, map, params],
@@ -316,15 +319,17 @@ public enum H3FusedKernels {
     ///   - x/other: [S, hidden]（如 h 与 at / mo）
     ///   - gate: [numModRows, hidden]（mods[2] / mods[5]）
     ///   - runs: plan.runs（分段取行）
+    ///   - rowMap: 可选，预先构建的 row→modRow 映射表 [S] UInt32（同 fusedNormModscale）
     /// - Returns: [S, hidden] bf16，与旧 modGate 数值一致
     public static func fusedModGate(_ x: MLXArray, gate: MLXArray,
-                                    other: MLXArray, runs: [ModRun]) -> MLXArray {
+                                    other: MLXArray, runs: [ModRun],
+                                    rowMap: MLXArray? = nil) -> MLXArray {
         guard fuseEnabled else {
             return fallbackModGate(x, gate: gate, other: other, runs: runs)
         }
         let S = x.shape[0]
         let hidden = x.shape[1]
-        let map = buildRowModMap(count: S, runs: runs)
+        let map = rowMap ?? buildRowModMap(count: S, runs: runs)
         let params = MLXArray([Float(hidden)])
         let out = kernelModGate(
             [x, other, gate, map, params],

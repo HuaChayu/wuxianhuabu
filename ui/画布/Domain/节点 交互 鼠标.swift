@@ -153,7 +153,11 @@ extension CanvasView {
            !store.connections.contains(where: { $0.id == sel }) {
             store.selectedConnectionID = nil
         }
-        for id in nodeIDs { store.nodeSizes.removeValue(forKey: id) }
+        for id in nodeIDs {
+            store.nodeSizes.removeValue(forKey: id)
+            // 节点被删：连带清掉它的输入框草稿缓存（含引用块），避免缓存无限增长
+            promptDraftCache.removeValue(forKey: id)
+        }
         for gid in affectedGroups { dissolveGroupIfUnderflow(gid) }
         store.save()
     }

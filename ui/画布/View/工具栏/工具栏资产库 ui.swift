@@ -61,7 +61,7 @@ extension CanvasView {
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 8)
             
             // 分类过滤（资产自带分类，按分类筛）
             Picker("", selection: $assetCategory) {
@@ -71,8 +71,12 @@ extension CanvasView {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 16)
+            // 关键：5 段 segmented 的固有最小宽度大于面板内宽（260-16*2=228），
+            // 会把外层 VStack 撑宽 → GeometryReader/ScrollView 跟着变宽 →
+            // 滚动条被绘制到面板右边缘之外。这里锁死宽度并裁掉多余绘制
+            .frame(width: 244)
+            .clipped()
+            .padding(.horizontal, 8)
             .onChange(of: assetCategory) { _, newValue in
                 debugLog("资产库：分类切换为 \(newValue.rawValue)")
             }
@@ -103,8 +107,8 @@ extension CanvasView {
         return AnyView(
             GeometryReader { geo in
                 ScrollView {
-                    // 面板可用宽度（左右各留 16 首尾留白）
-                    let availableWidth = geo.size.width - 32
+                    // 面板可用宽度（左右各留 8 首尾留白）：260-16=244，正好容纳 3x76 + 2x8
+                    let availableWidth = max(0, geo.size.width - 16)
                     // 每项最小宽度 76，据此算列数（自适应，加分类/缩放不破版）
                     let columns = max(1, Int(availableWidth / 76))
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: columns), spacing: 8) {
@@ -152,7 +156,7 @@ extension CanvasView {
                         )
                     }
                 }
-                .padding(.horizontal, 16)
+                .padding(.horizontal, 8)
                 .onPreferenceChange(AssetFrameKey.self) { frames in
                     assetFrames = frames
                 }

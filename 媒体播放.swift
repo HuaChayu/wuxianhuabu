@@ -245,9 +245,27 @@ extension MediaPlayerManager: AVAudioPlayerDelegate {
 final class PlayerNSView: NSView {
     let playerLayer = AVPlayerLayer()
 
+    /// 画面填充方式（默认等比完整显示，节点/画布场景沿用原行为）
+    var videoGravity: AVLayerVideoGravity = .resizeAspect {
+        didSet {
+            // 不使用 guard 提前返回：AVPlayerLayer 在挂上 currentItem 之前设置的 gravity
+            // 可能被 AVPictureInPicture/内部重排重置，无条件重设可确保 fill 模式稳定生效。
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            playerLayer.videoGravity = videoGravity
+            playerLayer.frame = bounds
+            CATransaction.commit()
+        }
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+        // 关键：宿主层必须裁剪，否则 AVPlayerLayer 在 resizeAspectFill 下放大溢出的部分
+        // 会盖到 SwiftUI 的圆角之外（圆角被填平，容器看上去像椭圆/胶囊），
+        // 同时画面边缘会与描边错位、露出缝隙。
+        layer?.masksToBounds = true
+        playerLayer.masksToBounds = true
         playerLayer.videoGravity = .resizeAspect
         layer?.addSublayer(playerLayer)
     }
@@ -271,15 +289,20 @@ final class PlayerNSView: NSView {
 /// SwiftUI 包裹：把 AVPlayer 画面渲染到指定区域
 struct VideoPlayerView: NSViewRepresentable {
     let player: AVPlayer
+    /// 画面填充方式：默认 .resizeAspect（等比完整显示，节点用）；
+    /// 属性面板等固定高度容器传 .resizeAspectFill，让画面铺满容器、不留黑边。
+    var videoGravity: AVLayerVideoGravity = .resizeAspect
 
     func makeNSView(context: Context) -> PlayerNSView {
         let view = PlayerNSView()
         view.playerLayer.player = player
+        view.videoGravity = videoGravity
         return view
     }
 
     func updateNSView(_ nsView: PlayerNSView, context: Context) {
         nsView.playerLayer.player = player
+        nsView.videoGravity = videoGravity
     }
 }
 

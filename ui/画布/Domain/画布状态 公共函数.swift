@@ -251,7 +251,25 @@ final class CanvasStore: ObservableObject {
     
     // 节点之间的连线（didSet 清 inputValidity 缓存：连线增删，禁用判定需重算）
     @Published var connections: [NodeConnection] = [] {
-        didSet { inputValidityCache = nil }
+        didSet {
+            inputValidityCache = nil
+            connectionVersion &+= 1   // 连线图变更：提示词面板据此重算前置条件缩略图
+        }
+    }
+    
+    /// 连线图结构版本号（连线增删即自增）：提示词面板在 body 中读取本值，
+    /// 保证「连线成功后立刻重新判断一次前置条件」，新连入的节点缩略图追加到队尾。
+    @Published private(set) var connectionVersion: Int = 0
+
+    /// 节点改名事件（只保留最后一条 + 递增序号）：输入框引用块据此把块内名字同步成新标题。
+    /// 改名是低频操作，用单条事件推送而非在视图层对 nodes 做全量比对，避免逐帧遍历。
+    @Published private(set) var nodeTitleChange: NodeTitleChange?
+    private var nodeTitleChangeSeq: Int = 0
+
+    /// 节点标题变更统一入口：改完 title 后调用，通知输入框层更新引用块名字（按 id 精确匹配）。
+    func publishNodeTitleChange(nodeID: UUID, title: String) {
+        nodeTitleChangeSeq &+= 1
+        nodeTitleChange = NodeTitleChange(nodeID: nodeID, title: title, seq: nodeTitleChangeSeq)
     }
     
     // 画布级临时提示（底部黑胶囊，自动消失；连线限制等即时反馈用）
@@ -554,6 +572,8 @@ func attachAssetToNode(_ asset: AssetItem, nodeID: UUID, store: CanvasStore) -> 
     // 引用模型：节点不复制资产提示词，输入框通过 imageFileName 引用读资产 prompt
     if wasEmpty {
         store.nodes[idx].title = asset.name
+        // 通知输入框层：引用该节点的引用块跟着改名
+        store.publishNodeTitleChange(nodeID: nodeID, title: asset.name)
     }
     store.save()
     return true
@@ -640,6 +660,61 @@ extension CanvasStore {
         return result
     }
     
+    /// 提示词面板顶部的前置条件缩略图（打开面板时调用，连线变更即时重算）：
+    /// 按连线顺序收集本节点所有入边源节点（新连入的追加在队尾，同源节点多条线只算一次），
+    /// 图片/角色/场景与视频（首帧缩略图）取资产图，文本/音频/空节点退回类型图标。
+    /// 无效连线（超限/空节点）标 isInvalid，由面板侧半透明 + 红框提示。
+    /// 无任何入边时返回空数组 → 面板不显示缩略图区（保持原样式）。
+    /// - Parameter version: 连线图版本号（调用方传 connectionVersion）。仅用于让 SwiftUI
+    ///   在连线成功/删除后立即重新求值本函数 —— 即"连线成功就重新判断一次，新连入的追加到队尾"。
+    func promptInputThumbnails(for nodeID: UUID, version: Int = 0) -> [PromptInputThumbnail] {
+        let validity = inputValidity(for: nodeID)
+        var seenSourceIDs: Set<UUID> = []
+        var items: [PromptInputThumbnail] = []
+        for conn in connections where conn.toID == nodeID {
+            guard let fromNode = nodes.first(where: { $0.id == conn.fromID }) else { continue }
+            guard seenSourceIDs.insert(fromNode.id).inserted else { continue }   // 同一源节点只显示一张
+            let image = fromNode.imageFileName.flatMap { cachedAssetImage(for: $0) }
+            items.append(
+                PromptInputThumbnail(
+                    id: fromNode.id,
+                    title: fromNode.title,
+                    kind: fromNode.type,
+                    image: image,
+                    isInvalid: validity.invalidConnectionIDs.contains(conn.id)
+                )
+            )
+        }
+        return items
+    }
+    
+    /// 输入框手打 @ 的候选清单：先收集本节点入边源节点（优先区），
+    /// 再收集本项目全部其它节点（下方按类型分类展开）。全部内容都限于本项目范围。
+    /// - Parameter version: 连线图版本号（调用方传 connectionVersion），连线变更即时重算。
+    func promptMentionCatalog(for nodeID: UUID, version: Int = 0) -> PromptMentionCatalog {
+        var catalog = PromptMentionCatalog()
+        var seenUpstream: Set<UUID> = []
+        for conn in connections where conn.toID == nodeID {
+            guard let fromNode = nodes.first(where: { $0.id == conn.fromID }) else { continue }
+            guard seenUpstream.insert(fromNode.id).inserted else { continue }
+            catalog.upstream.append(mentionCandidate(fromNode))
+        }
+        for node in nodes where node.id != nodeID {
+            catalog.all.append(mentionCandidate(node))
+        }
+        return catalog
+    }
+
+    /// 单个节点 → @ 提及候选（有视觉内容取资产缩略图，否则由界面退回类型图标）
+    private func mentionCandidate(_ node: CanvasNode) -> PromptMentionCandidate {
+        PromptMentionCandidate(
+            id: node.id,
+            title: node.title,
+            kind: node.type,
+            image: node.imageFileName.flatMap { cachedAssetImage(for: $0) }
+        )
+    }
+
     /// ltx2.5 蒸馏版规则：
     /// - 空节点（无媒体内容）→ 无效线
     /// - 视频节点（未开尾帧）→ 无效线（不允许视频输入）
