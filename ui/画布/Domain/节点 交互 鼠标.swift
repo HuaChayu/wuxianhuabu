@@ -162,14 +162,20 @@ extension CanvasView {
         guard imageNodeTypes.contains(oldType), oldType != newType else { return }
         store.pushSnapshot()   // 类型互转会改数据，先记录撤销快照
         let fileName = store.nodes[idx].imageFileName
-        // 同一张图在项目内可能有多个节点：类型属于「图」本身，全部一起改
         var affectedIDs: Set<UUID> = []
-        for i in store.nodes.indices
-        where imageNodeTypes.contains(store.nodes[i].type)
-            && store.nodes[i].imageFileName != nil
-            && store.nodes[i].imageFileName == fileName {
-            store.nodes[i].type = newType
-            affectedIDs.insert(store.nodes[i].id)
+        if let fileName {
+            // 有图：同一张图在项目内可能有多个节点，类型属于「图」本身，全部一起改
+            for i in store.nodes.indices
+            where imageNodeTypes.contains(store.nodes[i].type)
+                && store.nodes[i].imageFileName == fileName {
+                store.nodes[i].type = newType
+                affectedIDs.insert(store.nodes[i].id)
+            }
+        } else {
+            // 空节点（尚未放图）：没有同源图可共享，只改这个节点自身的用途分类。
+            // 旧逻辑把这类节点排除在循环外，导致空节点点「转换为X」毫无反应。
+            store.nodes[idx].type = newType
+            affectedIDs.insert(nodeID)
         }
         // 块快照 kind 跟着图走（本项目全部节点）：生成端已实时读 node.type，
         // 这里刷快照只为让落盘数据一致、节点被删后兜底类型不出错

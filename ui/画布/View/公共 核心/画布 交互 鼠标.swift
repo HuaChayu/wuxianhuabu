@@ -138,13 +138,17 @@ extension CanvasView {
                 }
             }
         }
-        .padding(.vertical, 6)
+        // showAddNodePanel 时内容本身已是完整卡片（addNodePanel 自带白底/圆角/阴影/内边距），
+        // 外层不再套第二层背景与内边距，否则会形成「两个盒子叠一块」（上下各露一圈白边 + 双层阴影）
+        .padding(.vertical, showAddNodePanel ? 0 : 6)
         .frame(width: 180)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.97))
-                .shadow(color: Color.black.opacity(0.15), radius: 10, x: 0, y: 4)
-        )
+        .background {
+            if !showAddNodePanel {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.white.opacity(0.97))
+                    .shadow(color: Color.black.opacity(0.15), radius: 10, x: 0, y: 4)
+            }
+        }
     }
     
     // MARK: - 添加节点面板（右键菜单与左侧工具栏共用，onClose 由调用方决定关闭哪个面板）
@@ -164,7 +168,8 @@ extension CanvasView {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 4)
             
-            ForEach(NodeType.allCases) { type in
+            // 展示顺序显式指定，不依赖 case 声明顺序：图片三兄弟（角色→场景→道具）放一起，其后才是文本/视频/音频
+            ForEach(addNodeMenuTypes) { type in
                 contextMenuItem(icon: type.icon, title: type.rawValue) {
                     debugLog("添加节点：\(type.rawValue)")
                     addNode(type)
@@ -264,7 +269,7 @@ extension CanvasView {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
             
-            ForEach([NodeType.image_prop, .video, .audio, .image_character, .image_scene].filter { type in
+            ForEach([NodeType.image_character, .image_scene, .image_prop, .video, .audio].filter { type in
                 !(hideVideoOption && type == .video)
             }) { type in
                 contextMenuItem(icon: type.icon, title: type.rawValue) {

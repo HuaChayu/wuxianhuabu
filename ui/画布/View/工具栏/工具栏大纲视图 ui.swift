@@ -372,7 +372,7 @@ extension CanvasView {
                         outlineTypeFilter = nil
                         debugLog("大纲视图：类型过滤 全部")
                     }
-                    ForEach(NodeType.allCases) { type in
+                    ForEach(addNodeMenuTypes) { type in
                         Button(type.rawValue) {
                             outlineTypeFilter = type
                             debugLog("大纲视图：类型过滤 \(type.rawValue)")

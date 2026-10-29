@@ -75,8 +75,12 @@ enum NodeType: String, CaseIterable, Identifiable, Codable {
 // MARK: - 节点数据模型（画布坐标 position 为画布坐标系，显示时乘 zoom + offset）
 
 /// 图片类节点（同一张图的不同用途分类）：角色 / 场景 / 道具 三者之间可右键互转。
-/// 顺序即右键菜单展示顺序（道具 → 场景 → 角色），去掉当前类型后即为可转目标。
-let imageNodeTypes: [NodeType] = [.image_prop, .image_scene, .image_character]
+/// 顺序即右键菜单展示顺序（角色 → 场景 → 道具），去掉当前类型后即为可转目标。
+let imageNodeTypes: [NodeType] = [.image_character, .image_scene, .image_prop]
+
+/// 「添加节点」菜单展示顺序（不依赖 case 声明顺序）：
+/// 图片三类角色/场景/道具聚在一起，其后才是文本/视频/音频。
+let addNodeMenuTypes: [NodeType] = [.image_character, .image_scene, .image_prop, .text, .video, .audio]
 
 struct CanvasNode: Identifiable, Codable {
     var id: UUID = UUID()   // var：解码时从 JSON 恢复原 id，否则加载后连线 fromID/toID 匹配不上
