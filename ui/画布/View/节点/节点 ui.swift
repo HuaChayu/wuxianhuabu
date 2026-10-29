@@ -53,6 +53,8 @@ struct NodeView: View {
     @State private var isConnecting = false
     /// 节点实际尺寸（供加号定位）
     @State private var nodeSize: CGSize = .zero
+    /// 资产缩略图版本号：后台缩略图就绪后自增，触发 nodeImage 重算（首屏不再同步解码原图）
+    @State private var assetThumbTick = 0
     /// 媒体播放管理（观察播放状态刷新播放按钮）
     @ObservedObject private var playerManager = MediaPlayerManager.shared
     /// 生成队列（观察节点生成状态，内容区覆盖"正在生成/排队中"）
@@ -69,8 +71,9 @@ struct NodeView: View {
     private var spec: NodeSizeSpec {
         nodeSizeSpecs[node.type] ?? NodeSizeSpec(x: 16, y: 9)
     }
-    // 资产图片（从资产库缓存加载；nil = 空节点）
+    // 资产图片（从资产库缓存加载；nil = 空节点或缩略图尚未就绪）
     private var nodeImage: NSImage? {
+        _ = assetThumbTick   // 读取版本号：后台缩略图就绪后 body 重算时才能拿到新图
         guard let fileName = node.imageFileName else { return nil }
         return cachedAssetImage(for: fileName)
     }
@@ -121,6 +124,10 @@ struct NodeView: View {
                 }
             }
             .scaleEffect(zoom)
+            // 后台缩略图分批就绪 → 版本号自增重算 nodeImage（首屏不再同步解码原图，图片逐批浮现）
+            .onReceive(NotificationCenter.default.publisher(for: .assetThumbnailDidUpdate)) { _ in
+                assetThumbTick &+= 1
+            }
     }
     
     // 节点卡片
@@ -186,6 +193,12 @@ struct NodeView: View {
                             .aspectRatio(contentMode: .fit)
                             .frame(width: nodeWidth, height: placeholderHeight)
                             .clipShape(UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3, style: .continuous))
+                    } else if let pendingName = node.imageFileName, assetFileExists(pendingName) {
+                        // 有图但显示缩略图尚未就绪（后台正在生成）：画中性骨架，不出「上传/资产库」按钮，
+                        // 避免首屏把"还没加载完"误认成空节点；尺寸由 assetPixelSize 保证已稳定
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.10))
+                            .frame(width: nodeWidth, height: placeholderHeight)
                     } else {
                         VStack(spacing: emptyPlaceholderSpacing) {
                             Image(systemName: node.type.placeholderIcon)
@@ -2704,8 +2717,16 @@ struct PromptInputThumbnailStrip: View {
     var onMention: (PromptInputThumbnail) -> Void = { _ in }
     
     var body: some View {
-        HStack(spacing: 5) {
-            ForEach(items.prefix(6)) { item in
+        // 最多展示 12 张，一行放不下自动折行。
+        // 用按"实际宽度"排布的自定义流式布局，而不是 LazyVGrid：
+        // LazyVGrid 的列宽是固定的，卡片悬停展开变宽会被固定格子吃掉 —— 后面的卡片不会跟着后移，
+        // 展开效果就"粘"在原位、和邻居叠在一起。流式布局每次都按当前宽度重排，展开即推开后面。
+        ThumbnailFlowLayout(
+            horizontalSpacing: 5,
+            verticalSpacing: 5,
+            itemHeight: cardHeight
+        ) {
+            ForEach(items.prefix(12)) { item in
                 PromptInputThumbnailCard(
                     item: item,
                     width: cardWidth,
@@ -2714,14 +2735,60 @@ struct PromptInputThumbnailStrip: View {
                     onMention: { onMention(item) }
                 )
             }
-            if items.count > 6 {
-                Text("+\(items.count - 6)")
+            if items.count > 12 {
+                Text("+\(items.count - 12)")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.secondary)
+                    .frame(width: cardWidth, height: cardHeight)
             }
-            Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// 缩略图条的流式折行布局：按每个子视图**当前实际宽度**排布。
+/// 卡片悬停展开时宽度变大 → 后面的卡片被顺势推后；一行放不下就换行。
+/// 展开/收起都发生在 withAnimation 事务里，位置变化随之平滑过渡。
+struct ThumbnailFlowLayout: Layout {
+    var horizontalSpacing: CGFloat = 5
+    var verticalSpacing: CGFloat = 5
+    var itemHeight: CGFloat = 32
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        let frames = frames(maxWidth: maxWidth, subviews: subviews)
+        let width = maxWidth.isFinite ? maxWidth : (frames.map { $0.maxX }.max() ?? 0)
+        let height = frames.map { $0.maxY }.max() ?? itemHeight
+        return CGSize(width: width, height: max(height, itemHeight))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let frames = frames(maxWidth: bounds.width, subviews: subviews)
+        for (index, subview) in subviews.enumerated() where index < frames.count {
+            let frame = frames[index]
+            subview.place(
+                at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY),
+                proposal: ProposedViewSize(width: frame.width, height: itemHeight)
+            )
+        }
+    }
+
+    private func frames(maxWidth: CGFloat, subviews: Subviews) -> [CGRect] {
+        var result: [CGRect] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        for subview in subviews {
+            // 用子视图自身的理想宽度：折叠态 = cardWidth，展开态 = 胶囊宽度
+            let measured = subview.sizeThatFits(ProposedViewSize(width: nil, height: itemHeight))
+            let w = measured.width > 0 ? measured.width : itemHeight
+            if x > 0, maxWidth.isFinite, x + w > maxWidth {
+                x = 0
+                y += itemHeight + verticalSpacing
+            }
+            result.append(CGRect(x: x, y: y, width: w, height: itemHeight))
+            x += w + horizontalSpacing
+        }
+        return result
     }
 }
 
@@ -2797,7 +2864,9 @@ struct PromptInputThumbnailCard: View {
             }
             if !hovering { cancelPreviewShow(); schedulePreviewHide() }
         }
-        .help(item.title)
+        .help(item.isInvalid
+              ? "\(item.title)\n这条前置条件无效（超出当前模型的输入上限，或源节点为空），不会参与本次生成"
+              : item.title)
         // 箭头朝下 → popover 出现在卡片上方（预览不遮挡下方输入区）
         .popover(isPresented: $showPreview, arrowEdge: .top) {
             previewContent

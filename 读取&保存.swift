@@ -354,6 +354,9 @@ func loadProjectCanvas(_ project: ProjectItem, into canvas: CanvasStore) {
     canvas.continuousVideoMode = file.continuousVideoMode ?? true
     // 字段全部复位后，才把"类型/块快照修复"落盘（一次写，避免先写坏再写回）
     if typesRepaired { canvas.save() }
+    // 显示缩略图预热：后台并发生成缺失的 768px JPEG（不阻塞主线程）。
+    // 原图 PNG 解码单张 30–45ms，60 张在主线程就是 2 秒级风车，必须挪到后台。
+    prewarmAssetThumbnails(canvas.nodes.compactMap { $0.imageFileName })
     debugLog("加载项目画布：\(project.title)（节点\(file.nodes.count) 连线\(file.connections.count)）")
 }
 

@@ -171,9 +171,9 @@ let videoNodeLongSide: CGFloat = nodeBaseWidth * nodeSizeSpecs[.video]!.scale * 
 func videoNodeSize(imageFileName: String?) -> CGSize {
     let longSide = videoNodeLongSide
     if let fileName = imageFileName,
-       let img = cachedAssetImage(for: fileName) {
-        let w = img.size.width
-        let h = img.size.height
+       let pixel = assetPixelSize(for: fileName) {
+        let w = pixel.width
+        let h = pixel.height
         guard w > 0, h > 0 else { return CGSize(width: roundedToGrid(longSide), height: roundedToGrid(longSide) * 9 / 16) }
         // 直接按素材真实比例（不再强制 16:9/9:16）：长边按 40 网格取整，短边精确跟随，fit 恰好铺满
         if w >= h {   // 横屏/方形
@@ -199,9 +199,9 @@ let imageNodeLongSide: CGFloat = 240
 func imageNodeDisplaySize(type: NodeType, imageFileName: String?) -> CGSize {
     let long = roundedToGrid(imageNodeLongSide)
     if let fileName = imageFileName,
-       let img = cachedAssetImage(for: fileName) {
-        let w = img.size.width
-        let h = img.size.height
+       let pixel = assetPixelSize(for: fileName) {
+        let w = pixel.width
+        let h = pixel.height
         if w > 0, h > 0 {
             // 长边取 40 网格整数，短边精确跟随真实比例（fit 恰好铺满，不裁不留白）
             return w >= h
@@ -252,9 +252,9 @@ func placeholderHeightForType(_ type: NodeType, imageFileName: String?) -> CGFlo
         return imageNodeDisplaySize(type: type, imageFileName: imageFileName).height
     }
     if let fileName = imageFileName,
-       let img = cachedAssetImage(for: fileName) {
-        let w = img.size.width
-        let h = img.size.height
+       let pixel = assetPixelSize(for: fileName) {
+        let w = pixel.width
+        let h = pixel.height
         guard w > 0 else { return emptyPlaceholderHeight(for: type) }
         return nodeWidthForType(type) * h / w   // 精确比例，fit 恰好铺满（不再 40 网格取整）
     }

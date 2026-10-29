@@ -679,6 +679,9 @@ final class MouseControlNSView: NSView {
     // 中键拖拽状态
     private var isMiddleDragging = false
     private var lastDragLocation: NSPoint = .zero
+    /// 中键按下时的预热位移（不可见的极小 delta）：用于把拖动首帧的绘制提交成本提前到按下时刻，
+    /// 松手时原样减回，保证 offset 语义不变、不产生累积漂移
+    private var middleWarmUpDelta: CGPoint = .zero
     
     // 悬停检测 tracking area
     private var hoverTrackingArea: NSTrackingArea?
@@ -895,6 +898,9 @@ final class MouseControlNSView: NSView {
             debugLog("中键按下：开始移动画布")
             isMiddleDragging = true
             lastDragLocation = event.locationInWindow
+            // 预热：按下瞬间先推动一个不可见的极小位移，把"静止 → 平移"的第一次渲染成本（body 求值、
+            // 内容层 .position 提交、CA 事务建立）提前到按下时完成，避免这笔一次性开销落在拖动第一帧上
+            warmUpPanRendering()
         }
     }
     
@@ -913,11 +919,9 @@ final class MouseControlNSView: NSView {
         let current = event.locationInWindow
         let dx = current.x - lastDragLocation.x
         let dy = current.y - lastDragLocation.y
-        if var offset = offsetBinding?.wrappedValue {
-            offset.x += dx
-            offset.y -= dy
-            offsetBinding?.wrappedValue = offset
-        }
+        // 与滚轮/缩放共用同一套合并路径：同一 runloop tick 内多次拖动事件只写一次 offset，
+        // 避免 120Hz 鼠标每事件直写 @Published → 每事件触发画布全量 body 求值
+        accumulatePan(dx: dx, dy: -dy)
         lastDragLocation = current
     }
     
@@ -926,8 +930,33 @@ final class MouseControlNSView: NSView {
         if event.buttonNumber == 2 {
             debugLog("中键释放：移动画布结束")
             isMiddleDragging = false
+            flushPendingPan()      // 先冲刷合并窗口内残留的位移，否则 store.save() 会漏存最后一段拖动位移
+            restoreWarmUpDelta()   // 再把预热位移减回，避免把 0.01pt 的预热写进保存的 offset
             onDragEnded?()
         }
+    }
+    
+    /// 预热：中键按下时推动一个不可见的极小位移，让绘制管线在拖动开始前完成首帧提交。
+    /// 位移量 0.01pt（Retina 下 0.02px），肉眼不可见；松手时由 restoreWarmUpDelta 原样减回。
+    private func warmUpPanRendering() {
+        restoreWarmUpDelta()   // 上一次若未正常松手（失焦/被抢事件）留有残留，先清掉再重新预热
+        guard var offset = offsetBinding?.wrappedValue else { return }
+        let epsilon: CGFloat = 0.01
+        offset.x += epsilon
+        offset.y += epsilon
+        middleWarmUpDelta = CGPoint(x: epsilon, y: epsilon)
+        offsetBinding?.wrappedValue = offset
+    }
+    
+    /// 复位预热位移：与累积的平移 delta 同为加法，与迟到的 pending flush 顺序无关，结果一致
+    private func restoreWarmUpDelta() {
+        guard middleWarmUpDelta != .zero else { return }
+        let delta = middleWarmUpDelta
+        middleWarmUpDelta = .zero
+        guard var offset = offsetBinding?.wrappedValue else { return }
+        offset.x -= delta.x
+        offset.y -= delta.y
+        offsetBinding?.wrappedValue = offset
     }
     
     override func mouseDragged(with event: NSEvent) {
@@ -1173,6 +1202,14 @@ final class MouseControlNSView: NSView {
         }
     }
     
+    /// 立即冲刷合并窗口内残留的平移 delta（松手/落盘前调用，避免漏掉最后一 tick 的位移）
+    private func flushPendingPan() {
+        guard pendingOffsetDelta != .zero else { return }
+        let delta = pendingOffsetDelta
+        pendingOffsetDelta = .zero
+        applyPendingOffset(delta)
+    }
+    
     /// 将累积的平移 delta 合并写入 offset（同一 runloop tick 内只写一次）
     private func applyPendingOffset(_ delta: CGPoint) {
         guard delta != .zero else { return }
@@ -1193,11 +1230,7 @@ final class MouseControlNSView: NSView {
             guard let self else { return }
             self.zoomFlushScheduled = false
             // 先冲刷残留的平移 delta（平移→缩放快速切换时，旧位移不得叠加到缩放后的 offset 上）
-            if self.pendingOffsetDelta != .zero {
-                let panDelta = self.pendingOffsetDelta
-                self.pendingOffsetDelta = .zero
-                self.applyPendingOffset(panDelta)
-            }
+            self.flushPendingPan()
             let factor = self.pendingZoomFactor
             self.pendingZoomFactor = 1.0
             guard factor != 1.0 else { return }

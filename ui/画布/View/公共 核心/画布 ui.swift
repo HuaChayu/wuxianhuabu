@@ -52,6 +52,8 @@ struct CanvasView: View {
     @State var outlineTypeFilter: NodeType? = nil
     /// 大纲视图：悬停的节点 id（用于行悬停高亮）
     @State var hoveredOutlineNodeID: UUID? = nil
+    /// 大纲视图：行点击令牌（点击行时自增 → 立即收起该行的大图预览，不必等悬停超时）
+    @State var outlinePreviewDismissToken: Int = 0
     /// 大纲视图：已展开的组 id 集合（展开显示组内节点）
     @State var outlineExpandedGroupIDs: Set<UUID> = []
     /// 大纲视图：悬停的组 id（用于组行悬停高亮）
@@ -687,7 +689,7 @@ struct CanvasView: View {
     private func historyImageCell(entry: NodeContentHistory, cellWidth: CGFloat, imageHeight: CGFloat, onTap: @escaping () -> Void) -> some View {
         ZStack(alignment: .bottomTrailing) {
             Group {
-                if let imgName = entry.imageFileName, let img = cachedAssetImage(for: imgName) {
+                if let imgName = entry.imageFileName, let img = cachedAssetImage(for: imgName) ?? fullAssetImage(for: imgName) {
                     Image(nsImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
@@ -855,7 +857,7 @@ struct CanvasView: View {
             nodeID: ref.nodeID,
             title: target?.title ?? ref.title,
             kind: target?.type ?? ref.kind,
-            image: target?.imageFileName.flatMap { cachedAssetImage(for: $0) }
+            image: target?.imageFileName.flatMap { cachedAssetImage(for: $0) ?? fullAssetImage(for: $0) }
         )
     }
 

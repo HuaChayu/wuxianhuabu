@@ -161,9 +161,7 @@ extension CanvasView {
             if outlineRenameNodeID == node.id {
                 // 重命名模式：行内直接编辑，回车提交
                 HStack(spacing: 12) {
-                    Image(systemName: node.type.icon)
-                        .font(.system(size: 15))
-                        .frame(width: 22)
+                    OutlineThumbnail(node: node)
                     OutlineRenameField(text: $outlineRenameText, onSubmit: {
                         commitOutlineRename(node)
                     }, onCancel: {
@@ -192,13 +190,13 @@ extension CanvasView {
                 // padding 放进 Button 内部，让整行（含 padding）都能触发聚焦，
                 // 避免点击行内空白穿透到面板 onTapGesture 被当成"点击面板空白"
                 Button(action: {
+                    // 点了这一行 → 立刻收起它的大图预览（不用等悬停超时）
+                    outlinePreviewDismissToken += 1
                     focusOnNode(node)
                     debugLog("大纲视图：选中并聚焦节点「\(node.title)」")
                 }) {
                     HStack(spacing: 12) {
-                        Image(systemName: node.type.icon)
-                            .font(.system(size: 15))
-                            .frame(width: 22)
+                        OutlineThumbnail(node: node)
                         Text(node.title)
                             .font(.subheadline)
                             .lineLimit(1)
@@ -239,6 +237,12 @@ extension CanvasView {
                 debugLog("大纲视图：右键节点「\(node.title)」")
             }
         }
+        // 整行大图预览：锚点是整行右缘，向右展开，不遮行内标题
+        .modifier(OutlineRowPreview(
+            node: node,
+            isRowHovered: hoveredOutlineNodeID == node.id,
+            dismissToken: outlinePreviewDismissToken
+        ))
     }
     
     /// 大纲视图组行：展开/收缩箭头 + 文件夹图标 + 分组名，点击行主体聚焦整组
@@ -505,6 +509,339 @@ extension CanvasView {
 }
 
 // ============================================================
+
+// MARK: - 大纲行首缩略图（悬停弹完整画面）
+
+/// 大纲行首视觉，与提示词面板的前置条件块保持一致：有媒体内容显示真实缩略图，
+/// 没有内容才退回类型图标（按类型着色，不再是统一黑白小图标）。
+/// 纯渲染组件：悬停/预览逻辑在 OutlineRowPreview（挂在整行上，锚点是整行而不是这张小图）。
+struct OutlineThumbnail: View {
+    let node: CanvasNode
+    /// 缩略图显示边长（pt）；外层占位宽度固定 26，保证文字起始位置一致
+    var side: CGFloat = 24
+    
+    /// 行内小图：按 3x 屏幕倍数取像素边长，避免 Retina 下发虚（解码尺寸见 cachedRowThumbnail）
+    private var rowImage: NSImage? {
+        node.imageFileName.flatMap { cachedRowThumbnail(for: $0, pixelSide: side * 3) }
+    }
+    
+    var body: some View {
+        ZStack {
+            if let image = rowImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Image(systemName: node.type.icon)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(node.type.thumbnailAccent)
+            }
+        }
+        .frame(width: side, height: side)
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        // 描边用类型色（弱化）：对应提示词块底部那条类型色带的语义，缩略图态也能一眼分清类型
+        .overlay(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .stroke(node.type.thumbnailAccent.opacity(0.35), lineWidth: 0.8)
+        )
+        .help(node.title)
+        .frame(width: 26)   // 与层级对齐：文字起始位置不变
+    }
+}
+
+/// 大纲行的整行大图预览。
+/// 锚点是**整行右缘**：预览从行右侧向外展开，不会盖住行内的标题文字。
+/// 用自绘的无交互悬浮窗（NSWindow + ignoresMouseEvents）而不是 .popover：
+/// popover 是独立窗口，会吞掉"点在这一行上"的那次点击（表现就是预览在时点不动这行，非要等它消失）；
+/// 悬浮窗不接收鼠标事件，点击直接穿透到下面的行，聚焦/选中照常生效。
+/// 触发区是整行：鼠标落在这行任意位置 220ms 后展示，离开 180ms 收起（进出都取消上一个任务，快速划过不闪）。
+/// 无媒体内容的行不展示。
+struct OutlineRowPreview: ViewModifier {
+    let node: CanvasNode
+    /// 行级悬停状态（整行任意位置悬停都为 true）
+    let isRowHovered: Bool
+    /// 点击令牌：值变化（点了这一行）就立即收起预览，不用等悬停超时
+    let dismissToken: Int
+    
+    @State private var showPreview = false
+    @State private var showTask: Task<Void, Never>? = nil
+    @State private var hideTask: Task<Void, Never>? = nil
+    /// 整行在**屏幕坐标**（origin 左下）的精确矩形，由 AppKit 直接换算得到
+    @State private var rowScreenRect: NSRect = .zero
+    
+    /// 预览最大显示尺寸（pt）
+    private let previewMaxSize = CGSize(width: 340, height: 250)
+    
+    func body(content: Content) -> some View {
+        content
+            // 记录整行在**屏幕**上的精确位置，预览据此贴到行右缘。
+            // 用 AppKit 的 view → window → screen 直接换算，不再手工做
+            // "SwiftUI global → contentView → screen" 的 Y 轴翻转，避免垂直偏移。
+            .background(
+                RowScreenFrameProbe { rect in
+                    // layout 可能就发生在 SwiftUI 更新周期内，异步写回，避免 "Modifying state during view update"
+                    DispatchQueue.main.async {
+                        rowScreenRect = rect
+                        // 列表滚动 / 行位移：只挪预览窗位置，不重建内容
+                        if showPreview {
+                            OutlinePreviewCenter.shared.move(owner: node.id, anchorScreenRect: rect)
+                        }
+                    }
+                }
+            )
+            // global frame 变化只当"行位置脏了"的触发器：滚动不一定触发 probe 的 layout，
+            // 这里按 global 位移量平移已知的屏幕矩形（global y 向下、屏幕 y 向上，取负）
+            .background(
+                GeometryReader { proxy in
+                    Color.clear
+                        .onChange(of: proxy.frame(in: .global)) { old, new in
+                            guard showPreview, rowScreenRect.width > 0 else { return }
+                            let dx = new.minX - old.minX
+                            let dy = new.minY - old.minY
+                            guard dx != 0 || dy != 0 else { return }
+                            rowScreenRect = rowScreenRect.offsetBy(dx: dx, dy: -dy)
+                            OutlinePreviewCenter.shared.move(owner: node.id, anchorScreenRect: rowScreenRect)
+                        }
+                }
+            )
+            // 无媒体内容不展示（只有类型图标，没有信息量）
+            .onChange(of: isRowHovered) { _, hovering in
+                guard node.imageFileName != nil else { return }
+                if hovering { scheduleShow() } else { cancelShow(); scheduleHide() }
+            }
+            // 点击这一行 → 立刻收起预览
+            .onChange(of: dismissToken) { _, _ in
+                cancelShow(); hideTask?.cancel(); hidePreview()
+            }
+            .onDisappear {
+                // 行滚出视口/面板关闭：清掉挂起任务与预览窗
+                cancelShow(); hideTask?.cancel(); hidePreview()
+            }
+    }
+    
+    /// 完整画面（全尺寸缓存图，不是 60px 小图；圆角，按原比例 fit）
+    /// 注意：**不要**加 padding + 不透明底 —— 那层底就是之前预览四周的白边。
+    /// 图片自己圆角裁切，窗口背景透明，阴影交给窗口。
+    private var previewView: AnyView {
+        AnyView(
+            Group {
+                if let fileName = node.imageFileName, let image = fullAssetImage(for: fileName) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                } else {
+                    VStack(spacing: 6) {
+                        Image(systemName: node.type.placeholderIcon)
+                            .font(.system(size: 22))
+                            .foregroundColor(.secondary)
+                        Text(node.title)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color(nsColor: .windowBackgroundColor))
+                    )
+                }
+            }
+        )
+    }
+    
+    /// 按原图比例算出预览窗尺寸（无内边距，窗口即画面）
+    private func previewSize() -> NSSize {
+        guard let fileName = node.imageFileName, let image = fullAssetImage(for: fileName) else {
+            return NSSize(width: 220, height: 90)
+        }
+        let w = max(image.size.width, 1)
+        let h = max(image.size.height, 1)
+        let scale = min(previewMaxSize.width / w, previewMaxSize.height / h, 1)
+        return NSSize(width: max(w * scale, 80), height: max(h * scale, 60))
+    }
+    
+    private func presentPreview() {
+        OutlinePreviewCenter.shared.show(
+            owner: node.id,
+            content: previewView,
+            size: previewSize(),
+            anchorScreenRect: rowScreenRect
+        )
+    }
+    
+    private func hidePreview() {
+        OutlinePreviewCenter.shared.hide(owner: node.id)
+    }
+    
+    // 悬停进出用短延迟 + 取消，规避快速划过时预览闪烁
+    private func scheduleShow() {
+        hideTask?.cancel()
+        guard !showPreview else { return }
+        showTask?.cancel()
+        showTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+            showPreview = true
+            presentPreview()
+        }
+    }
+    
+    private func cancelShow() {
+        showTask?.cancel()
+        showTask = nil
+    }
+    
+    private func scheduleHide() {
+        guard showPreview else { return }
+        hideTask?.cancel()
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled else { return }
+            showPreview = false
+            hidePreview()
+        }
+    }
+}
+
+// MARK: - 行屏幕坐标探针
+
+/// 把某个视图在**屏幕坐标系**（origin 左下）上的精确矩形上报出来。
+/// 直接走 AppKit 的 view → window → screen 转换，比在 SwiftUI 里拿 .global 再手算
+/// "contentView 高度 - midY" 可靠：后者只要窗口内容区高度与 SwiftUI 的假设不一致
+/// （标题栏、隐藏式标题栏、全尺寸 contentView…），预览就会整体上下偏移一大截。
+struct RowScreenFrameProbe: NSViewRepresentable {
+    var onFrameChange: (NSRect) -> Void
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onFrameChange = onFrameChange
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        nsView.onFrameChange = onFrameChange
+        nsView.reportIfNeeded()
+    }
+
+    final class ProbeView: NSView {
+        var onFrameChange: ((NSRect) -> Void)?
+        private var lastReported: NSRect = .null
+
+        override var isFlipped: Bool { true }
+
+        /// 关键：探针只负责量尺寸，绝不能吃掉这一行的悬停与点击
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            reportIfNeeded(force: true)
+        }
+
+        override func layout() {
+            super.layout()
+            reportIfNeeded()
+            // 父级滚动/位移不一定触发自身 layout，下一帧再校一次
+            DispatchQueue.main.async { [weak self] in self?.reportIfNeeded() }
+        }
+
+        func reportIfNeeded(force: Bool = false) {
+            guard let window, !isHiddenOrHasHiddenAncestor else { return }
+            let rectOnScreen = window.convertToScreen(convert(bounds, to: nil))
+            guard rectOnScreen.width > 0, rectOnScreen.height > 0 else { return }
+            guard force || rectOnScreen != lastReported else { return }
+            lastReported = rectOnScreen
+            onFrameChange?(rectOnScreen)
+        }
+    }
+}
+
+// MARK: - 大纲行预览悬浮窗（不接收鼠标事件，点击可穿透到下面的行）
+
+/// 无边框、非激活、不接收鼠标事件的悬浮窗：
+/// 预览展示期间鼠标点击直接落到下面的行（聚焦正常生效），
+/// 这是相对 .popover 的关键差异 —— popover 的窗口会吃掉那次点击。
+final class OutlinePreviewPanel: NSPanel {
+    init() {
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: 10, height: 10),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isFloatingPanel = true
+        level = .popUpMenu
+        backgroundColor = .clear
+        isOpaque = false
+        hasShadow = true
+        ignoresMouseEvents = true          // 关键：鼠标事件穿透，不挡行点击
+        collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
+        isReleasedWhenClosed = false
+        hidesOnDeactivate = true
+        animationBehavior = .none
+    }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// 全局唯一的预览窗管理（同一时刻只会有一行在悬停，避免每行各自持有一个窗口）
+@MainActor
+final class OutlinePreviewCenter {
+    static let shared = OutlinePreviewCenter()
+    private var panel: OutlinePreviewPanel?
+    private var owner: UUID?
+    
+    func show(owner: UUID, content: AnyView, size: NSSize, anchorScreenRect: NSRect) {
+        guard let origin = screenOrigin(anchorRow: anchorScreenRect, size: size) else { return }
+        let previewPanel = panel ?? OutlinePreviewPanel()
+        panel = previewPanel
+        let hosting = NSHostingView(rootView: content)
+        // 关键：禁止 NSHostingView 用 SwiftUI 尺寸反向改写窗口的 contentMinSize/contentMaxSize。
+        // 否则每次换图（尺寸变化）都会触发一轮 Update Constraints，AppKit 检测到
+        // "more Update Constraints passes than views" 会直接抛异常崩掉（OutlinePreviewPanel 崩点）。
+        hosting.sizingOptions = []
+        hosting.autoresizingMask = [.width, .height]
+        // 先定窗口 frame，再挂 contentView，避免挂载瞬间用 10x10 的初始尺寸去算 extrema
+        previewPanel.setFrame(NSRect(origin: origin, size: size), display: false)
+        previewPanel.contentView = hosting
+        hosting.frame = NSRect(origin: .zero, size: size)
+        previewPanel.setContentSize(size)
+        if !previewPanel.isVisible { previewPanel.orderFront(nil) }
+        // 透明窗口的阴影是按内容 alpha 算的，换图/加圆角后要让系统重算一次
+        DispatchQueue.main.async { [weak previewPanel] in previewPanel?.invalidateShadow() }
+        self.owner = owner
+    }
+    
+    /// 只挪位置、不重建内容（列表滚动时按帧调用，避免每帧重建 NSHostingView）
+    func move(owner: UUID, anchorScreenRect: NSRect) {
+        guard self.owner == owner, let previewPanel = panel else { return }
+        guard let origin = screenOrigin(anchorRow: anchorScreenRect, size: previewPanel.frame.size) else { return }
+        previewPanel.setFrameOrigin(origin)
+    }
+    
+    func hide(owner: UUID) {
+        guard self.owner == owner else { return }
+        panel?.orderOut(nil)
+        self.owner = nil
+    }
+    
+    /// 行右缘 → 预览位置（屏幕坐标，origin 左下）；预览垂直方向与行居中，越界时回收进屏幕
+    private func screenOrigin(anchorRow: NSRect, size: NSSize) -> NSPoint? {
+        guard anchorRow.width > 0, anchorRow.height > 0 else { return nil }
+        // anchorRow 本身就是屏幕坐标（由 RowScreenFrameProbe 用 AppKit 换算得到），直接用
+        var x = anchorRow.maxX + 10
+        var y = anchorRow.midY - size.height / 2
+        let anchorCenter = NSPoint(x: anchorRow.midX, y: anchorRow.midY)
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(anchorCenter) }) ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            // 右侧放不下就翻到行左侧（宁可盖住面板，也不让预览飞出屏幕）
+            if x + size.width > visible.maxX - 8 { x = anchorRow.minX - size.width - 10 }
+            x = max(visible.minX + 8, min(x, visible.maxX - size.width - 8))
+            y = max(visible.minY + 8, min(y, visible.maxY - size.height - 8))
+        }
+        return NSPoint(x: x, y: y)
+    }
+}
 
 // MARK: - 左侧工具栏位置上报
 
