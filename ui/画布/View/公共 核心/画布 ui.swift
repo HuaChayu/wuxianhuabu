@@ -84,7 +84,7 @@ struct CanvasView: View {
     /// 资产库过滤范围：nil 表示全局资产，否则为对应项目 id
     @State var assetScope: UUID? = nil
     /// 资产库分类 Tab：角色 / 场景
-    @State var assetCategory: AssetCategory = .character
+    @State var assetCategory: AssetCategory = .image_character
     /// 资产库中已选中的资产 id（支持批量多选后拖拽）
     @State var selectedAssetIDs: Set<UUID> = []
     /// 资产库框选：框选矩形 / 框选临时命中的资产
@@ -95,7 +95,7 @@ struct CanvasView: View {
     /// 空节点「资产库」选择面板：目标节点 id（nil 表示未弹出）
     @State var pickAssetNodeID: UUID?
     /// 资产库选择面板：当前分类（随节点类型初始化）
-    @State var pickAssetCategory: AssetCategory = .character
+    @State var pickAssetCategory: AssetCategory = .image_character
     /// 资产库选择面板：来源过滤（nil=全局）
     @State var pickAssetScope: UUID? = nil
     /// 资产库选择面板：当前选中资产
@@ -597,7 +597,7 @@ struct CanvasView: View {
             x: node.position.x * zoom + offset.x,
             y: node.position.y * zoom + offset.y
         )
-        let nodeHalfW = nodeWidthForType(node.type) * zoom / 2
+        let nodeHalfW = nodeDisplaySize(for: node).width * zoom / 2
         historyPanelPos = CGPoint(x: center.x + nodeHalfW + 12, y: center.y)
         showContextMenu = false
         showGeneratePanel = false
@@ -611,7 +611,7 @@ struct CanvasView: View {
     func historyPanel(nodeID: UUID) -> some View {
         // 面板基准尺寸：横向 = 节点宽 × 0.85，竖向 = 节点宽 × 1.2（随 store.zoom 联动）
         // 宽度必须固定（防止父容器拉伸占满窗口），并设上下限保证可用性
-        let base = store.nodes.first(where: { $0.id == nodeID }).map { nodeWidthForType($0.type) * store.zoom } ?? 280
+        let base = store.nodes.first(where: { $0.id == nodeID }).map { nodeDisplaySize(for: $0).width * store.zoom } ?? 280
         let panelW = min(max(base * 0.85, 220), 460)
         let panelH = min(max(base * 0.9, 220), 400)
 
@@ -767,17 +767,24 @@ struct CanvasView: View {
     /// 节点输入框草稿统一写回（引用模型：只写单一数据源）。
     /// 节点引用资产 → 写资产库 prompt，所有引用该资产的节点天然同步；
     /// 未引用资产 → 写节点自身 prompt。
-    func commitNodePrompt(_ prompt: String, nodeID: UUID) {
+    /// - Parameter blocks: 与这段文本配套的引用块（nil = 用当前输入框的块）。
+    ///   认领条件只看「占位符数 == 块数 + 块 id 不重复」，不再依赖 prompt 必须等于当前
+    ///   输入框草稿——那条旧条件让"文本对、块也对、只是不来自当前草稿"的写入被误判成
+    ///   外部文本，结果把合法的富文本快照置空。传纯文本（历史恢复 / 资产同步）时占位符数为 0，
+    ///   自然不认领，防误存的效果不变。
+    func commitNodePrompt(_ prompt: String, nodeID: UUID, blocks: [PromptMention]? = nil) {
         guard let idx = store.nodes.firstIndex(where: { $0.id == nodeID }) else { return }
         // 节点提示词是"引用源头的本地副本"：编辑只写节点自身，不改总资产源头
         // 引用块占位符（U+FFFC）不写进 prompt：该字段只存纯文本（生成端按纯文本喂模型）
         store.nodes[idx].prompt = prompt.strippingMentionPlaceholders
-        // 引用块单独落盘：只有在「传入文本就是当前输入框草稿」且块数与占位符对齐时才认领，
-        // 避免历史内容恢复等传外部文本的场景把别的节点的块误存到本节点
+        // 引用块单独落盘（与 promptRich 里的占位符按出现顺序一一对应）
+        let claimed = blocks ?? promptMentions
         let placeholderCount = PromptMentionToken.count(in: prompt)
-        if placeholderCount > 0, prompt == promptDraft, promptMentions.count == placeholderCount {
+        if placeholderCount > 0,
+           claimed.count == placeholderCount,
+           Set(claimed.map(\.id)).count == claimed.count {
             store.nodes[idx].promptRich = prompt
-            store.nodes[idx].promptMentionRefs = promptMentions.map {
+            store.nodes[idx].promptMentionRefs = claimed.map {
                 PromptMentionRef(blockID: $0.id, nodeID: $0.nodeID, title: $0.title, kind: $0.kind)
             }
         } else {
@@ -903,7 +910,7 @@ struct CanvasView: View {
             startVideoGeneration(nodeID: node.id, prompt: promptText)
         }
         // 图像/角色/场景节点：点发送即开始生成图像（HiDream-O1）
-        if node.type == .image || node.type == .character || node.type == .scene {
+        if node.type == .image_prop || node.type == .image_character || node.type == .image_scene {
             startImageGeneration(nodeID: node.id, prompt: promptText)
         }
     }
@@ -951,7 +958,8 @@ struct CanvasView: View {
         }
         // 收集有效输入：走公共判定（视频节点选了模型后，不符合要求的线禁用跳过，只收集合规线）
         let validity = store.inputValidity(for: nodeID)
-        let imagePaths = validity.imagePaths
+        // 条件图路径（可被下方「@ 块解析」重写：块优先占号 + 连线补位后的完整条件图序列）
+        var imagePaths = validity.imagePaths
         let videoPaths = validity.videoPaths
         let audioPaths = validity.audioPaths
         if !validity.invalidConnectionIDs.isEmpty {
@@ -987,7 +995,101 @@ struct CanvasView: View {
             }
         }
         // 误触保护：提示词为空且无任何输入条件（图片/视频/音频）时直接取消，不启动管线
-        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        // ★ 条件图统一解析（H3 多参考，2026-10-27）：一套逻辑，1 张和 N 张走完全相同的路径——
+        //   块（@ 引用）优先占号 → 连线补位 → 同图不重复占号；第 i 张恒为 <Picture i> / <Subject i>。
+        //   块名字展开成 subject_definitions + retention_analysis 前置段（缺 retention 时模型不采纳参考图）。
+        // ★ FL2VA / Ref2VA 提示词结构分流（2026-10-27）：两者段名不可互换。
+        //   判据与管线同源（模型生成队列-通用.swift:303：fl2vaAsRefs=false 且无视频/音频
+        //   且图恰 2 张 → 走首尾帧硬锚）：首尾帧用官方三段，多参考用 Ref2VA 六段。
+        //   此前一律注入六段，FL2VA 不认 detailed_description 段名，正文整段落自由区被朗读。
+        let fl2vaMode: Bool = {
+            guard let n = store.nodes.first(where: { $0.id == nodeID }),
+                  n.type == .video, n.model == .minimaxH3,
+                  n.refMode?.fl2vaAsRefs == false else { return false }
+            return videoPaths.isEmpty && audioPaths.isEmpty && imagePaths.count == 2
+        }()
+        if fl2vaMode {
+            // 首尾帧无参考主体：不占 @ 号、不插 <Subject n>、不生成 (SN)。
+            // 只按官方 §4.4 把引号台词拆成 `<d>[Language] …</d>`；说话人 ID 由正文自己携带
+            // （`(S1)` 或 `<Subject n>`），程序不做任何词法推断。
+            let fl2vaDialogue = H3Dialogue.normalize(trimmedPrompt)
+            trimmedPrompt = fl2vaStructuredPrompt(userText: fl2vaDialogue.text)
+            debugLog("视频生成：FL2VA 首尾帧模式 → 三段结构（integrated_multimodal_description / overall_soundscape / non_diegetic_music），台词拆封 \(fl2vaDialogue.lineCount) 句｜说话人 \(fl2vaDialogue.speakerCount) 个｜未绑定 \(fl2vaDialogue.unboundLines)")
+        } else if let refNode = store.nodes.first(where: { $0.id == nodeID }),
+           refNode.type == .video, refNode.model == .minimaxH3 {
+            let blocks = refNode.promptMentionRefs ?? []
+            let canvas = store
+            debugLog("视频生成：块快照 \(blocks.count) 个｜promptRich \(refNode.promptRich?.count ?? -1) 字符｜连线图 \(imagePaths.count) 张（合并后应为 \(blocks.count + imagePaths.count) 上限内去重）")
+            let resolution = resolveReferences(
+                plainPrompt: trimmedPrompt,
+                richPrompt: refNode.promptRich,
+                blocks: blocks,
+                wiredPaths: imagePaths,
+                limit: Int(H3Const.maxRefImages),
+                pathForBlock: { ref in
+                    switch ref.kind {
+                    case .image_prop, .image_scene, .image_character:
+                        let p = canvas.referencePath(forNodeID: ref.nodeID)
+                        debugLog("视频生成：块「\(ref.title)」nodeID \(ref.nodeID.uuidString.prefix(8)) → \(p.map { ($0 as NSString).lastPathComponent } ?? "nil（节点丢失或该节点无图）")")
+                        return p
+                    default:
+                        debugLog("视频生成：块「\(ref.title)」kind=\(ref.kind) 非图片类，不占号")
+                        return nil   // 视频/音频/文本块不作图片条件图，退化为块名文本
+                    }
+                },
+                label: { labelFor(kind: .image, ordinal: UInt32($0)) },
+                // ★ 2026-10-27 方案 B：正文指代改 <Subject n>，与 subject_definitions 段同源。
+                //   视觉块头仍是 <Picture n>:（pipeline 依赖它排视觉 token），两条链在定义段完成拼接。
+                inlineRef: { subjectMark(ordinal: UInt32($0)) }
+            )
+            imagePaths = resolution.orderedPaths
+            // ref2va 绑定链必须常驻：subject_definitions + retention_analysis 是模型采纳参考图的开关，
+            // 缺了这段，图虽进视觉块但生成侧无指代，参考图等于没接。
+            // 主体名＝块名做身份锚（纯数字块名自动退回中性指代，故仍不会出现「133」上屏），
+            // ★ 2026-10-27 台词拆封：引号内的字转成官方 `<d>[Chinese] …</d>` 并绑上说话人 (Sx)。
+            //   官方不把引号当台词语法（`“…”` 是「画面可见文字」语义），中文引号会让语音轨道
+            //   把整段描述当旁白念出来；必须显式包 `<d>`。
+            let dialogue = H3Dialogue.normalize(resolution.text)
+            if dialogue.lineCount > 0 {
+                debugLog("视频生成：\(dialogue.summary)")
+            }
+            // ★ 2026-10-29 定义段按引用类型区分（角色 / 场景 / 道具）：
+            //   ★ 类型唯一真相 = 画布上那个节点此刻的 node.type（类型属于「图」本身，改一次全局一致）。
+            //   块快照里的 kind 只是历史副本：右键互转、打开项目对齐资产库、跨项目同步都只改
+            //   node.type，快照不会跟着走（2026-10-29 实测：快照全是「道具」，节点已是场景/角色）。
+            //   因此取数顺序固定为 ①按块 nodeID 查活节点类型 → ②按条件图路径查活节点类型
+            //   → ③快照 kind 兜底（仅节点已删除时）→ ④nil 交给模型层写中性「主体」。
+            //   同时预建 nodeID / path → type 字典，避免每块全量扫节点（O(块数×节点数)）。
+            let nodeTypeByID = Dictionary(canvas.nodes.map { ($0.id, $0.type) },
+                                          uniquingKeysWith: { first, _ in first })
+            var nodeTypeByPath: [String: NodeType] = [:]
+            for n in canvas.nodes where imageNodeTypes.contains(n.type) {
+                if let p = canvas.referencePath(forNodeID: n.id) {
+                    if nodeTypeByPath[p] == nil { nodeTypeByPath[p] = n.type }
+                }
+            }
+            let blockKindByBlockID = Dictionary(blocks.map { ($0.blockID, $0.kind) },
+                                                uniquingKeysWith: { first, _ in first })
+            let subjectKinds: [String?] = resolution.refs.map { ref -> String? in
+                if let nid = ref.nodeID, let live = nodeTypeByID[nid], imageNodeTypes.contains(live) {
+                    return live.rawValue
+                }
+                if let byPath = nodeTypeByPath[ref.path] { return byPath.rawValue }
+                if let bid = ref.blockID, let kind = blockKindByBlockID[bid] {
+                    return kind.rawValue
+                }
+                return nil
+            }
+            debugLog("视频生成：主体类型 \(subjectKinds.enumerated().map { "\($0.offset + 1)=\($0.element ?? "未知")" }.joined(separator: ","))")
+            trimmedPrompt = prependRefSubjectSections(to: dialogue.text,
+                                                      subjectCount: resolution.refs.count,
+                                                      subjectKinds: subjectKinds)
+            if !resolution.degradedTitles.isEmpty {
+                debugLog("视频生成：\(resolution.degradedTitles.count) 个 @ 块未占号（无内容/超限），文本退化为块名")
+            }
+            debugLog("视频生成：条件图解析完成（块 \(blocks.count) 个 → 条件图 \(resolution.orderedPaths.count) 张，序号 1…\(resolution.orderedPaths.count)）")
+        }
         if trimmedPrompt.isEmpty && imagePaths.isEmpty && videoPaths.isEmpty && audioPaths.isEmpty {
             inputValidationErrors[nodeID] = "提示词为空且未连接图片/视频/音频条件，已取消运行（请填写提示词或接入条件）"
             debugLog("视频生成：误触保护（无提示词、无图片、无视频、无音频），取消运行")
@@ -1037,6 +1139,14 @@ struct CanvasView: View {
             return
         }
         debugLog("视频生成：入队（节点 \(nodeID)，模型 \(modelName)，提示词「\(trimmedPrompt)」，尺寸 \(size.width)×\(size.height)，时长 \(duration.displayName)）")
+        // ★ 2026-10-27：最终提示词全文逐行打到调试面板，界面可直接核对这次生成到底送了什么
+        //   （段标题 / <Subject n> / <d> 标签 / 说话人 (Sx) 全部可见，不再只截一行）。
+        let finalLines = trimmedPrompt.components(separatedBy: "\n")
+        debugLog("视频生成：最终提示词全文（\(trimmedPrompt.count) 字符 / \(finalLines.count) 行）▽")
+        for (i, line) in finalLines.enumerated() {
+            debugLog("   P\(String(format: "%02d", i + 1))| \(line)")
+        }
+        debugLog("视频生成：最终提示词全文 △")
         let task = QueueTask(
             kind: .video,
             nodeID: nodeID,
@@ -1326,7 +1436,7 @@ struct CanvasView: View {
                 name: baseName,
                 image: image,
                 prompt: prompt,
-                category: .image,
+                category: .image_prop,
                 fileName: pngName,
                 mediaFileName: nil
             )
@@ -1673,7 +1783,7 @@ struct CanvasView: View {
             let targetNode = node
             Task { @MainActor in
                 guard let image = await thumbnailImage(for: url) else { return }
-                let isImage = targetNode.type.assetCategory == .image
+                let isImage = targetNode.type.assetCategory == .image_prop
                 importAsset(
                     image: image,
                     name: url.deletingPathExtension().lastPathComponent,
@@ -1714,23 +1824,26 @@ struct CanvasView: View {
             let targetStore = store
             Task { @MainActor in
                 var index = 0
-                func place(_ url: URL, category: AssetCategory) async {
+                func place(_ url: URL, category baseCategory: AssetCategory) async {
                     guard let thumb = await thumbnailImage(for: url) else { return }
                     let pos = CGPoint(x: baseCanvas.x + Double(index) * 40,
                                       y: baseCanvas.y + Double(index) * 40)
+                    // 普通图片按尺寸自动细分：竖图 → 角色，横图/方图 → 场景
+                    let category = resolvedImportCategory(baseCategory, image: thumb)
+                    let isImage = fileKind(of: url) == .image
                     importAsset(
                         image: thumb,
                         name: url.deletingPathExtension().lastPathComponent,
                         category: category,
-                        sourceURL: category == .image ? url : nil,
-                        mediaSourceURL: category == .image ? nil : url,
+                        sourceURL: isImage ? url : nil,
+                        mediaSourceURL: isImage ? nil : url,
                         createNode: true,
                         nodePosition: pos,
                         store: targetStore
                     )
                     index += 1
                 }
-                for url in imageURLs { await place(url, category: .image) }
+                for url in imageURLs { await place(url, category: .image_prop) }
                 for url in videoURLs { await place(url, category: .video) }
                 for url in audioURLs { await place(url, category: .audio) }
             }
@@ -1783,7 +1896,9 @@ struct CanvasView: View {
                               model: $0.model,
                               quality: $0.quality,
                               imageModel: $0.imageModel,
-                              imageQuality: $0.imageQuality)
+                              imageQuality: $0.imageQuality,
+                              promptRich: $0.promptRich,
+                              promptMentionRefs: $0.promptMentionRefs)
             },
             connections: connections.map { ClipboardConnection(fromID: $0.fromID, toID: $0.toID) }
         )
@@ -1840,10 +1955,26 @@ struct CanvasView: View {
                 model: oldNode.model ?? .ltx25Distill,
                 quality: oldNode.quality ?? .standard,
                 imageModel: oldNode.imageModel ?? .hidreamO1,
-                imageQuality: oldNode.imageQuality ?? .p720
+                imageQuality: oldNode.imageQuality ?? .p720,
+                // 引用块快照随节点一起复制，否则粘贴出来的提示词只剩文字、块全丢
+                promptRich: oldNode.promptRich,
+                promptMentionRefs: oldNode.promptMentionRefs
             )
             idMap[oldNode.id] = newNode.id
             store.nodes.append(newNode)
+        }
+        // 引用块里的 nodeID 重映射：被引用节点也在本次粘贴集合内时指向新副本（自引用随之指新节点），
+        // 集合外的保持原 nodeID（仍引用项目里那个既有节点，与原节点行为一致）
+        for newID in idMap.values {
+            guard let idx = store.nodes.firstIndex(where: { $0.id == newID }),
+                  let refs = store.nodes[idx].promptMentionRefs, !refs.isEmpty else { continue }
+            let remapped = refs.map { ref -> PromptMentionRef in
+                guard let mapped = idMap[ref.nodeID] else { return ref }
+                var copy = ref
+                copy.nodeID = mapped
+                return copy
+            }
+            if remapped != refs { store.nodes[idx].promptMentionRefs = remapped }
         }
         // 重建节点间连线（id 映射到新节点）
         for conn in data.connections {

@@ -27,6 +27,7 @@
 		5ACA61DC302EEA3E00C0EF7D /* 更新日志.txt in Resources */ = {isa = PBXBuildFile; fileRef = 5ACA61DB302EEA3E00C0EF7D /* 更新日志.txt */; };
 		5ACA61E8302EEFE700C0EF7D /* 主ui.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5ACA61E7302EEFD800C0EF7D /* 主ui.swift */; };
 		5ACA61E9302EEFE700C0EF7D /* 调试中心.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5ACA61EA302EEFE700C0EF7D /* 调试中心.swift */; };
+		5AD0765D3092D82C002C1BB1 /* h3 ref-中文.txt in Resources */ = {isa = PBXBuildFile; fileRef = 5AD0765C3092D82C002C1BB1 /* h3 ref-中文.txt */; };
 		5AD7A0A530358BF8007525F8 /* 接收逻辑.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD7A09830358BF8007525F8 /* 接收逻辑.swift */; };
 		5AD7A0A630358BF8007525F8 /* 媒体播放.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AD7A09930358BF8007525F8 /* 媒体播放.swift */; };
 /* End PBXBuildFile section */
@@ -47,6 +48,7 @@
 		5ACA61E7302EEFD800C0EF7D /* 主ui.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "主ui.swift"; sourceTree = "<group>"; };
 		5ACA61EA302EEFE700C0EF7D /* 调试中心.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "调试中心.swift"; sourceTree = "<group>"; };
 		5ACA61F5302EFBA200C0EF7D /* SKILL.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = SKILL.md; sourceTree = "<group>"; };
+		5AD0765C3092D82C002C1BB1 /* h3 ref-中文.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "h3 ref-中文.txt"; sourceTree = "<group>"; };
 		5AD7A09830358BF8007525F8 /* 接收逻辑.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "接收逻辑.swift"; sourceTree = "<group>"; };
 		5AD7A09930358BF8007525F8 /* 媒体播放.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "媒体播放.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -139,6 +141,7 @@
 			isa = PBXGroup;
 			children = (
 				5ACA61F6302EFBA200C0EF7D /* 分镜师17.1 */,
+				5AD0765C3092D82C002C1BB1 /* h3 ref-中文.txt */,
 			);
 			path = skill;
 			sourceTree = "<group>";
@@ -257,6 +260,7 @@
 				5A5E5140305E881400DF476E /* 开篇.mov in Resources */,
 				5ACA61DC302EEA3E00C0EF7D /* 更新日志.txt in Resources */,
 				5ACA61D4302EE9E400C0EF7D /* 说明.txt in Resources */,
+				5AD0765D3092D82C002C1BB1 /* h3 ref-中文.txt in Resources */,
 			);
 		};
 /* End PBXResourcesBuildPhase section */

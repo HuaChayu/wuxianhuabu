@@ -11,19 +11,36 @@ import Combine
 // MARK: - 资产模型（图片资产）
 
 enum AssetCategory: String, CaseIterable, Identifiable, Codable {
-    case character = "角色"
-    case scene = "场景"
-    case image = "图片"
+    case image_character = "角色"
+    case image_scene = "场景"
+    case image_prop = "道具"
     case video = "视频"
     case audio = "音频"
     var id: String { rawValue }
+
+    /// 旧存档兼容：「图片」已更名为「道具」，读旧资产库 JSON 时把 "图片" 映射到 .image_prop，
+    /// 其余未知值仍按原行为抛错（与自动合成 Codable 一致）。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        if let category = AssetCategory(rawValue: raw) {
+            self = category
+        } else if raw == "图片" {
+            self = .image_prop
+        } else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath,
+                      debugDescription: "未知资产分类：\(raw)")
+            )
+        }
+    }
     
     /// 分类图标（资产库 Tab / 资产管理页 Tab 共用）
     var icon: String {
         switch self {
-        case .character: return "person"
-        case .scene: return "photo.on.rectangle.angled"
-        case .image: return "photo"
+        case .image_character: return "person"
+        case .image_scene: return "photo.on.rectangle.angled"
+        case .image_prop: return "photo"
         case .video: return "video"
         case .audio: return "music.note"
         }
@@ -35,7 +52,7 @@ struct AssetItem: Identifiable {
     var name: String
     let image: NSImage
     var prompt: String
-    let category: AssetCategory
+    var category: AssetCategory
     /// 磁盘上的图片文件名（如 <id>.png），由保存逻辑写入
     var fileName: String
     /// 原始媒体文件名（视频/音频等非图片资产保留原文件；nil 表示纯图片资产）
@@ -43,7 +60,7 @@ struct AssetItem: Identifiable {
     /// 所属项目 id（nil 表示全局资产）
     var projectID: UUID? = nil
 
-    init(id: UUID = UUID(), name: String, image: NSImage, prompt: String = "", category: AssetCategory = .character, fileName: String = "", mediaFileName: String? = nil, projectID: UUID? = nil) {
+    init(id: UUID = UUID(), name: String, image: NSImage, prompt: String = "", category: AssetCategory = .image_character, fileName: String = "", mediaFileName: String? = nil, projectID: UUID? = nil) {
         self.id = id
         self.name = name
         self.image = image
@@ -93,6 +110,19 @@ final class AssetStore: ObservableObject {
         }
         guard let category = category else { return base }
         return base.filter { $0.category == category }
+    }
+
+    /// 修改资产分类（节点类型互转时同步资产库；按磁盘文件名精确匹配同源资产）
+    func setCategory(forFileName fileName: String, to category: AssetCategory) {
+        var changed = false
+        for idx in assets.indices where assets[idx].fileName == fileName {
+            guard assets[idx].category != category else { continue }
+            assets[idx].category = category
+            changed = true
+        }
+        guard changed else { return }
+        objectWillChange.send()
+        saveAssetLibraryJSON()
     }
 
     /// 重命名资产（触发 UI 刷新）

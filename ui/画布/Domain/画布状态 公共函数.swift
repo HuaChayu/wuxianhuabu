@@ -40,9 +40,9 @@ struct AssetDragData: Transferable, Codable {
 extension AssetCategory {
     var nodeType: NodeType {
         switch self {
-        case .character: return .character
-        case .scene: return .scene
-        case .image: return .image
+        case .image_character: return .image_character
+        case .image_scene: return .image_scene
+        case .image_prop: return .image_prop
         case .video: return .video
         case .audio: return .audio
         }
@@ -55,19 +55,19 @@ extension NodeType {
     /// 节点对应的资产分类（空节点上传/选资产时决定入库分类；text 无对应分类，归入图片）
     var assetCategory: AssetCategory {
         switch self {
-        case .character: return .character
-        case .scene: return .scene
-        case .image: return .image
+        case .image_character: return .image_character
+        case .image_scene: return .image_scene
+        case .image_prop: return .image_prop
         case .video: return .video
         case .audio: return .audio
-        case .text: return .image
+        case .text: return .image_prop
         }
     }
 
     /// 空节点「资产库」面板允许的资产分类：视频只显示视频、音频只显示音频、图像/角色/场景显示这 3 种；文本无资产库按钮
     var allowedAssetCategories: [AssetCategory] {
         switch self {
-        case .character, .scene, .image: return [.character, .scene, .image]
+        case .image_character, .image_scene, .image_prop: return [.image_character, .image_scene, .image_prop]
         case .video: return [.video]
         case .audio: return [.audio]
         case .text: return []
@@ -85,13 +85,37 @@ func uploadAllowedTypes(for nodeType: NodeType?) -> [UTType] {
         return [.image, .movie, .video, .audio, .mpeg4Movie, .quickTimeMovie]
     }
     switch nodeType {
-    case .character, .scene, .image, .text:
+    case .image_character, .image_scene, .image_prop, .text:
         return [.image]
     case .video:
         return [.movie, .video, .mpeg4Movie, .quickTimeMovie]
     case .audio:
         return [.audio]
     }
+}
+
+// MARK: - 图片按尺寸自动分类（外部拖入 / 导入图片时用）
+
+/// 图片按尺寸自动归类：竖图（高 > 宽）→ 角色，横图 / 方图 → 场景。
+/// 「道具」是显式类型，只能由用户手动指定，自动导入永远不会落到道具上（强迫按语义分类）。
+/// - Parameter image: 待分类图片（读 size；size 异常时退回位图像素）
+/// - Returns: .image_character（竖）/ .image_scene（横或方）
+func autoAssetCategory(for image: NSImage) -> AssetCategory {
+    var w = image.size.width
+    var h = image.size.height
+    if (w <= 0 || h <= 0), let rep = image.representations.first,
+       rep.pixelsWide > 0, rep.pixelsHigh > 0 {
+        w = CGFloat(rep.pixelsWide)
+        h = CGFloat(rep.pixelsHigh)
+    }
+    if w <= 0 || h <= 0 { return .image_scene }   // 尺寸不可知时按横图（场景）兜底
+    return h > w ? .image_character : .image_scene
+}
+
+/// 导入分类兜底：媒体分类为「道具」（即一张普通图片）时，按图片尺寸自动细分为角色 / 场景；
+/// 视频 / 音频 / 用户显式指定的角色 / 场景不受影响（不覆盖用户意图）。
+func resolvedImportCategory(_ category: AssetCategory, image: NSImage) -> AssetCategory {
+    category == .image_prop ? autoAssetCategory(for: image) : category
 }
 
 // MARK: - 上传文件分类（图片 / 视频 / 音频）
@@ -485,7 +509,7 @@ func nextAssetName(prefix: String) -> String {
 ///   - image: 必填，要导入的图片（视频/音频资产传缩略图或占位图）
 ///   - name: 可选，资产名字，默认「资产 N」
 ///   - prompt: 可选，该图片的提示词
-///   - category: 可选，分类（.character 角色 / .scene 场景 / .image 图片 / .video 视频 / .audio 音频）
+///   - category: 可选，分类（.image_character 角色 / .image_scene 场景 / .image_prop 道具 / .video 视频 / .audio 音频）
 ///   - sourceURL: 可选，原始图片文件路径；有则直接复制原文件（不重新编码，最快且无损）
 ///   - mediaSourceURL: 可选，原始媒体文件路径（视频/音频）；有则复制原文件到 资产库/<mediaFileName>
 ///   - projectID: 可选，所属项目 id（nil 表示全局资产）
@@ -500,7 +524,7 @@ func importAsset(
     image: NSImage,
     name: String? = nil,
     prompt: String = "",
-    category: AssetCategory = .character,
+    category: AssetCategory = .image_character,
     sourceURL: URL? = nil,
     mediaSourceURL: URL? = nil,
     projectID: UUID? = nil,
@@ -647,7 +671,7 @@ extension CanvasStore {
                 case .minimaxH3:
                     result = minimaxH3InputValidity(for: node)
                 }
-            case .image, .character, .scene:
+            case .image_prop, .image_character, .image_scene:
                 result = hidreamInputValidity(for: node)
             default:
                 result = InputValidity()
@@ -731,7 +755,7 @@ extension CanvasStore {
         for conn in connections where conn.toID == videoNode.id {
             guard let fromNode = nodes.first(where: { $0.id == conn.fromID }) else { continue }
             switch fromNode.type {
-            case .image, .scene, .character:
+            case .image_prop, .image_scene, .image_character:
                 if imageCount < 2 {
                     if let path = inputFilePath(for: fromNode) {
                         imageCount += 1
@@ -795,7 +819,7 @@ extension CanvasStore {
             guard let fromNode = nodes.first(where: { $0.id == conn.fromID }) else { continue }
             let totalCount = imageCandidates.count + videoCandidates.count + audioCandidates.count
             switch fromNode.type {
-            case .image, .scene, .character:
+            case .image_prop, .image_scene, .image_character:
                 if totalCount < H3Const.maxRefTotal, imageCandidates.count < H3Const.maxRefImages {
                     if let path = inputFilePath(for: fromNode) {
                         imageCandidates.append((fromNode.position.y, path))
@@ -860,7 +884,7 @@ extension CanvasStore {
         for conn in connections where conn.toID == imageNode.id {
             guard let fromNode = nodes.first(where: { $0.id == conn.fromID }) else { continue }
             switch fromNode.type {
-            case .image, .character, .scene:
+            case .image_prop, .image_character, .image_scene:
                 if imageCount < 5 {
                     if let path = inputFilePath(for: fromNode) {
                         imageCount += 1
@@ -964,7 +988,7 @@ extension CanvasStore {
     /// 来源节点媒体文件绝对路径（nil = 空节点无内容）
     private func inputFilePath(for node: CanvasNode) -> String? {
         switch node.type {
-        case .image, .scene, .character:
+        case .image_prop, .image_scene, .image_character:
             // 图片/角色/场景：纯图片资产 mediaFileName 为 nil，实际文件就是资产库里的 imageFileName
             guard let imgName = node.imageFileName, !imgName.isEmpty else { return nil }
             return assetLibraryURL.appendingPathComponent(imgName).path
@@ -973,6 +997,11 @@ extension CanvasStore {
             guard let fileName = mediaFileName(for: node) else { return nil }
             return assetLibraryURL.appendingPathComponent(fileName).path
         }
+    }
+
+    /// 节点 id → 条件图路径（供生成入口把 @ 引用块解析成条件图，口径与连线收集完全一致）
+    func referencePath(forNodeID id: UUID) -> String? {
+        nodes.first(where: { $0.id == id }).flatMap { inputFilePath(for: $0) }
     }
 }
 
@@ -1057,4 +1086,154 @@ private let tailFrameCache = NSCache<NSString, NSString>()
 /// 仅在主线程读写：读发生在 SwiftUI body / 渲染热路径（tailFrameImagePath），
 /// 写在 triggerTailFrameLoad 主线程入口与 MainActor.run 完成回调中。
 private var tailFrameInFlight = Set<String>()
+
+// ============================================================
+
+// MARK: - 引用条件图（块优先 · 不重复 · @ 等效连线）
+
+/// 条件图占号序（决定 1-based 序号分配先后）：
+/// - `.blocksFirst`：提示词里的 @ 引用块先占号（块是提示词中明确写出的主体 / 角色 / 行为，语义最强），
+///   其余本节点连线条件图按连线顺序补位；
+/// - `.wiredFirst`：连线先占号、块补位（旧档无块时的历史行为，兼容回退用）。
+enum RefPlacement {
+    case blocksFirst
+    case wiredFirst
+}
+
+/// 一个已占号的条件图引用（label 与视觉块严格配对，顺序即序号）。
+struct ResolvedRef: Equatable {
+    /// 1-based 序号（同类型内独立计数）
+    var ordinal: Int
+    /// 视觉块前置标签，如 "<Picture 2>: "
+    var label: String
+    /// 条件图源头路径（去重键）
+    var path: String
+    /// 来源块 id（纯连线来源为 nil）
+    var blockID: UUID?
+    /// 来源块指向的被引用节点 id（纯连线来源为 nil）。
+    /// 生成端判定主体类型（角色/场景/道具）只能靠它去查活节点的 node.type：
+    /// 块快照里的 kind 是历史副本，不会随右键互转 / 资产库对齐更新。
+    var nodeID: UUID?
+    /// 来源块名字（纯连线来源为 nil）——模型层据此生成主体定义段
+    var title: String?
+}
+
+/// resolveReferences 的产出：可直接喂给管线的「有序条件图 + 已渲染提示词」。
+struct RefResolution {
+    /// 最终提示词：占位符 U+FFFC 已替换为「内联引用记号（占号）」或「块名字（降级）」
+    var text: String
+    /// 有序条件图（顺序 = 序号顺序；调用方按此顺序编码视觉块并前置 label）
+    var refs: [ResolvedRef]
+    /// 占号顺序的路径（已去重，1-based 序号 = 下标 + 1）
+    var orderedPaths: [String]
+    /// 降级为纯文本的块名字（无内容 / 超限，不占号）
+    var degradedTitles: [String]
+}
+
+/// 统一解析「@ 引用块 + 连线」为一个去重的条件图序列（跨模型公共函数）。
+///
+/// 规则（2026-10-26 定稿）：
+/// 1. **块优先**：块是提示词里明确写出的主体 / 角色 / 行为，定序时先于连线；
+/// 2. **不重复**：同一路径只占一个号（块与连线指向同一张图 → 复用该号，不双份编码）；
+/// 3. **@ 等效连线**：块未连线时同样并入条件图（懒操作方式，免去手动拖线）；
+/// 4. **超限降级**：超出 limit 或块无可用资源 → 不占号，文本中退化为块名字；
+/// 5. **不继承**：只看本节点自己的块 + 本节点自己的连线，不涉及任何前置节点的条件图。
+///
+/// - Parameters:
+///   - plainPrompt: 剥掉占位符的纯文本（richPrompt 缺失时的兜底）
+///   - richPrompt: 含 U+FFFC 占位符的原文（blocks 与其按出现顺序一一对应）
+///   - blocks: 本节点提示词中的 @ 引用块快照
+///   - wiredPaths: 本节点连线收集到的条件图路径（允许重复）
+///   - limit: 条件图数量上限（超出部分降级为文本）
+///   - placement: 占号序（默认块优先）
+///   - pathForBlock: 块 → 可用资源路径（nil = 被引用节点无内容 / 已删除）
+///   - label: 序号 → 视觉块前置标签（如 "<Picture 1>: "）
+///   - inlineRef: 序号 → 提示词内联引用记号（如 "<Subject 1>"，须与 subject_definitions 段同源）
+///   - placeholder: 占位符字符（默认 U+FFFC）
+func resolveReferences(
+    plainPrompt: String,
+    richPrompt: String?,
+    blocks: [PromptMentionRef],
+    wiredPaths: [String],
+    limit: Int,
+    placement: RefPlacement = .blocksFirst,
+    pathForBlock: (PromptMentionRef) -> String?,
+    label: (Int) -> String,
+    inlineRef: (Int) -> String,
+    placeholder: Character = "\u{FFFC}"
+) -> RefResolution {
+    let cap = max(0, limit)
+    let blockPaths: [String?] = blocks.map { pathForBlock($0) }
+
+    var orderedPaths: [String] = []
+    var pathToOrdinal: [String: Int] = [:]
+    var blockOrdinal: [Int: Int] = [:]      // blocks 下标 → 序号（占号成功才有值）
+    var degraded: [String] = []
+
+    /// 同路径复用号；已满则返回 nil（交由调用方降级）
+    func occupy(_ path: String) -> Int? {
+        if let existing = pathToOrdinal[path] { return existing }
+        guard orderedPaths.count < cap else { return nil }
+        orderedPaths.append(path)
+        let ord = orderedPaths.count
+        pathToOrdinal[path] = ord
+        return ord
+    }
+    func occupyBlocks() {
+        for (i, p) in blockPaths.enumerated() {
+            guard let p else { continue }
+            if let ord = occupy(p) { blockOrdinal[i] = ord }
+        }
+    }
+    func occupyWired() {
+        for p in wiredPaths { _ = occupy(p) }
+    }
+    switch placement {
+    case .blocksFirst:
+        occupyBlocks()
+        occupyWired()
+    case .wiredFirst:
+        occupyWired()
+        occupyBlocks()
+    }
+
+    // 无资源 / 超限的块：不占号，文本退化为名字
+    for (i, blk) in blocks.enumerated() where blockOrdinal[i] == nil {
+        degraded.append(blk.title)
+    }
+
+    // 渲染提示词：占位符按块顺序逐个替换（占号 → 内联引用；降级 → 名字）
+    var text: String
+    if let rich = richPrompt, rich.contains(placeholder) {
+        var out = ""
+        out.reserveCapacity(rich.count + 16)
+        var bi = 0
+        for ch in rich {
+            if ch == placeholder {
+                if bi < blocks.count {
+                    out += blockOrdinal[bi].map { inlineRef($0) } ?? blocks[bi].title
+                }
+                bi += 1
+            } else {
+                out.append(ch)
+            }
+        }
+        text = out
+    } else {
+        text = plainPrompt
+    }
+
+    // 输出有序引用：label 与视觉块严格配对；块名字一并带出（模型层据此生成主体定义段）
+    let refs: [ResolvedRef] = orderedPaths.enumerated().map { idx, path in
+        let ord = idx + 1
+        let bi = blocks.indices.first { blockOrdinal[$0] == ord }
+        return ResolvedRef(ordinal: ord, label: label(ord), path: path,
+                           blockID: bi.map { blocks[$0].blockID },
+                           nodeID: bi.map { blocks[$0].nodeID },
+                           title: bi.map { blocks[$0].title })
+    }
+
+    return RefResolution(text: text, refs: refs,
+                         orderedPaths: orderedPaths, degradedTitles: degraded)
+}
 

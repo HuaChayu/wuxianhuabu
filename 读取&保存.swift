@@ -341,6 +341,10 @@ func loadProjectCanvas(_ project: ProjectItem, into canvas: CanvasStore) {
         return
     }
     canvas.nodes = file.nodes
+    // 类型「引用自源」：图片类节点类型以资产库分类为准，同源图在任何项目里都显示同一类型
+    // 顺带刷新块快照 kind（返回 true = 修过脏数据），落盘等所有字段复位后再做，
+    // 否则此刻 connections/offset 还是空值，save() 会把它们写坏
+    let typesRepaired = syncNodeTypesWithAssetLibrary(canvas)
     canvas.connections = file.connections
     canvas.offset = file.offset
     canvas.zoom = file.zoom
@@ -348,6 +352,8 @@ func loadProjectCanvas(_ project: ProjectItem, into canvas: CanvasStore) {
         canvas.currentRatio = ratio
     }
     canvas.continuousVideoMode = file.continuousVideoMode ?? true
+    // 字段全部复位后，才把"类型/块快照修复"落盘（一次写，避免先写坏再写回）
+    if typesRepaired { canvas.save() }
     debugLog("加载项目画布：\(project.title)（节点\(file.nodes.count) 连线\(file.connections.count)）")
 }
 
@@ -362,6 +368,110 @@ func loadProjectNodes(projectID: UUID) -> [CanvasNode] {
         return []
     }
     return file.nodes
+}
+
+// MARK: - 图片类节点类型以资产库为准（类型「引用自源」，不在各项目里各存一份快照）
+
+/// 资产分类 → 图片类节点类型；非图片资产（视频/音频）返回 nil（不参与对齐）
+func imageNodeType(forAssetCategory category: AssetCategory) -> NodeType? {
+    switch category {
+    case .image_character: return .image_character
+    case .image_scene: return .image_scene
+    case .image_prop: return .image_prop
+    case .video, .audio: return nil
+    }
+}
+
+/// 按磁盘文件名在资产库里找对应图片类节点类型（找不到资产 / 非图片资产返回 nil）
+func imageNodeType(forAssetFileName fileName: String) -> NodeType? {
+    guard let asset = AssetStore.shared.assets.first(where: { $0.fileName == fileName }) else { return nil }
+    return imageNodeType(forAssetCategory: asset.category)
+}
+
+/// 把画布里的图片类节点按资产库分类对齐（引用资产的节点，类型跟着源走）。
+/// - Returns: 是否发生过改动（调用方决定要不要重绘 / 落盘）
+@discardableResult
+func syncNodeTypesWithAssetLibrary(_ canvas: CanvasStore) -> Bool {
+    var changed = false
+    // 图片类节点一律按资产库取权威类型（不只是"不一致"的节点）：
+    // 类型已一致但块快照 kind 仍是旧值的存档也要能被修，这类脏数据在生成端曾导致全是「道具」
+    var idsByType: [NodeType: Set<UUID>] = [:]
+    for idx in canvas.nodes.indices {
+        guard imageNodeTypes.contains(canvas.nodes[idx].type),
+              let fileName = canvas.nodes[idx].imageFileName,
+              let type = imageNodeType(forAssetFileName: fileName) else { continue }
+        idsByType[type, default: []].insert(canvas.nodes[idx].id)
+        guard type != canvas.nodes[idx].type else { continue }
+        canvas.nodes[idx].type = type
+        changed = true
+        debugLog("类型对齐资产库：「\(canvas.nodes[idx].title)」→ \(type.rawValue)")
+    }
+    // 块快照 kind 跟着图走，否则打开旧项目后块里仍是转换前的类型
+    for (type, ids) in idsByType {
+        if refreshMentionRefKinds(&canvas.nodes, nodeIDs: ids, to: type) {
+            changed = true
+        }
+    }
+    return changed
+}
+
+/// 块快照里的类型（PromptMentionRef.kind）跟着图走。
+/// 类型唯一真相是图片类节点的 node.type（右键互转 / 打开项目对齐资产库 / 跨项目同步都只改它），
+/// 块快照不会自动跟随；这里把「指向指定节点集合」的块快照 kind 一并刷新，避免落盘脏数据
+/// （生成端已改为实时读 node.type，快照只作节点删除后的兜底，但脏快照会误导排查）。
+/// - Parameter nodeIDs: 已变更类型的节点 id 集合（同一张图在项目内的全部节点）
+/// - Returns: 是否有块快照被改写
+@discardableResult
+func refreshMentionRefKinds(_ nodes: inout [CanvasNode], nodeIDs: Set<UUID>, to newType: NodeType) -> Bool {
+    guard !nodeIDs.isEmpty else { return false }
+    var changed = false
+    for i in nodes.indices {
+        guard var refs = nodes[i].promptMentionRefs, !refs.isEmpty else { continue }
+        var touched = false
+        for j in refs.indices where nodeIDs.contains(refs[j].nodeID) && refs[j].kind != newType {
+            refs[j].kind = newType
+            touched = true
+        }
+        if touched {
+            nodes[i].promptMentionRefs = refs
+            changed = true
+        }
+    }
+    return changed
+}
+
+/// 把某张图的类型变更同步到其它项目文件（类型属于「图」本身，不属于某个项目的节点快照）。
+/// 直接改写各项目 project.json 里引用该图片的图片类节点；当前项目由调用方改内存后自行 save。
+/// - Parameter excludingProjectID: 跳过该项目（通常是当前项目，已单独处理）
+func syncImageNodeTypesAcrossProjects(fileName: String, to newType: NodeType, excludingProjectID: UUID?) {
+    let fm = FileManager.default
+    guard let dirs = try? fm.contentsOfDirectory(at: projectsURL, includingPropertiesForKeys: nil) else { return }
+    for dir in dirs where dir.pathExtension == "canvas" {
+        let jsonURL = dir.appendingPathComponent("project.json")
+        guard let data = try? Data(contentsOf: jsonURL),
+              var file = decodeJSONFile(ProjectFile.self, from: data) else { continue }
+        if let excludingProjectID, file.id == excludingProjectID { continue }
+        var changed = false
+        // 先收集该项目里引用这张图的节点 id（跨项目 nodeID 不通用，只能按 imageFileName 反查）
+        // 注意：type 已是 newType 的节点也要收进来——它的块快照可能仍是旧类型
+        var affectedIDs: Set<UUID> = []
+        for idx in file.nodes.indices {
+            guard imageNodeTypes.contains(file.nodes[idx].type),
+                  file.nodes[idx].imageFileName == fileName else { continue }
+            affectedIDs.insert(file.nodes[idx].id)
+            if file.nodes[idx].type != newType {
+                file.nodes[idx].type = newType
+                changed = true
+            }
+        }
+        // 该项目里指向这些节点的块快照 kind 一并刷新（否则该项目打开后快照仍是旧类型）
+        if refreshMentionRefKinds(&file.nodes, nodeIDs: affectedIDs, to: newType) {
+            changed = true
+        }
+        guard changed, let out = encodeJSONFile(file) else { continue }
+        try? out.write(to: jsonURL)
+        debugLog("类型跨项目同步：项目「\(file.title)」中引用 \(fileName) 的节点 → \(newType.rawValue)")
+    }
 }
 
 /// Write metadata into 资产库/资产库.json (small, fast).

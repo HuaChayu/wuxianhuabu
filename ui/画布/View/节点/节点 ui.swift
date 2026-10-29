@@ -79,6 +79,10 @@ struct NodeView: View {
         if node.type == .video, node.imageFileName != nil {
             return videoNodeSize(imageFileName: node.imageFileName).width
         }
+        // 图片类（角色/场景/道具）：长边统一 240，宽度随素材比例（横图 240 / 竖图按比例收窄），与类型无关
+        if imageNodeTypes.contains(node.type) {
+            return imageNodeDisplaySize(type: node.type, imageFileName: node.imageFileName).width
+        }
         return nodeWidthForType(node.type)
     }
     // 占位区高度（有图片按图片比例自适应 = 节点宽 * 图高/图宽；空节点按映射表比例，与命中侧共用）
@@ -798,7 +802,8 @@ struct NodePromptBar: View {
                     isMentionPanelActive: showMentionPanel,
                     onMentionKeyCommand: handleMentionKeyCommand,
                     placeholder: nodePromptPlaceholder(for: node.type),
-                    fontSize: 14
+                    fontSize: 14,
+                    mentionCatalogProvider: { mentionCatalog }
                 )
                 .popover(isPresented: $showMentionPanel) {
                     PromptMentionPickPanel(
@@ -917,7 +922,7 @@ struct NodePromptBar: View {
                 
                 // 比例下拉：视频/图像/角色/场景节点通用（nil 时跟随全局比例；与画布右上角一致）
                 // 编辑模式（hasValidImageInput 为 true）比例由参考图决定，禁用比例下拉（含视频 I2V 首帧）
-                if node.type == .video || node.type == .image || node.type == .character || node.type == .scene {
+                if node.type == .video || node.type == .image_prop || node.type == .image_character || node.type == .image_scene {
                     compactMenu(
                         items: CanvasStore.Ratio.allCases,
                         isSelected: { node.ratio == $0 },
@@ -1332,7 +1337,8 @@ struct ExpandedNodePromptView: View {
                     onMentionKeyCommand: handleMentionKeyCommand,
                     placeholder: nodePromptPlaceholder(for: node.type),
                     fontSize: 16,
-                    minHeight: 26
+                    minHeight: 26,
+                    mentionCatalogProvider: { mentionCatalog }
                 )
                 .popover(isPresented: $showMentionPanel) {
                     PromptMentionPickPanel(
@@ -1435,7 +1441,7 @@ struct ExpandedNodePromptView: View {
                     
                     // 比例下拉：视频/图像/角色/场景节点通用（nil 时跟随全局比例）
                     // 编辑模式（hasValidImageInput 为 true）比例由参考图决定，禁用比例下拉（含视频 I2V 首帧）
-                    if node.type == .video || node.type == .image || node.type == .character || node.type == .scene {
+                    if node.type == .video || node.type == .image_prop || node.type == .image_character || node.type == .image_scene {
                         compactMenu(
                             items: CanvasStore.Ratio.allCases,
                             isSelected: { node.ratio == $0 },
@@ -1832,6 +1838,17 @@ enum PromptMentionChipImage {
     }
 }
 
+/// 输入框内部复制粘贴用的富文本切片：文字（含 U+FFFC 占位符）+ 每个占位符对应的引用块快照。
+/// 系统默认的 RTF 序列化写不出「无文件包装」的块贴图，粘贴后块会变成空白，所以块信息单独随片走。
+struct PromptMentionClipboardSlice: Codable {
+    static let pasteboardType = NSPasteboard.PasteboardType("com.huachayui.canvas.promptmention")
+
+    /// 选中区间的原文（占位符个数与 mentions 顺序一一对应）
+    var text: String
+    /// 按出现顺序排列的块快照
+    var mentions: [PromptMentionRef]
+}
+
 /// 高度随内容自适应的 NSTextView：块与文字同行混排、块后继续输入都靠它（SwiftUI TextField 无法渲染行内附件）
 final class InlineMentionNSTextView: NSTextView {
     var minimumHeight: CGFloat = 22
@@ -1857,6 +1874,49 @@ final class InlineMentionNSTextView: NSTextView {
     override func didChangeText() {
         super.didChangeText()
         invalidateIntrinsicContentSize()
+    }
+
+    /// 复制钩子：选区 → 切片（文字 + 块快照）；nil = 交给系统默认复制
+    var copySliceProvider: ((NSRange) -> PromptMentionClipboardSlice?)?
+    /// 粘贴钩子：返回 true = 已处理（含引用块）；false = 交给系统默认粘贴
+    var pasteSliceHandler: ((PromptMentionClipboardSlice) -> Bool)?
+
+    /// 复制：选区里有引用块时自己写剪贴板（纯文本 + 自定义类型的块快照）。
+    /// 默认实现走 RTF 序列化，PromptMentionAttachment 没有 fileWrapper，块会被丢成空白。
+    override func copy(_ sender: Any?) {
+        let range = selectedRange()
+        if range.length > 0,
+           let slice = copySliceProvider?(range),
+           !slice.mentions.isEmpty {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            let item = NSPasteboardItem()
+            item.setString(slice.text, forType: .string)
+            if let data = try? JSONEncoder().encode(slice) {
+                item.setData(data, forType: PromptMentionClipboardSlice.pasteboardType)
+            }
+            pb.writeObjects([item])
+            return
+        }
+        super.copy(sender)
+    }
+
+    /// 剪切：与 copy 走同一套块快照（系统默认剪切的块同样会丢），再删掉选区
+    override func cut(_ sender: Any?) {
+        copy(sender)
+        let range = selectedRange()
+        guard range.length > 0 else { return }
+        insertText("", replacementRange: range)
+    }
+
+    /// 粘贴：剪贴板带块快照时按快照重建块（块实例 id 重新生成，同一节点可粘多个块），否则走系统默认
+    override func paste(_ sender: Any?) {
+        if let data = NSPasteboard.general.data(forType: PromptMentionClipboardSlice.pasteboardType),
+           let slice = try? JSONDecoder().decode(PromptMentionClipboardSlice.self, from: data),
+           pasteSliceHandler?(slice) == true {
+            return
+        }
+        super.paste(sender)
     }
 
     /// 按给定宽度算出的高度（宽度为 nil 时用当前 textContainer 宽度）
@@ -1922,6 +1982,8 @@ struct InlineMentionTextView: NSViewRepresentable {
     var placeholder: String
     var fontSize: CGFloat = 14
     var minHeight: CGFloat = 22
+    /// 提及候选目录（粘贴引用块时按 nodeID 现取名字/类型/缩略图，节点已删则退回快照）
+    var mentionCatalogProvider: (() -> PromptMentionCatalog)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -1946,6 +2008,15 @@ struct InlineMentionTextView: NSViewRepresentable {
         textView.insertionPointColor = .labelColor
         textView.placeholderString = placeholder
         textView.minimumHeight = minHeight
+        // 输入框内部复制粘贴：块跟文字一起走（系统默认 RTF 丢块）
+        textView.copySliceProvider = { [weak coordinator = context.coordinator, weak textView] range in
+            guard let coordinator, let textView else { return nil }
+            return coordinator.clipboardSlice(from: range, in: textView)
+        }
+        textView.pasteSliceHandler = { [weak coordinator = context.coordinator, weak textView] slice in
+            guard let coordinator, let textView else { return false }
+            return coordinator.paste(slice, into: textView)
+        }
         context.coordinator.rebuild(textView, text: text, mentions: mentions)
         return textView
     }
@@ -2115,6 +2186,10 @@ struct InlineMentionTextView: NSViewRepresentable {
             var map = insertedStore
             for mention in parent.mentions { map[mention.id] = mention }
             let resolved = ids.compactMap { map[$0] }
+            // 当前 textStorage 就是「已渲染态」：同步记下块 id 序列，
+            // 否则绑定回写后 updateNSView 会判定「渲染的块 ≠ 绑定里的块」→ 再全量 rebuild 一次，
+            // 表现为粘贴 / 删块后文字先整体前移一下、光标跳一下再恢复（多一次无谓重排）
+            renderedMentionIDs = ids
             isDirty = true
             DispatchQueue.main.async {
                 self.parent.text = snapshot
@@ -2124,6 +2199,64 @@ struct InlineMentionTextView: NSViewRepresentable {
                 self.isDirty = false
             }
             textView.invalidateIntrinsicContentSize()
+        }
+
+        // MARK: - 输入框内部复制粘贴（引用块跟随文字一起复制）
+
+        /// 选区 → 剪贴板切片：原文原样 + 每个 U+FFFC 对应的块快照（按出现顺序）
+        func clipboardSlice(from range: NSRange, in textView: NSTextView) -> PromptMentionClipboardSlice? {
+            guard let storage = textView.textStorage,
+                  range.length > 0,
+                  range.location >= 0,
+                  range.location + range.length <= storage.length else { return nil }
+            let slice = storage.attributedSubstring(from: range)
+            var refs: [PromptMentionRef] = []
+            slice.enumerateAttribute(.attachment, in: NSRange(location: 0, length: slice.length)) { value, _, _ in
+                guard let attachment = value as? PromptMentionAttachment else { return }
+                let mention = attachment.mention
+                refs.append(PromptMentionRef(blockID: mention.id, nodeID: mention.nodeID,
+                                            title: mention.title, kind: mention.kind))
+            }
+            return PromptMentionClipboardSlice(text: slice.string, mentions: refs)
+        }
+
+        /// 切片 → 光标处富文本：块按快照重建（块 id 重新生成），名字/缩略图以当前节点为准
+        func paste(_ slice: PromptMentionClipboardSlice, into textView: NSTextView) -> Bool {
+            guard !slice.text.isEmpty else { return false }
+            let font = textView.font ?? NSFont.systemFont(ofSize: 14)
+            var attributes = textView.typingAttributes
+            if attributes[.font] == nil { attributes[.font] = font }
+            if attributes[.foregroundColor] == nil { attributes[.foregroundColor] = NSColor.labelColor }
+            let attributed = NSMutableAttributedString(string: slice.text, attributes: attributes)
+            var cursor = 0
+            for ref in slice.mentions {
+                let ns = attributed.string as NSString
+                guard cursor <= ns.length else { break }
+                let found = ns.range(of: PromptMentionToken.placeholder, options: [],
+                                     range: NSRange(location: cursor, length: ns.length - cursor))
+                guard found.location != NSNotFound else { break }
+                // 当前项目里同名节点仍在 → 用它的名字/类型/缩略图；已删除则退回快照
+                let catalog = parent.mentionCatalogProvider?() ?? .empty
+                let candidate = (catalog.upstream + catalog.all).first { $0.id == ref.nodeID }
+                let mention = PromptMention(
+                    id: UUID(),
+                    nodeID: ref.nodeID,
+                    title: candidate?.title ?? ref.title,
+                    kind: candidate?.kind ?? ref.kind,
+                    image: candidate?.image
+                )
+                // 登记到 insertedStore：textDidChange 靠它把附件还原成提到的节点，漏登记块会被当成孤立占位符丢掉
+                insertedStore[mention.id] = mention
+                attributed.replaceCharacters(
+                    in: found,
+                    with: NSAttributedString(attachment: PromptMentionAttachment(mention: mention,
+                                                                                fontSize: font.pointSize))
+                )
+                cursor = found.location + 1
+            }
+            isDirty = true
+            textView.insertText(attributed, replacementRange: textView.selectedRange())
+            return true
         }
 
         /// 扫描文本中的附件，按出现顺序返回被引用节点 id
@@ -2775,10 +2908,10 @@ extension NodeType {
     /// 前置条件缩略图底部色带颜色（按节点类型区分，仅视觉标识，不影响生成）
     var thumbnailAccent: Color {
         switch self {
-        case .character: return Color(red: 0.93, green: 0.45, blue: 0.60)
-        case .scene: return Color(red: 0.25, green: 0.70, blue: 0.72)
+        case .image_character: return Color(red: 0.93, green: 0.45, blue: 0.60)
+        case .image_scene: return Color(red: 0.25, green: 0.70, blue: 0.72)
         case .text: return Color(red: 0.30, green: 0.72, blue: 0.52)
-        case .image: return Color(red: 0.29, green: 0.56, blue: 0.89)
+        case .image_prop: return Color(red: 0.29, green: 0.56, blue: 0.89)
         case .video: return Color(red: 0.56, green: 0.37, blue: 0.88)
         case .audio: return Color(red: 0.92, green: 0.62, blue: 0.27)
         }

@@ -18,7 +18,7 @@
 //      image:    NSImage,                    // 必填：要导入的图片
 //      name:     String? = nil,              // 可选：资产名字，默认「资产 N」
 //      prompt:   String  = "",               // 可选：该图片的提示词
-//      category: AssetCategory = .character  // 可选：.character 角色 / .scene 场景
+//      category: AssetCategory = .image_character  // 可选：.image_character 角色 / .image_scene 场景 / .image_prop 道具
 //  )
 //
 //  示例：
@@ -26,7 +26,7 @@
 //      importAsset(image: img,
 //                  name: "主角",
 //                  prompt: "赛博朋克风格，霓虹灯光",
-//                  category: .character)
+//                  category: .image_character)
 //
 //  导入后自动出现在「资产管理」页对应分类下，可在右侧「属性管理」面板
 //  点击名字改名、编辑提示词。
@@ -102,7 +102,7 @@ struct AssetManagementView: View {
     @ObservedObject private var settings = AppSettings.shared
     /// 媒体播放管理（观察播放状态刷新播放按钮；资产格子/属性预览共用）
     @ObservedObject private var playerManager = MediaPlayerManager.shared
-    @State private var assetCategory: AssetCategory = .character
+    @State private var assetCategory: AssetCategory = .image_character
     @State private var showImageImporter = false
     /// 导入按钮悬停态（仅用于动效，不影响逻辑）
     @State private var isImportHovered = false
@@ -628,7 +628,7 @@ struct AssetManagementView: View {
         switch category {
         case .video: rowCount = 11
         case .audio: rowCount = 9
-        case .image, .character, .scene: rowCount = 6
+        case .image_prop, .image_character, .image_scene: rowCount = 6
         }
         return CGFloat(rowCount) * rowHeight
     }
@@ -962,7 +962,8 @@ struct AssetManagementView: View {
             return .audio
         }
         if ["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "heif", "tiff", "tif", "svg", "icns"].contains(ext) {
-            return .image
+            // 图片先落「道具」基类，随后由 resolvedImportCategory 按尺寸细分为角色 / 场景
+            return .image_prop
         }
         return nil
     }
@@ -978,7 +979,7 @@ struct AssetManagementView: View {
                 var importedCategory: AssetCategory?
                 var skippedCount = 0
                 for url in urls {
-                    guard let category = importCategory(for: url) else {
+                    guard let baseCategory = importCategory(for: url) else {
                         skippedCount += 1
                         debugLog("资产管理：跳过非素材文件 \(url.lastPathComponent)")
                         continue
@@ -990,7 +991,9 @@ struct AssetManagementView: View {
                         debugLog("资产管理：跳过无法解析的文件 \(url.lastPathComponent)")
                         continue
                     }
-                    let isImage = category == .image
+                    // 普通图片按尺寸自动细分：竖图 → 角色，横图/方图 → 场景
+                    let category = resolvedImportCategory(baseCategory, image: thumb)
+                    let isImage = fileKind(of: url) == .image
                     importAsset(
                         image: thumb,
                         name: url.deletingPathExtension().lastPathComponent,

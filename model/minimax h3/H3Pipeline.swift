@@ -543,10 +543,17 @@ public enum H3FL2VAPipeline {
             throw NSError(domain: "H3FL2VA", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "tokenizer 加载失败"])
         }
+        // ★ 2026-10-27：把「真正送去编码的提示词」逐行原样落日志。
+        //   目的：任何一次生成都能在 pipeline.log 里看到完整文本（含段标题、<Subject n>、
+        //   <d> 标签、说话人 (Sx)），用于核对是否有漏段/漏标签，而不是靠公式反推。
+        log("最终提示词全文（\(prompt.count) 字符 / \(prompt.components(separatedBy: "\n").count) 行）：")
+        for (i, line) in prompt.components(separatedBy: "\n").enumerated() {
+            log("  P\(String(format: "%02d", i + 1))| \(line)")
+        }
         var promptIds = tokenizer.encode(text: prompt, addSpecialTokens: false).map { Int32($0) }
         // ★ 续接标记命令（2026-10-03）：本次为 .h3cc 尾帧链式续接（continuationSource 非 nil）时，
         //   在命令拼接序列（prompt 文本条件）最前面额外拼接续接标记命令，让模型知道这是
-        //   「把上一段接下去」而非新生成；风格与现有命令（如 "no subtitles"）一致：简短英文标记，
+        //   「把上一段接下去」而非新生成；简短英文标记，
         //   经 tokenizer 编码为独立文本条件 token，不破坏既有拼接逻辑与续接语义（从头生成时零变化）。
         if continuationSource != nil {
             // ★ 通用续接提示词前缀（2026-10-03 修订 v3）：续接 = 同一镜头内的因果连续，不是
@@ -563,9 +570,6 @@ public enum H3FL2VAPipeline {
         }
         var presentItems: [H3PresentItem] = []
         var textTagsForLayout: [UInt8] = []
-        // 无字幕抑制条件：简短标准写法，避免长句误伤画面内容（如广告牌/文字元素）。
-        // 作为条件 token 注入文本序列末尾（与首尾帧标签同机制），默认开启，设 NA_H3_NO_SUBTITLES=0 关闭。
-        let noSubtitleOn = (ProcessInfo.processInfo.environment["NA_H3_NO_SUBTITLES"].flatMap { $0 == "1" } ?? true)
         if !refVisionBlocks.isEmpty {
             // ★ 2026-10-04 重构：fl/ref 统一——首尾帧软参考也生成视觉块；
             //   对齐官方 build_ref2va_presentation：逐张 `<Picture i>: ` + vision block，prompt 收尾
@@ -575,21 +579,9 @@ public enum H3FL2VAPipeline {
                 presentItems.append(.vision(vb))
             }
             presentItems.append(.text(promptIds))
-            if noSubtitleOn {
-                let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
-                presentItems.append(.text(suppressIds))
-                log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
-            } else {
-                log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
-            }
+            log("参考图文本序列：\(refVisionBlocks.count) 个视觉块 + prompt \(promptIds.count) tokens；标签：\(refVisionLabels.joined(separator: " | "))")
         } else {
-            if noSubtitleOn {
-                let suppressIds = tokenizer.encode(text: "no subtitles", addSpecialTokens: false).map { Int32($0) }
-                presentItems = [.text(promptIds), .text(suppressIds)]
-                log("prompt 编码：\(promptIds.count) tokens + 无字幕抑制 \(suppressIds.count) tokens")
-            } else {
-                presentItems = [.text(promptIds)]
-            }
+            presentItems = [.text(promptIds)]
         }
         log("prompt 编码：\(promptIds.count) tokens")
 
@@ -692,6 +684,13 @@ public enum H3FL2VAPipeline {
         var keptPreRefHs: [UInt32] = []
         var keptPreRefWs: [UInt32] = []
         var contRefBlocks: [RefBlock] = []          // 续接前置参考块（layout 按各自网格重建 .refImg 段）
+        // ★ 2026-10-26 条件图不继承（用户最终决策）：每个视频节点只用自己的「连线条件图 + @ 引用条件图」，
+        //   前置 .h3cc 不再继承参考图条件行（modes==1 refImg 段）与 keyframe 条件段（modes==0 cond 段）。
+        //   仅保留「画面接续本体」：尾段 latent 窗口 / 末帧像素锚点 / history 时间轴注入 / 音频行。
+        //   条件图定序规则（本节点内）：块（@ 引用块，提示词里明确主体角色行为，不重复）优先，
+        //   其余 @ 引用等效于连线并入条件图；块未重复占号由 resolveReferences 统一保证。
+        //   回退旧行为（继承前置条件图）时设环境变量 NA_H3_INHERIT_REFS=1。
+        let inheritPreRefs = (ProcessInfo.processInfo.environment["NA_H3_INHERIT_REFS"].flatMap { Int($0) } ?? 0) > 0
         if let cont = continuationSource {
             // fpOK 指纹（2026-09-21）：steps 不参与校验——步数为偏好滑杆动态值，
             // 缓存落盘后用户改动会导致误判失效、回退从头；与 H3ContinuationCache.load
@@ -704,7 +703,7 @@ public enum H3FL2VAPipeline {
                 && cont.header.frameCount == frameCount
                 // v3（2026-09-20）：refCount 不再作严格匹配项——上游多参考、下游仅尾帧图
                 // 时客观不等，硬约束导致续接失败回退从头（风格漂移）。差异仅告警观察。
-            if cont.header.refCount != referenceImagePaths.count {
+            if inheritPreRefs && cont.header.refCount != referenceImagePaths.count {
                 log("⚠️ 续接 refCount 差异：上游 \(cont.header.refCount) vs 本节点 \(referenceImagePaths.count)（不再阻断，仅告警）")
             }
             let geoOK =
@@ -845,7 +844,10 @@ public enum H3FL2VAPipeline {
                         var cursor = 0
                         for (i, (rid, span)) in zip(cont.header.condIDs, cont.header.condRowSpans).enumerated() {
                             let seg = preFull[cursor ..< (cursor + span), 0 ..< vp]
-                            if ownCondIDs.contains(rid) {
+                            if !inheritPreRefs {
+                                // 条件图不继承：前置条件段一律不收集（仅推进 cursor），尾段 latent 续接不受影响
+                                skipped += 1
+                            } else if ownCondIDs.contains(rid) {
                                 skipped += 1
                             } else if metaOK && modes![i] == 1 {
                                 // refImg 段：保留行 + 重建参考块（配参考图自身网格，修位置编码错位）
@@ -864,7 +866,9 @@ public enum H3FL2VAPipeline {
                         if kept.isEmpty && keptRefRows.isEmpty {
                             continuationCondRows = nil
                             continuationRefRows = nil
-                            log("★ 续接前置条件行 \(rows) 行全部与自身重复（跳过 \(skipped) 个同 id 资源），不注入前置条件")
+                            log(inheritPreRefs
+                                ? "★ 续接前置条件行 \(rows) 行全部与自身重复（跳过 \(skipped) 个同 id 资源），不注入前置条件"
+                                : "★ 条件图不继承：跳过前置 \(rows) 行条件段（本节点仅用自己的连线/@ 条件图；尾段 latent 续接照常）")
                         } else {
                             if kept.isEmpty {
                                 continuationCondRows = nil
@@ -880,6 +884,11 @@ public enum H3FL2VAPipeline {
                             }
                             log("★ 续接前置条件行：cond 段 \(continuationCondRows?.shape ?? [])（\(kept.count) 段）+ refImg 段 \(continuationRefRows?.shape ?? [])（\(keptRefRows.count) 段），跳过 \(skipped) 个同 id 资源")
                         }
+                    } else if !inheritPreRefs {
+                        // ★ 2026-10-26 条件图不继承：旧版缓存无资源元数据时也不再全量注入前置条件行
+                        continuationCondRows = nil
+                        continuationRefRows = nil
+                        log("★ 条件图不继承：缓存无资源元数据，跳过前置 \(rows) 行条件段（本节点仅用自己的连线/@ 条件图）")
                     } else {
                         continuationCondRows = preFull
                         MLX.eval(continuationCondRows)

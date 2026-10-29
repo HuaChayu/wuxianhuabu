@@ -18,7 +18,7 @@ func assetCategory(for url: URL) -> AssetCategory {
     switch fileKind(of: url) {
     case .video: return .video
     case .audio: return .audio
-    case .image: return .image
+    case .image: return .image_prop
     }
 }
 
@@ -32,8 +32,10 @@ func receiveDroppedMedia(urls: [URL], store: CanvasStore?, nodePosition: CGPoint
     var index = 0
     for url in urls {
         guard let thumb = await thumbnailImage(for: url) else { continue }
-        let category = assetCategory(for: url)
-        let isImage = category == .image
+        // 普通图片（道具基类）按尺寸自动细分：竖图 → 角色，横图/方图 → 场景
+        let category = resolvedImportCategory(assetCategory(for: url), image: thumb)
+        // 用文件媒体类型判断是否图片（不能用 category 判断：图片已被自动细分到角色/场景）
+        let isImage = fileKind(of: url) == .image
         // 画布区域：节点在落点基础上斜向错开，避免重叠
         var pos: CGPoint? = nil
         if let nodePosition = nodePosition {

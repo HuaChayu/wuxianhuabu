@@ -30,9 +30,9 @@ struct NodeSizeSpec {
 let nodeSizeSpecs: [NodeType: NodeSizeSpec] = [
     // 视频节点整体放大（空/有内容统一走本映射表：nodeWidthForType / placeholderHeightForType 共用，渲染与命中永远一致）
     .video:     NodeSizeSpec(x: 16, y: 9, scale: 1.35),
-    .scene:     NodeSizeSpec(x: 16, y: 9),
-    .image:     NodeSizeSpec(x: 16, y: 9),
-    .character: NodeSizeSpec(x: 4, y: 5),
+    .image_scene:     NodeSizeSpec(x: 16, y: 9),
+    .image_prop:      NodeSizeSpec(x: 16, y: 9),
+    .image_character: NodeSizeSpec(x: 4, y: 5),
     .audio:     NodeSizeSpec(x: 16, y: 9, scale: 0.8),
     .text:      NodeSizeSpec(x: 16, y: 9, scale: 0.8),
 ]
@@ -70,13 +70,14 @@ func groupPortBallCenter(rect: CGRect, side: ConnectSide, zoom: Double) -> CGPoi
 
 // MARK: - 空节点占位区按钮区域（唯一入口）
 
-/// 空节点占位区高度（映射表比例；渲染侧 NodeView.placeholderHeight 与命中侧 hitTestEmptyNodeButton 共用，保证两处永远一致）
+/// 空节点占位区高度（渲染侧 NodeView.placeholderHeight 与命中侧 hitTestEmptyNodeButton 共用，保证两处永远一致）
+/// 图片类走长边统一算法（imageNodeDisplaySize，长边 240）；其余按「节点宽度 × 映射表高宽比」推导
 func emptyPlaceholderHeight(for type: NodeType) -> CGFloat {
+    if imageNodeTypes.contains(type) {
+        return imageNodeDisplaySize(type: type, imageFileName: nil).height
+    }
     let spec = nodeSizeSpecs[type] ?? NodeSizeSpec(x: 16, y: 9)
-    let raw = spec.x >= spec.y
-        ? nodeBaseWidth * spec.scale * spec.y / spec.x
-        : nodeBaseWidth * spec.scale
-    return roundedToGrid(raw)
+    return roundedToGrid(nodeWidthForType(type) * spec.y / spec.x)
 }
 
 /// 空节点占位区布局常量（渲染侧 VStack 与命中侧 emptyNodeButtonRect 共用，保证两处永远一致）
@@ -141,9 +142,15 @@ func historyBadgeCenterOffset(for size: CGSize, type: NodeType, imageFileName: S
     let topLabelH: CGFloat = type.topLabel.isEmpty ? 0 : nodeTopLabelHeight
     let ph = placeholderHeightForType(type, imageFileName: imageFileName)
     let centerY = topLabelH + ph / 2 - size.height / 2
-    let contentW: CGFloat = (type == .video && imageFileName != nil)
-        ? videoNodeSize(imageFileName: imageFileName).width
-        : nodeWidthForType(type)
+    let contentW: CGFloat
+    if type == .video, imageFileName != nil {
+        contentW = videoNodeSize(imageFileName: imageFileName).width
+    } else if imageNodeTypes.contains(type) {
+        // 图片类宽度随素材比例变化（长边 240），不能用映射表基准宽，否则徽章命中区错位
+        contentW = imageNodeDisplaySize(type: type, imageFileName: imageFileName).width
+    } else {
+        contentW = nodeWidthForType(type)
+    }
     let x = contentW / 2 - historyBadgePadding - historyBadgeSize / 2
     let y = centerY + ph / 2 - historyBadgePadding - historyBadgeSize / 2
     return CGPoint(x: x, y: y)
@@ -181,19 +188,53 @@ func videoNodeSize(imageFileName: String?) -> CGSize {
     return CGSize(width: width, height: width * 9 / 16)   // 空视频节点按 16:9
 }
 
-/// 节点展示尺寸统一入口（视频有图片 = 长边统一算法；其余走原映射表/图片比例逻辑）
+/// 图片类节点统一长边（角色 / 场景 / 道具同口径：横图竖图长边都等于该值，短边按素材真实比例推导）
+/// 作用：横竖素材的节点「面积/体量」一致，且尺寸与具体类型无关 → 右键互转零缩放。
+/// 想整体放大/缩小图片节点，只改这一个数（视频节点见 videoNodeLongSide）
+let imageNodeLongSide: CGFloat = 240
+
+/// 图片类节点（角色 / 场景 / 道具）展示尺寸唯一入口：长边统一 = imageNodeLongSide，短边按素材真实比例推导
+/// 无图片（空节点）时按类型映射表比例推导（角色 4:5 竖卡、场景/道具 16:9 横卡），长边同样取 imageNodeLongSide
+/// 渲染侧 NodeView / 命中侧 / 兜底估算共用，保证三处永远一致
+func imageNodeDisplaySize(type: NodeType, imageFileName: String?) -> CGSize {
+    let long = roundedToGrid(imageNodeLongSide)
+    if let fileName = imageFileName,
+       let img = cachedAssetImage(for: fileName) {
+        let w = img.size.width
+        let h = img.size.height
+        if w > 0, h > 0 {
+            // 长边取 40 网格整数，短边精确跟随真实比例（fit 恰好铺满，不裁不留白）
+            return w >= h
+                ? CGSize(width: long, height: long * h / w)   // 横图 / 方图：宽为长边
+                : CGSize(width: long * w / h, height: long)   // 竖图：高为长边
+        }
+    }
+    let spec = nodeSizeSpecs[type] ?? NodeSizeSpec(x: 16, y: 9)
+    return spec.x >= spec.y
+        ? CGSize(width: long, height: long * spec.y / spec.x)
+        : CGSize(width: long * spec.x / spec.y, height: long)
+}
+
+/// 节点展示尺寸统一入口（视频有图片 = 长边统一算法；图片类 = 长边统一算法；其余走映射表/图片比例逻辑）
 /// 渲染侧 NodeView / 命中侧 / 兜底估算共用，保证三处永远一致
 func nodeDisplaySize(for node: CanvasNode) -> CGSize {
     if node.type == .video, node.imageFileName != nil {
         return videoNodeSize(imageFileName: node.imageFileName)
     }
+    if imageNodeTypes.contains(node.type) {
+        return imageNodeDisplaySize(type: node.type, imageFileName: node.imageFileName)
+    }
     return CGSize(width: nodeWidthForType(node.type),
                   height: placeholderHeightForType(node.type, imageFileName: node.imageFileName))
 }
 
-/// 节点宽度（有图片 = 空节点基准宽度，不随图片尺寸突然变大；空节点按映射表比例）
+/// 节点宽度（图片类 = 长边统一算法推导；其余按映射表比例）
 /// 渲染侧 NodeView 与命中侧共用，保证两处永远一致
 func nodeWidthForType(_ type: NodeType) -> CGFloat {
+    // 图片类（角色/场景/道具）宽度随素材比例变化（长边锁 240），必须与 imageNodeDisplaySize 同源
+    if imageNodeTypes.contains(type) {
+        return imageNodeDisplaySize(type: type, imageFileName: nil).width
+    }
     let spec = nodeSizeSpecs[type] ?? NodeSizeSpec(x: 16, y: 9)
     let raw = spec.x >= spec.y
         ? nodeBaseWidth * spec.scale
@@ -201,12 +242,14 @@ func nodeWidthForType(_ type: NodeType) -> CGFloat {
     return roundedToGrid(raw)
 }
 
-/// 占位区高度（有图片按图片比例自适应 = 节点宽 * 图高/图宽；空节点按映射表比例）
-/// 视频节点有图片时走长边统一算法（videoNodeSize），横竖屏视觉体量一致
+/// 占位区高度（视频/图片类有内容走长边统一算法；其余按图片比例或映射表比例）
 /// 渲染侧 NodeView 与命中侧共用，保证两处永远一致
 func placeholderHeightForType(_ type: NodeType, imageFileName: String?) -> CGFloat {
     if type == .video, imageFileName != nil {
         return videoNodeSize(imageFileName: imageFileName).height
+    }
+    if imageNodeTypes.contains(type) {
+        return imageNodeDisplaySize(type: type, imageFileName: imageFileName).height
     }
     if let fileName = imageFileName,
        let img = cachedAssetImage(for: fileName) {
@@ -273,9 +316,9 @@ func nodePromptRequirement(for type: NodeType) -> String? {
     switch type {
     case .audio: return "44100Hz"
     case .video: return "1080P 25fps"
-    case .image: return "1024×1024"
-    case .character: return "角色描述"
-    case .scene: return "场景描述"
+    case .image_prop: return "1024×1024"
+    case .image_character: return "角色描述"
+    case .image_scene: return "场景描述"
     case .text: return nil
     }
 }
@@ -285,9 +328,9 @@ func nodePromptPlaceholder(for type: NodeType) -> String {
     switch type {
     case .audio: return "输入音色描述，@引用素材..."
     case .video: return "输入画面描述，@引用素材..."
-    case .image: return "输入画面描述，@引用素材..."
-    case .character: return "输入角色描述，@引用素材..."
-    case .scene: return "输入场景描述，@引用素材..."
+    case .image_prop: return "输入画面描述，@引用素材..."
+    case .image_character: return "输入角色描述，@引用素材..."
+    case .image_scene: return "输入场景描述，@引用素材..."
     case .text: return "输入内容描述..."
     }
 }

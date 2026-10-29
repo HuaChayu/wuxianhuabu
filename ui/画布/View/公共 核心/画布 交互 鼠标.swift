@@ -78,6 +78,17 @@ extension CanvasView {
                         debugLog("画布节点：开始重命名节点「\(node.title)」")
                     }
                     
+                    // 图片类节点：改名下方提供类型互转（角色 / 场景 / 道具 三选一，只显示「除当前类型外」的两项）
+                    if imageNodeTypes.contains(node.type) {
+                        ForEach(imageNodeTypes.filter { $0 != node.type }, id: \.self) { targetType in
+                            contextMenuItem(icon: targetType.icon, title: "转换为\(targetType.rawValue)") {
+                                convertNodeType(node.id, to: targetType)
+                                showContextMenu = false
+                                debugLog("右键菜单：转换节点类型「\(node.title)」→ \(targetType.rawValue)")
+                            }
+                        }
+                    }
+                    
                     contextMenuItem(icon: "doc.on.doc", title: "复制文本", isEnabled: node.type == .text) {
                         copyNodeText(node)
                         showContextMenu = false
@@ -253,7 +264,7 @@ extension CanvasView {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
             
-            ForEach([NodeType.image, .video, .audio, .character, .scene].filter { type in
+            ForEach([NodeType.image_prop, .video, .audio, .image_character, .image_scene].filter { type in
                 !(hideVideoOption && type == .video)
             }) { type in
                 contextMenuItem(icon: type.icon, title: type.rawValue) {

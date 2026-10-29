@@ -16,7 +16,7 @@ import AppKit
 enum NodeFactory {
     /// 统一创建节点：默认标题「未命名<类型>」、副标题「出现集数：暂无」、待补充标记
     /// 完整参数版本：新增字段全部带默认值，旧调用点不受影响；粘贴侧按「存在性」传入（nil/默认 = 跳过该参数）。
-    static func createNode(type: NodeType, title: String? = nil, subtitle: String? = nil, needsSupplement: Bool = true, position: CGPoint, imageFileName: String? = nil, mediaFileName: String? = nil, prompt: String = "", groupID: UUID? = nil, ratio: CanvasStore.Ratio? = nil, duration: VideoDuration? = nil, tailFrameEnabled: Bool = true, model: VideoModel = .ltx25Distill, quality: VideoQuality = .standard, imageModel: ImageModel = .hidreamO1, imageQuality: ImageQuality = .p720, history: [NodeContentHistory]? = nil) -> CanvasNode {
+    static func createNode(type: NodeType, title: String? = nil, subtitle: String? = nil, needsSupplement: Bool = true, position: CGPoint, imageFileName: String? = nil, mediaFileName: String? = nil, prompt: String = "", groupID: UUID? = nil, ratio: CanvasStore.Ratio? = nil, duration: VideoDuration? = nil, tailFrameEnabled: Bool = true, model: VideoModel = .ltx25Distill, quality: VideoQuality = .standard, imageModel: ImageModel = .hidreamO1, imageQuality: ImageQuality = .p720, history: [NodeContentHistory]? = nil, promptRich: String? = nil, promptMentionRefs: [PromptMentionRef]? = nil) -> CanvasNode {
         CanvasNode(
             type: type,
             title: title ?? "未命名\(type.rawValue)",
@@ -34,7 +34,9 @@ enum NodeFactory {
             quality: quality,
             imageModel: imageModel,
             imageQuality: imageQuality,
-            history: history
+            history: history,
+            promptRich: promptRich,
+            promptMentionRefs: promptMentionRefs
         )
     }
 }
@@ -111,6 +113,8 @@ extension CanvasView {
         for (gid, count) in groupCounts where count >= 2 {
             groupIDMap[gid] = UUID()
         }
+        var idMap: [UUID: UUID] = [:]   // 原节点 id → 副本 id（引用块重映射用）
+        var copies: [CanvasNode] = []
         for node in targets {
             let copy = NodeFactory.createNode(
                 type: node.type,
@@ -127,11 +131,58 @@ extension CanvasView {
                 model: node.model,
                 quality: node.quality,
                 imageModel: node.imageModel,
-                imageQuality: node.imageQuality
+                imageQuality: node.imageQuality,
+                // 提示词里的引用块一起复制（只带 prompt 纯文本会把块丢干净）
+                promptRich: node.promptRich,
+                promptMentionRefs: node.promptMentionRefs
             )
-            store.nodes.append(copy)
+            idMap[node.id] = copy.id
+            copies.append(copy)
+        }
+        // 引用块的 nodeID 重映射：被引用节点也在复制集合内 → 指向副本，集合外保持原节点
+        for i in copies.indices {
+            guard let refs = copies[i].promptMentionRefs, !refs.isEmpty else { continue }
+            copies[i].promptMentionRefs = refs.map { ref -> PromptMentionRef in
+                guard let mapped = idMap[ref.nodeID] else { return ref }
+                var copy = ref
+                copy.nodeID = mapped
+                return copy
+            }
+        }
+        store.nodes.append(contentsOf: copies)
+        store.save()
+    }
+    
+    // 图片类节点互转类型（角色 / 场景 / 道具）：只改「这张图的用途分类」，
+    // 图片内容、提示词、连线、位置、尺寸比例基准全部不动，可撤销。
+    func convertNodeType(_ nodeID: UUID, to newType: NodeType) {
+        guard imageNodeTypes.contains(newType),
+              let idx = store.nodes.firstIndex(where: { $0.id == nodeID }) else { return }
+        let oldType = store.nodes[idx].type
+        guard imageNodeTypes.contains(oldType), oldType != newType else { return }
+        store.pushSnapshot()   // 类型互转会改数据，先记录撤销快照
+        let fileName = store.nodes[idx].imageFileName
+        // 同一张图在项目内可能有多个节点：类型属于「图」本身，全部一起改
+        var affectedIDs: Set<UUID> = []
+        for i in store.nodes.indices
+        where imageNodeTypes.contains(store.nodes[i].type)
+            && store.nodes[i].imageFileName != nil
+            && store.nodes[i].imageFileName == fileName {
+            store.nodes[i].type = newType
+            affectedIDs.insert(store.nodes[i].id)
+        }
+        // 块快照 kind 跟着图走（本项目全部节点）：生成端已实时读 node.type，
+        // 这里刷快照只为让落盘数据一致、节点被删后兜底类型不出错
+        refreshMentionRefKinds(&store.nodes, nodeIDs: affectedIDs, to: newType)
+        // 资产库同步：同一张图的分类跟着改，避免资产库 / 画布 / 拖拽三处分类不一致
+        if let fileName {
+            AssetStore.shared.setCategory(forFileName: fileName, to: newType.assetCategory)
+            // 类型属于「图」本身：其它项目里引用同一张图的节点一并改（直接写各项目 project.json）
+            syncImageNodeTypesAcrossProjects(fileName: fileName, to: newType,
+                                            excludingProjectID: store.currentProject?.id)
         }
         store.save()
+        debugLog("节点类型互转：\(oldType.rawValue) → \(newType.rawValue)「\(store.nodes[idx].title)」")
     }
     
     // 删除节点及其相关连线

@@ -9,22 +9,39 @@ import Foundation
 // MARK: - 节点类型
 
 enum NodeType: String, CaseIterable, Identifiable, Codable {
-    case character = "角色"
-    case scene = "场景"
+    case image_character = "角色"
+    case image_scene = "场景"
     case text = "文本"
-    case image = "图片"
+    case image_prop = "道具"
     case video = "视频"
     case audio = "音频"
     
     var id: String { rawValue }
+
+    /// 旧存档兼容：「图片」已更名为「道具」，读旧项目 JSON 时把 "图片" 映射到 .image_prop，
+    /// 其余未知值仍按原行为抛错（与自动合成 Codable 一致）。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(String.self)
+        if let type = NodeType(rawValue: raw) {
+            self = type
+        } else if raw == "图片" {
+            self = .image_prop
+        } else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath,
+                      debugDescription: "未知节点类型：\(raw)")
+            )
+        }
+    }
     
     // 底部信息栏左侧小图标
     var icon: String {
         switch self {
-        case .character: return "person"
-        case .scene: return "photo.on.rectangle.angled"
+        case .image_character: return "person"
+        case .image_scene: return "photo.on.rectangle.angled"
         case .text: return "textformat"
-        case .image: return "photo"
+        case .image_prop: return "photo"
         case .video: return "video"
         case .audio: return "music.note"
         }
@@ -33,28 +50,33 @@ enum NodeType: String, CaseIterable, Identifiable, Codable {
     // 顶部占位区图标
     var placeholderIcon: String {
         switch self {
-        case .character: return "person.crop.circle"
-        case .scene: return "building.2"
+        case .image_character: return "person.crop.circle"
+        case .image_scene: return "building.2"
         case .text: return "textformat"
-        case .image: return "photo"
+        case .image_prop: return "photo"
         case .video: return "video"
         case .audio: return "music.note"
         }
     }
     
-    // 顶部独立文本标签（文本/图像/视频/音频）
+    // 顶部独立文本标签（角色/场景/道具/文本/视频/音频）
     var topLabel: String {
         switch self {
         case .text: return "T 文本"
-        case .image: return "图像"
+        case .image_character: return "角色"
+        case .image_scene: return "场景"
+        case .image_prop: return "道具"
         case .video: return "视频"
         case .audio: return "音频"
-        default: return ""
         }
     }
 }
 
 // MARK: - 节点数据模型（画布坐标 position 为画布坐标系，显示时乘 zoom + offset）
+
+/// 图片类节点（同一张图的不同用途分类）：角色 / 场景 / 道具 三者之间可右键互转。
+/// 顺序即右键菜单展示顺序（道具 → 场景 → 角色），去掉当前类型后即为可转目标。
+let imageNodeTypes: [NodeType] = [.image_prop, .image_scene, .image_character]
 
 struct CanvasNode: Identifiable, Codable {
     var id: UUID = UUID()   // var：解码时从 JSON 恢复原 id，否则加载后连线 fromID/toID 匹配不上
@@ -294,7 +316,7 @@ struct PromptMentionCatalog {
 
     /// 按分类顺序分组，只保留有内容的分类
     var grouped: [PromptMentionGroup] {
-        let order: [NodeType] = [.character, .scene, .image, .video, .text, .audio]
+        let order: [NodeType] = [.image_character, .image_scene, .image_prop, .video, .text, .audio]
         var result: [PromptMentionGroup] = []
         for kind in order {
             let items = all.filter { $0.kind == kind }

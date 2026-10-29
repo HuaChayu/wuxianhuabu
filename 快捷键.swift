@@ -171,6 +171,9 @@ struct ClipboardNode: Codable {
     var quality: VideoQuality? = nil    // 视频清晰度档位
     var imageModel: ImageModel? = nil   // 图像/角色/场景生成模型
     var imageQuality: ImageQuality? = nil // 图像/角色/场景尺寸档位
+    /// 提示词富文本原文（含 U+FFFC 占位符）+ 引用块快照：只带 prompt 纯文本会丢块
+    var promptRich: String? = nil
+    var promptMentionRefs: [PromptMentionRef]? = nil
 }
 
 /// 剪贴板中的连线（仅记录 from/to，id 粘贴时重建）
