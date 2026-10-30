@@ -995,10 +995,9 @@ public final class H3DiT {
         if hidden == cfg.hiddenSize { return textStates }
         var h: MLXArray
         if let cp = conditionProj {
+            // condition_proj.bias 在 MfLinear.load 时已装入 lin.bias，forward 末尾已加一次；
+            // 此处再叠加等于 x·Wᵀ + 2b（官方只加一次），故不重复加。
             h = cp.forward(textStates)
-            if let b = conditionBias {
-                h = h + b.asType(h.dtype)
-            }
         } else {
             h = textStates
         }

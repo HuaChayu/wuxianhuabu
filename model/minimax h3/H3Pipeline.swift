@@ -145,8 +145,8 @@ public enum H3FL2VAPipeline {
         ///           （走 ref2va 软参考）；nil = 无显式选择（旧档/自检脚本）→ 回退下方旧启发式判定。
         ///   由队列端 task.h3Fl2vaAsRefs 透传（首尾帧=false → true，多参考=true → false）。
         flFirstLastMode: Bool? = nil,
-        /// 参考图缩放模式：.match = 缩到与生成画面同面积（默认，序列最短）；
-        /// .mid = 短边上限 1024；.max = 短边上限 2048（官方 ref2va，序列最长）
+        /// 参考图缩放模式：.match = 缩到生成画面同面积（默认）；.mid = 短边上限 1024；
+        /// .max = 短边上限 2048（官方 ref2va，序列最长）
         referenceSizing: RefImageSizing = .match,
         /// ★ H3→LTX latent 直通适配器（H3-to-LTX-Latent-Adapter，见 H3-to-LTX-Latent-Adapter-(h3专属).swift）：
         /// 非 nil 时，在 H3 VAE 解码之前拦截 clean latent，直接映射为 LTX 归一化 latent 挂到 bridge，
@@ -378,7 +378,7 @@ public enum H3FL2VAPipeline {
                         refEncodeBarrier("fl 图 \(i + 1)")
                         continue
                     }
-                    // 官方 reference canvas：短边 2048 上限、32 对齐；再经 fitCanvas 复核对齐
+                    // 参考图 canvas：缩到与生成画面同面积（.match），32 对齐；再经 fitCanvas 复核对齐。
                     let rc = refImageCanvas(UInt32(dims.w), UInt32(dims.h),
                                             genW: UInt32(width), genH: UInt32(height),
                                             mode: referenceSizing)

@@ -342,7 +342,7 @@ public func ref2vaStructuredPrompt(userText: String,
     }
 
     // ② summary —— 任务类型 + 素材数量，不描述情节（情节在④）。
-    let summary = "summary:\n[参考生成] 目标视频由 \(subjectCount) 张参考图生成，具体内容见下方详细描述。\n"
+    //let summary = "summary:\n[参考生成] 目标视频由 \(subjectCount) 张参考图生成，具体内容见下方详细描述。\n"
 
     // ③ retention_analysis —— 只锁「完全保留」这一条可验证声明，外观细节不编造。
     var ret = "retention_analysis:\n"
@@ -359,7 +359,7 @@ public func ref2vaStructuredPrompt(userText: String,
         + "与画面场景一致的自然环境声，以及画面中可见动作产生的音效。\n"
     let music = "non_diegetic_music:\nN/A\n"
 
-    return [defs, summary, ret, detailed, sound, music].joined(separator: "\n")
+    return [defs, ret, detailed, sound, music].joined(separator: "\n")
 }
 
 /// 六段结构前置到用户正文前。
