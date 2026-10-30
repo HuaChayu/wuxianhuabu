@@ -210,7 +210,14 @@ public enum H3FL2VAPipeline {
         // ★ H3 收尾恢复：10GB 缓存池仅供 H3 单步中间 buffer 跨步复用（50 层 DiT >> LTX），
         // 函数返回/抛错时立即恢复全局 2GB（MemoryPolicy.bufferCacheLimit），避免高水位残留到
         // 后续像素桥/LTX refine 编译窗口（实测 H3 后 10GB 未恢复 + refine 重编译 → low-swap jetsam）。
-        defer { MLX.Memory.cacheLimit = 2_000_000_000 }
+        // ★ 2026-10-30 收尾同步屏障：降 cacheLimit 会立即 trim 并真 free 池内 MTLBuffer，
+        //   而函数尾部（尾帧 .h3cc 落盘 MLX.eval / 音频 BigVGAN 解码）提交的 command buffer
+        //   可能仍在 GPU 队列在飞 → 连续点击生成时下一轮首个 VAE 编码 commit 命中
+        //   "command buffer references deallocated object" preCommit 断言。降档前先排空 GPU 队列。
+        defer {
+            Stream.gpu.synchronize()
+            MLX.Memory.cacheLimit = 2_000_000_000
+        }
 
         // ★ 2026-10-07 跨生成 GPU 同步屏障：连续点击生成（上一次刚结束立刻再点）时，
         // 上一轮收尾的 clearCache / cacheLimit 10GB→2GB trim 会把 GPU 队列可能仍在
@@ -538,10 +545,35 @@ public enum H3FL2VAPipeline {
         }()
         let lmConfig = LanguageModelConfigurationFromHub(modelFolder: lmFolderURL)
         guard let tokConfig = try? await lmConfig.tokenizerConfig,
-              let tokData = try? await lmConfig.tokenizerData,
-              let tokenizer = try? AutoTokenizer.from(tokenizerConfig: tokConfig, tokenizerData: tokData) else {
+              let tokDataBase = try? await lmConfig.tokenizerData else {
+            throw NSError(domain: "H3FL2VA", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "tokenizer 配置加载失败"])
+        }
+        // ★ 2026-10-30：补齐官方边界特殊 token（修 ref2va 对白被切碎乱念）。
+        //   官方 tokenizer.json 的 addedTokens 只登记到 id 151668；
+        //   <d> </d> <|cutoff|> <|lyrics_start|> <|lyrics_end|> <|caption_start|> <|caption_end|>
+        //   这 7 个只写在 tokenizer_config.json 的 additional_special_tokens 里。
+        //   swift-transformers 构建词表只读 tokenizerData["addedTokens"]，从不按
+        //   additional_special_tokens 派生 id，于是 <d> 被 BPE 拆成 "<"+"d"+">" 碎片，
+        //   模型在 token 层看不到台词边界，把整段描述当台词念。
+        //   这里按官方顺序补进 addedTokens（id 顺延现有最大值），仅内存注入，不改磁盘文件。
+        let tokPatch = H3SpecialTokenPatch.apply(to: tokDataBase, tokenizerConfig: tokConfig)
+        log("特殊 token 注入：\(tokPatch.summary)")
+        let tokData = tokPatch.data
+        guard let tokenizer = try? AutoTokenizer.from(tokenizerConfig: tokConfig, tokenizerData: tokData) else {
             throw NSError(domain: "H3FL2VA", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "tokenizer 加载失败"])
+        }
+        // 注入自检：<d> / </d> 必须编码为单个 token 且落在 151669–151675。
+        do {
+            for probe in ["<d>", "</d>"] {
+                let ids = tokenizer.encode(text: probe, addSpecialTokens: false)
+                let ok = ids.count == 1 && (151669...151675).contains(ids[0])
+                log("特殊 token 自检：\(probe) → \(ids) \(ok ? "✅单token" : "❌仍被切碎（注入失效）")")
+            }
+            let sids = tokenizer.encode(text: "<d>[Chinese] 你好世界</d>", addSpecialTokens: false)
+            let ok = sids.first == 151669 && sids.last == 151670
+            log("特殊 token 自检：行内样本 首=\(sids.first ?? -1) 尾=\(sids.last ?? -1) 共\(sids.count) tokens \(ok ? "✅边界对齐" : "❌边界丢失")")
         }
         // ★ 2026-10-27：把「真正送去编码的提示词」逐行原样落日志。
         //   目的：任何一次生成都能在 pipeline.log 里看到完整文本（含段标题、<Subject n>、
@@ -620,6 +652,9 @@ public enum H3FL2VAPipeline {
 
             textEncoder = nil
             teWeights = nil
+            // ★ 2026-10-30 同步屏障：文本编码器权重是大块 MTLBuffer，clearCache 会真 free；
+            //   MLX.eval 只提交不等待，GPU 队列可能仍在引用 → 必须先 sync 再清池（跨生成 UAF）。
+            Stream.gpu.synchronize()
             MLX.Memory.clearCache()
             h3MemLog("文本编码器置 nil 后（autoreleasepool 内）")
         }
@@ -1348,6 +1383,9 @@ public enum H3FL2VAPipeline {
             MLX.eval(videoX, audioX)
             slVae = nil
             slVaeWeights = nil
+            // ★ 2026-10-30 同步屏障：SelfLift 像素锚点 VAE 权重同属大块 MTLBuffer，
+            //   在飞命令缓冲仍可能引用 → 先 sync 再清池（跨生成 UAF）。
+            Stream.gpu.synchronize()
             MLX.Memory.clearCache()
             h3MemLog("SelfLift 像素锚点 VAE 已释放（回到全分辨率 \(latW)×\(latH) latent）")
         } else {
@@ -1879,4 +1917,62 @@ func h3ImagePixelSize(_ path: String) -> (w: Int, h: Int)? {
           let h = props[kCGImagePropertyPixelHeight] as? Int,
           w > 0, h > 0 else { return nil }
     return (w, h)
+}
+
+// MARK: - tokenizer 特殊 token 内存注入
+
+/// 把 tokenizer_config.json 里 `additional_special_tokens` 声明、但 tokenizer.json 的
+/// `addedTokens` 中缺失的条目补进 `addedTokens`，id 顺延现有最大值。
+///
+/// 背景：swift-transformers 的 `PreTrainedTokenizer` 只从 `tokenizerData["addedTokens"]`
+/// 建词表（Tokenizer.swift 的 encode 也按该数组生成 addedTokensRegex），
+/// BPE 的 `tokensToIds` 同样是 `vocab.merging(addedTokens)`；
+/// `additional_special_tokens` 仅在 jinja 模板里作为变量暴露，从不派生 token id。
+/// 因此只改 tokenizer_config.json 而无 addedTokens 时，`<d>` 会被 BPE 拆成 `<`/`d`/`>` 碎片。
+/// 本函数全程在内存中完成，不写回磁盘。
+enum H3SpecialTokenPatch {
+    struct Result {
+        let data: Config
+        let summary: String
+    }
+
+    static func apply(to data: Config, tokenizerConfig: Config) -> Result {
+        // 直接在已解析的 Config 上做结构拼接：不重读、不重解析 tokenizer.json。
+        // （整份 tokenizer.json 含 15 万条 vocab，走 JSONDecoder 重建 Config 每次生成都要
+        //  多花数秒到数十秒，且深递归有栈风险；字典型 Config 写时复制只影响 9 个顶层键。）
+        guard var root = data.dictionary() else {
+            return Result(data: data, summary: "⚠️ tokenizerData 非字典结构，跳过注入")
+        }
+        // 官方 tokenizer.json 里该字段写作 added_tokens，swift-transformers 通过 uncamelCase
+        // 用 "addedTokens" 查同一字段；这里按实际存在的键写回，两种写法都能命中。
+        let addedKey: BinaryDistinctString =
+            root[BinaryDistinctString("addedTokens")] != nil
+            ? BinaryDistinctString("addedTokens")
+            : BinaryDistinctString("added_tokens")
+        var added = root[addedKey]?.array() ?? []
+        var nextId = ((added.compactMap { $0["id"].integer() }.max()) ?? -1) + 1
+        let existing = Set(added.compactMap { $0.content.string() })
+        let declared = tokenizerConfig.dictionary()?[BinaryDistinctString("additional_special_tokens")]?.array()?
+            .compactMap { $0.string() } ?? []
+
+        var injected: [String] = []
+        for token in declared where !existing.contains(token) {
+            added.append(Config([
+                BinaryDistinctString("id"): Config(nextId),
+                BinaryDistinctString("content"): Config(token),
+                BinaryDistinctString("single_word"): Config(false),
+                BinaryDistinctString("lstrip"): Config(false),
+                BinaryDistinctString("rstrip"): Config(false),
+                BinaryDistinctString("normalized"): Config(false),
+                BinaryDistinctString("special"): Config(true),
+            ]))
+            injected.append("\(token)=\(nextId)")
+            nextId += 1
+        }
+        guard !injected.isEmpty else {
+            return Result(data: data, summary: "无需注入（addedTokens 已覆盖 \(declared.count) 个声明项）")
+        }
+        root[addedKey] = Config(added)
+        return Result(data: Config(root), summary: "新增 \(injected.count) 个 → \(injected.joined(separator: " "))")
+    }
 }

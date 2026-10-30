@@ -791,8 +791,9 @@ struct NodePromptBar: View {
     @State private var translateError: String?
     /// 翻译会话配置：非 nil 时驱动 .translationTask 执行一次翻译（点击时先置 nil 再置新值，强制触发）
     @State private var translationConfig: TranslationSession.Configuration?
-    /// 待翻译文本：供 .translationTask action 读取，避免闭包捕获过期状态
-    @State private var pendingTranslationText = ""
+    /// 待翻译的文字片段（已按引用块占位符切分）：供 .translationTask action 读取，避免闭包捕获过期状态。
+    /// 块本身不进这里 —— 块在送模型时会转成标签，无需翻译，翻译后按原位置拼回
+    @State private var pendingTranslationSegments: [String] = []
     
     var body: some View {
         VStack(spacing: 10) {
@@ -1070,18 +1071,46 @@ struct NodePromptBar: View {
         )
         .frame(width: 460)
         .translationTask(translationConfig) { session in
-            // 环境注入的翻译会话：仅当有待翻译文本时执行；每次点击先置 nil 再置新配置，保证触发
-            let text = pendingTranslationText
-            guard !text.isEmpty else { return }
-            do {
-                let response = try await session.translate(text)
-                let targetText = response.targetText
+            // 环境注入的翻译会话：仅当有待翻译片段时执行；每次点击先置 nil 再置新配置，保证触发。
+            // 只翻文字片段：引用块占位符不进翻译请求（块送模型时会转成标签，翻了既无意义又会破坏结构）
+            let segments = pendingTranslationSegments
+            guard !segments.isEmpty else { return }
+            let indices = segments.indices.filter { PromptTranslationSplitter.needsTranslation(segments[$0]) }
+            guard !indices.isEmpty else {
                 await MainActor.run {
                     isTranslating = false
+                    pendingTranslationSegments = []
+                }
+                return
+            }
+            do {
+                // 一次批量请求（clientIdentifier 回填片段序号）：多片段只开一次翻译会话，且顺序可还原
+                let requests = indices.map {
+                    TranslationSession.Request(sourceText: segments[$0], clientIdentifier: String($0))
+                }
+                let responses = try await session.translations(from: requests)
+                var translated = segments
+                for response in responses {
+                    guard let identifier = response.clientIdentifier,
+                          let index = Int(identifier),
+                          translated.indices.contains(index) else { continue }
+                    translated[index] = PromptTranslationSplitter.restoringEdges(
+                        original: segments[index],
+                        translated: response.targetText
+                    )
+                }
+                // 按原占位符位置拼回：块保持原位、原顺序；占位符个数不变时 mentions 一律保留
+                let targetText = PromptTranslationSplitter.rejoin(translated)
+                let mentionCount = PromptMentionToken.count(in: targetText)
+                let keepingMentions = mentionCount == mentions.wrappedValue.count
+                await MainActor.run {
+                    isTranslating = false
+                    pendingTranslationSegments = []
                     self.text = targetText
-                    mentions.wrappedValue = []
+                    // 占位符个数异常（理论上不会发生）时退回旧行为，避免块与文本错位
+                    if !keepingMentions { mentions.wrappedValue = [] }
                     translateError = nil
-                    debugLog("节点输入框：翻译完成")
+                    debugLog("节点输入框：翻译完成（跳过 \(mentionCount) 个引用块）")
                 }
             } catch {
                 await MainActor.run {
@@ -1222,8 +1251,10 @@ struct NodePromptBar: View {
     
     /// 翻译按钮动作：按字符占比判断方向（中文多→英文，英文多→中文），通过 .translationTask 环境注入的系统翻译会话执行
     private func translatePrompt() {
-        // 翻译只处理纯文字：引用块占位符不参与翻译（翻译结果会替换整段文字，块随之清空）
-        let text = self.text.strippingMentionPlaceholders
+        // 翻译只处理文字片段：按引用块占位符（U+FFFC）切分，块本身不参与翻译。
+        // 块在转换时会变成标签，翻它既无意义又会破坏结构；翻译后按原位置拼回
+        let segments = PromptTranslationSplitter.segments(of: self.text)
+        let text = segments.joined()
         // 统计中文字符数（Unicode 表意文字：扩展 A 区 + 基本区）
         let chineseCount = text.unicodeScalars.reduce(0) { count, scalar in
             let v = scalar.value
@@ -1242,14 +1273,19 @@ struct NodePromptBar: View {
         let zhMore = chineseCount > englishCount
         let from = Locale.Language(identifier: zhMore ? "zh-Hans" : "en")
         let to = Locale.Language(identifier: zhMore ? "en" : "zh-Hans")
+        // 除引用块外没有可翻译文字（全是块 / 纯符号 / 纯数字）：不开翻译会话
+        guard segments.contains(where: { PromptTranslationSplitter.needsTranslation($0) }) else {
+            debugLog("节点输入框：翻译跳过（除引用块外无可翻译文字）")
+            return
+        }
         // 清除上一次的错误提示
         translateError = nil
-        pendingTranslationText = ""
+        pendingTranslationSegments = []
         translationConfig = nil
         isTranslating = true
-        // 下一拍同时写入待翻译文本与新配置，驱动 .translationTask 执行一次翻译（先置 nil 保证每次点击都触发）
+        // 下一拍同时写入待翻译片段与新配置，驱动 .translationTask 执行一次翻译（先置 nil 保证每次点击都触发）
         Task { @MainActor in
-            pendingTranslationText = text
+            pendingTranslationSegments = segments
             translationConfig = TranslationSession.Configuration(source: from, target: to)
         }
     }
@@ -1765,6 +1801,35 @@ extension String {
     /// 去掉引用块占位符后的纯提示词文本（写回节点、发送模型、翻译前调用）
     var strippingMentionPlaceholders: String {
         replacingOccurrences(of: PromptMentionToken.placeholder, with: "")
+    }
+}
+
+/// 翻译片段切分：提示词按引用块占位符切成若干文字片段，块本身不参与翻译。
+/// 块（U+FFFC）在送模型前会转成标签，翻译它既无意义又会破坏标签结构，
+/// 因此翻译只翻片段正文，翻完把占位符按原位置塞回去，块数量与顺序完全不变。
+enum PromptTranslationSplitter {
+    /// 按占位符切分文字片段（保留空片段与首尾空白，便于原位拼回）
+    static func segments(of text: String) -> [String] {
+        text.components(separatedBy: PromptMentionToken.placeholder)
+    }
+
+    /// 片段是否含可翻译文字（字母/汉字等 letters；纯符号、空白、纯数字不翻，避免译文乱改）
+    static func needsTranslation(_ segment: String) -> Bool {
+        segment.unicodeScalars.contains { CharacterSet.letters.contains($0) }
+    }
+
+    /// 按原占位符位置拼回文本（片段之间插入一个引用块占位符）
+    static func rejoin(_ segments: [String]) -> String {
+        segments.joined(separator: PromptMentionToken.placeholder)
+    }
+
+    /// 把译文套回原片段的首尾空白：翻译常会裁掉两侧空格/换行，
+    /// 不还原会导致块与前后文粘连（如 "about" 与块之间丢空格）
+    static func restoringEdges(original: String, translated: String) -> String {
+        let leading = String(original.prefix { $0.isWhitespace })
+        let trailing = String(original.reversed().prefix { $0.isWhitespace }.reversed())
+        let core = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+        return leading + core + trailing
     }
 }
 
