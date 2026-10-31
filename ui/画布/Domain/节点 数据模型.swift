@@ -98,7 +98,7 @@ struct CanvasNode: Identifiable, Codable {
     var tailFrameEnabled: Bool = true   // 视频节点「尾帧」开关（on = 播放到尾帧停住；默认开，Codable 自动 decodeIfPresent，旧档兼容）
     var model: VideoModel = .ltx25Distill   // 视频节点使用的生成模型（默认 ltx2.5 蒸馏版；Codable 自动 decodeIfPresent，旧档兼容）
     var refMode: H3RefMode? = nil   // 视频节点 H3 参考模式（UI 下拉仅「多参考/首尾帧」两选项、必选其一；旧档无该字段时 decodeIfPresent 得 nil，队列端按多参考兜底）
-    var quality: VideoQuality = .standard   // 视频节点清晰度档位（用户标签；默认标准档，Codable 自动 decodeIfPresent，旧档兼容）
+    var quality: VideoQuality = .p576   // 视频节点清晰度档位（用户标签；默认 576p = 0.75x 档，Codable 自动 decodeIfPresent，旧「标准」档自动映射）
     var imageModel: ImageModel = .hidreamO1 // 图像/角色/场景节点使用的生成模型（默认 HiDream-O1；Codable 自动 decodeIfPresent，旧档兼容）
     var imageQuality: ImageQuality = .p720  // 图像/角色/场景节点尺寸档位（默认 720 档；Codable 自动 decodeIfPresent，旧档兼容）
     /// 节点用过的历史内容（替换/生成新内容时旧内容入列，右下角徽标可展开恢复；Codable 自动 decodeIfPresent，旧档兼容）
@@ -206,13 +206,31 @@ enum ImageQuality: String, Codable, CaseIterable {
     }
 }
 
-/// 视频生成清晰度档位（用户标签；具体实际值 = 比例 × 档位查动态表，按 32 倍数适配，不钉死标准分辨率）
+/// 视频生成清晰度档位（用户标签；具体实际值 = 比例 × 档位查动态表，按 64 倍数适配，不钉死标准分辨率）
+/// ★ 2026-10-31：原「标准」档（最长边 512）退役，改为 0.75x 档 = 短边 576（768×0.75）。
+///   依据：官方 H3 native canvas 短边 768；社区 MinimaxH3Resolution 的 0.75x = preview 档，0.5x 才是 draft。
 enum VideoQuality: String, Codable, CaseIterable {
-    case standard = "标准"
+    case p576 = "576p"
     case p720 = "720p"
+    /// ★ 2026-10-31 新增：介于 720p 与 1080p 之间。标称 864，实际短边按 64 对齐 → 896（与 720→768、1080→1088 同构）。
+    case p864 = "864p"
     case p1080 = "1080p"
     
     var displayName: String { rawValue }
+    
+    /// 旧存档兼容：历史「标准」档解码映射到 576p（旧节点下次生成即用新档尺寸）。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        let raw = try c.decode(String.self)
+        if raw == "标准" {
+            self = .p576
+            return
+        }
+        guard let v = VideoQuality(rawValue: raw) else {
+            throw DecodingError.dataCorruptedError(in: c, debugDescription: "未知视频档位: \(raw)")
+        }
+        self = v
+    }
 }
 
 /// 视频时长档位（5s / 10s / 15s；@24fps → 120 / 240 / 360 帧）

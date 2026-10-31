@@ -49,21 +49,21 @@ func alignedSize(shortSide: Int, ratio: CanvasStore.Ratio) -> (width: Int, heigh
 // MARK: - 视频生成尺寸入口
 
 /// 视频生成目标尺寸（动态表）：比例 × 清晰度档位 → 宽高对齐 64 倍数。
-/// - standard：最长边 512 基准，等比缩放后每维取最近 64 倍数
-/// - p720 / p1080：短边对齐档位（720→768、1080→1088，向上取 64 倍数），长边按比例取最近 64 倍数
+/// - p576：短边 576（= 768 × 0.75，0.75x 档），长边按比例取最近 64 倍数（16:9 → 1024×576）
+/// - p720 / p864 / p1080：短边对齐档位（720→768、864→896、1080→1088，向上取 64 倍数），长边按比例取最近 64 倍数
 ///   （短边向上取整与长边对齐统一委托 alignedSize）
 func videoResolution(for ratio: CanvasStore.Ratio, quality: VideoQuality) -> (width: Int, height: Int) {
-    let m = sizeAlignMultiple()
     switch quality {
-    case .standard:
-        let horizontal = ratio.width >= ratio.height
-        let unit = min(ratio.width, ratio.height)
-        let long = max(ratio.width, ratio.height)
-        let longSide = m * 8   // 512
-        let shortSide = max(m, Int((Double(longSide) * unit / long / Double(m)).rounded()) * m)
-        return horizontal ? (longSide, shortSide) : (shortSide, longSide)
+    case .p576:
+        // ★ 2026-10-31：原「标准」档（最长边 512）退役，改为 0.75x = 576 短边。
+        //   16:9 → 1024×576；21:9 → 1344×576；4:3 → 768×576；1:1 → 576×576（均落 64 网格，16:9 比例精确）
+        return alignedSize(shortSide: 576, ratio: ratio)
     case .p720:
         return alignedSize(shortSide: alignedShortSide(720), ratio: ratio)
+    case .p864:
+        // ★ 2026-10-31：新增中间档，标称 864 → 短边对齐 896（64×14）。
+        //   16:9 → 1600×896；21:9 → 2112×896；4:3 → 1216×896；1:1 → 896×896（长边均落 64 网格）
+        return alignedSize(shortSide: alignedShortSide(864), ratio: ratio)
     case .p1080:
         return alignedSize(shortSide: alignedShortSide(1080), ratio: ratio)
     }
@@ -79,25 +79,27 @@ func nearestRatio(for width: Int, height: Int) -> CanvasStore.Ratio {
 }
 
 /// 实际像素尺寸 → 最近清晰度档位（与 videoResolution 正向口径反查）：
-/// - standard：最长边 512 基准，短边 ≤ 512（1:1 时最大 512）
+/// - p576：短边基准 576（0.75x）
 /// - p720 / p1080：短边对齐 720→768、1080→1088
-/// 按短边与各档位短边基准的距离取最近档位；宽高任一非正 → standard。
+/// 按短边与各档位短边基准的距离取最近档位；宽高任一非正 → p576。
 func videoQuality(for width: Int, height: Int) -> VideoQuality {
-    guard width > 0, height > 0 else { return .standard }
+    guard width > 0, height > 0 else { return .p576 }
     let shortSide = min(width, height)
     let candidates: [(quality: VideoQuality, shortSide: Int)] = [
-        (.standard, 512),                  // standard 最长边 512，短边最大 512（1:1）
+        (.p576, 576),                      // 0.75x 档短边
         (.p720, alignedShortSide(720)),    // 768
+        (.p864, alignedShortSide(864)),    // 896
         (.p1080, alignedShortSide(1080)),  // 1088
     ]
     return candidates.min {
         abs($0.shortSide - shortSide) < abs($1.shortSide - shortSide)
-    }?.quality ?? .standard
+    }?.quality ?? .p576
 }
 
 /// 视频生成目标尺寸：有图按图最接近比例查表；无图按传入比例（nil → 16:9）。
 /// 供 UI 收集阶段（startVideoGeneration）与管线兜底共用。
-func videoSize(imageWidth: Int? = nil, imageHeight: Int? = nil, ratio: CanvasStore.Ratio? = nil, quality: VideoQuality = .standard) -> (width: Int, height: Int) {
+/// quality 不设默认值：全部调用点均显式传档，漏传即编译期报错，避免静默落到最低清。
+func videoSize(imageWidth: Int? = nil, imageHeight: Int? = nil, ratio: CanvasStore.Ratio? = nil, quality: VideoQuality) -> (width: Int, height: Int) {
     let r: CanvasStore.Ratio
     if let imageWidth, let imageHeight {
         r = nearestRatio(for: imageWidth, height: imageHeight)

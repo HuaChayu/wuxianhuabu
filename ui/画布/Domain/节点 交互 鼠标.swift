@@ -16,7 +16,7 @@ import AppKit
 enum NodeFactory {
     /// 统一创建节点：默认标题「未命名<类型>」、副标题「出现集数：暂无」、待补充标记
     /// 完整参数版本：新增字段全部带默认值，旧调用点不受影响；粘贴侧按「存在性」传入（nil/默认 = 跳过该参数）。
-    static func createNode(type: NodeType, title: String? = nil, subtitle: String? = nil, needsSupplement: Bool = true, position: CGPoint, imageFileName: String? = nil, mediaFileName: String? = nil, prompt: String = "", groupID: UUID? = nil, ratio: CanvasStore.Ratio? = nil, duration: VideoDuration? = nil, tailFrameEnabled: Bool = true, model: VideoModel = .ltx25Distill, quality: VideoQuality = .standard, imageModel: ImageModel = .hidreamO1, imageQuality: ImageQuality = .p720, history: [NodeContentHistory]? = nil, promptRich: String? = nil, promptMentionRefs: [PromptMentionRef]? = nil) -> CanvasNode {
+    static func createNode(type: NodeType, title: String? = nil, subtitle: String? = nil, needsSupplement: Bool = true, position: CGPoint, imageFileName: String? = nil, mediaFileName: String? = nil, prompt: String = "", groupID: UUID? = nil, ratio: CanvasStore.Ratio? = nil, duration: VideoDuration? = nil, tailFrameEnabled: Bool = true, model: VideoModel = .ltx25Distill, quality: VideoQuality = .p576, imageModel: ImageModel = .hidreamO1, imageQuality: ImageQuality = .p720, history: [NodeContentHistory]? = nil, promptRich: String? = nil, promptMentionRefs: [PromptMentionRef]? = nil) -> CanvasNode {
         CanvasNode(
             type: type,
             title: title ?? "未命名\(type.rawValue)",

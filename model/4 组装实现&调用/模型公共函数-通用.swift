@@ -81,17 +81,83 @@ func runOnBigStack<T>(_ body: @escaping () -> T) -> T {
 /// 管线日志（三通道）：Xcode 控制台 + 模型监控浮层 + 落盘文件。
 /// - 参数 logURL: 落盘日志文件 URL；nil 时默认 output/视频/pipeline.log（保持视频管线原行为）。
 /// - 图像管线（HiDream）传入 output/图像/pipeline.log（方案 a-2：imagePipelineLog 并入本函数）。
+/// - ★ 2026-10-31：落盘改为按日期分文件，管线各自独立，不再有单文件无限增长：
+///   `output/视频/pipeline.log` → `output/视频/生成报告/20261031.log`
+///   `output/图像/pipeline.log` → `output/图像/生成报告/20261031.log`
+///   跨天自动换文件（无需重启）；自定义文件名（如 hidream_edit_dbg.log）保持原路径不变。
 func pipelineLog(_ message: String, logURL: URL? = nil) {
     print(message)
     monitorLog(message)
-    let url = logURL ?? outputVideoDirURL.appendingPathComponent("pipeline.log")
-    let line = "[\(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))] \(message)\n"
+    pipelineLogAppend("[\(pipelineLogTimestamp())] \(message)\n", logURL: logURL)
+}
+
+/// 日志时间戳（本地时间 时:分:秒；日期由文件名承担）。
+private func pipelineLogTimestamp() -> String {
+    DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+}
+
+/// 生成报告文件名日期格式（yyyyMMdd）。
+private let pipelineLogDayFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyyMMdd"
+    return f
+}()
+
+/// 日志写入串行锁（★ 2026-10-31：原 seekToEndOfFile + write 非原子，并发任务会交错串行）
+/// 用递归锁：写入与分隔逻辑会嵌套调用。
+private let pipelineLogLock = NSRecursiveLock()
+
+/// 自上次分隔以来写过实质日志的文件集合（分隔时逐份补线，保证视频与图像各自的报告都能分段）
+private var pipelineLogTouchedURLs: Set<URL> = []
+
+/// 解析落盘路径：把 `<管线目录>/pipeline.log` 改写为 `<管线目录>/生成报告/yyyyMMdd.log`；
+/// 其他自定义文件名原样返回。
+private func pipelineLogResolvedURL(_ explicit: URL?) -> URL {
+    let requested = explicit ?? outputVideoDirURL.appendingPathComponent("pipeline.log")
+    guard requested.lastPathComponent == "pipeline.log" else { return requested }
+    let dir = requested.deletingLastPathComponent().appendingPathComponent("生成报告", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("\(pipelineLogDayFormatter.string(from: Date())).log")
+}
+
+/// 底层追加写入（内部加锁；url 必须是已解析的最终路径）。
+private func pipelineLogWrite(_ text: String, to url: URL) {
+    guard let data = text.data(using: .utf8) else { return }
+    pipelineLogLock.lock()
+    defer { pipelineLogLock.unlock() }
     if let h = try? FileHandle(forWritingTo: url) {
         h.seekToEndOfFile()
-        h.write(line.data(using: .utf8)!)
+        h.write(data)
         try? h.close()
     } else {
-        try? line.data(using: .utf8)?.write(to: url)
+        try? data.write(to: url)
+    }
+}
+
+/// 追加写入（每次调用按当前日期解析路径，跨天自动切换新文件）。
+private func pipelineLogAppend(_ text: String, logURL: URL?) {
+    let url = pipelineLogResolvedURL(logURL)
+    pipelineLogLock.lock()
+    pipelineLogTouchedURLs.insert(url)
+    pipelineLogLock.unlock()
+    pipelineLogWrite(text, to: url)
+}
+
+/// 任务分隔（★ 2026-10-31）：用空行 + 分隔线把同一份生成报告里的不同任务隔开，
+/// 避免多次任务报告首尾相连堆叠。由 MonitorCenter.taskEnd 调用。
+/// - 门控与范围：只对“自上次分隔以来真正写入过”的日志逐份补线；
+///   队列 finish 与管线内 defer 会重复调 taskEnd，此处保证一个真实任务只留一条分隔线。
+func pipelineLogSeparator(_ title: String) {
+    pipelineLogLock.lock()
+    let targets = pipelineLogTouchedURLs
+    pipelineLogTouchedURLs.removeAll()
+    pipelineLogLock.unlock()
+    guard !targets.isEmpty else { return }
+    let bar = String(repeating: "─", count: 60)
+    let block = "\n\(bar)\n[\(pipelineLogTimestamp())] \(title)\n\(bar)\n"
+    for url in targets {
+        pipelineLogWrite(block, to: url)
     }
 }
 

@@ -576,7 +576,7 @@ public enum H3FL2VAPipeline {
             log("特殊 token 自检：行内样本 首=\(sids.first ?? -1) 尾=\(sids.last ?? -1) 共\(sids.count) tokens \(ok ? "✅边界对齐" : "❌边界丢失")")
         }
         // ★ 2026-10-27：把「真正送去编码的提示词」逐行原样落日志。
-        //   目的：任何一次生成都能在 pipeline.log 里看到完整文本（含段标题、<Subject n>、
+        //   目的：任何一次生成都能在生成报告（output/视频/生成报告/yyyyMMdd.log）里看到完整文本（含段标题、<Subject n>、
         //   <d> 标签、说话人 (Sx)），用于核对是否有漏段/漏标签，而不是靠公式反推。
         log("最终提示词全文（\(prompt.count) 字符 / \(prompt.components(separatedBy: "\n").count) 行）：")
         for (i, line) in prompt.components(separatedBy: "\n").enumerated() {

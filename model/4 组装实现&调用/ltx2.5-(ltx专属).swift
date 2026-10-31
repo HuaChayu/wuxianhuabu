@@ -494,7 +494,8 @@ func generateVideoTest(prompt: String = "", audioPath: String? = nil, imagePaths
         }
     } else if let first = imagePaths.first,
               let img = NSImage(contentsOfFile: first) {
-        let aligned = videoSize(imageWidth: Int(img.size.width), imageHeight: Int(img.size.height), quality: .standard)
+        // LTX 图片驱动兜底：沿用旧「标准」口径（最长边 512），不随 H3 换档放大
+        let aligned = legacyStandardSize(ratio: nearestRatio(for: Int(img.size.width), height: Int(img.size.height)))
         let m = videoLatentAlignMultiple()
         if stage2Refine {
             g.width = max(m, (aligned.width / 2 / m) * m)
@@ -2400,3 +2401,17 @@ func ltxEnhanceExternalVideoWithStage2Pixels(
         fullResInput: fullResInput)
 }
 
+
+// MARK: - LTX 私有尺寸兜底（与 H3 视频档位解耦）
+
+/// 旧「标准」档口径（最长边钉 512、短边按比例取 64 倍数）。
+/// 仅本文件内使用：LTX 图片驱动且未显式传尺寸时的兜底目标尺寸，保持换档前行为不变。
+private func legacyStandardSize(ratio: CanvasStore.Ratio) -> (width: Int, height: Int) {
+    let m = sizeAlignMultiple()
+    let horizontal = ratio.width >= ratio.height
+    let unit = min(ratio.width, ratio.height)
+    let long = max(ratio.width, ratio.height)
+    let longSide = m * 8   // 512
+    let shortSide = max(m, Int((Double(longSide) * unit / long / Double(m)).rounded()) * m)
+    return horizontal ? (longSide, shortSide) : (shortSide, longSide)
+}

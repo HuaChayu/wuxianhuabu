@@ -1103,7 +1103,7 @@ struct CanvasView: View {
         // 保证续接指纹 width/height 一致；非续接视频节点按节点私有比例（nil 跟随全局）× 档位。
         // 非视频节点保持原逻辑：有图按图最接近比例 × 档位；无图按节点比例。
         let node = store.nodes.first(where: { $0.id == nodeID })
-        let quality = node?.quality ?? .standard
+        let quality = node?.quality ?? .p576
         let ratio = node?.ratio ?? store.currentRatio
         let duration: VideoDuration
         if let curNode = node, curNode.type == .video, let chain = store.chainVideoDisplayInfo(for: curNode) {
@@ -1955,7 +1955,7 @@ struct CanvasView: View {
                 duration: oldNode.duration,
                 tailFrameEnabled: oldNode.tailFrameEnabled ?? true,
                 model: oldNode.model ?? .ltx25Distill,
-                quality: oldNode.quality ?? .standard,
+                quality: oldNode.quality ?? .p576,
                 imageModel: oldNode.imageModel ?? .hidreamO1,
                 imageQuality: oldNode.imageQuality ?? .p720,
                 // 引用块快照随节点一起复制，否则粘贴出来的提示词只剩文字、块全丢

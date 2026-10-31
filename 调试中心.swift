@@ -306,6 +306,10 @@ final class MonitorCenter: ObservableObject {
         DispatchQueue.main.async {
             self.activeTasks.removeAll { $0 == name }
         }
+        // ★ 2026-10-31：任务收尾在生成报告里插一条分隔（自带前导空行），
+        // 下个任务的日志自然被隔开；pipelineLogSeparator 内部已做去重门控，
+        // 队列 finish 与管线内 defer 双重调用也只留一条。
+        pipelineLogSeparator("任务结束：\(name)")
     }
 }
 
